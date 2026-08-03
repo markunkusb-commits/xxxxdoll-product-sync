@@ -27,3 +27,19 @@ Python 3.12 项目，用于搭建未来商品同步 worker 的安全基础。本
 ```powershell
 python -m unittest discover -s tests -v
 ```
+
+## 只读连接检查
+
+项目使用 `src` 布局，先在本地以 editable 模式安装：
+
+```powershell
+python -m pip install -e .
+```
+
+然后运行：
+
+```powershell
+python -m sync_worker doctor
+```
+
+`doctor` 仅允许对已验证的 `wpcomstaging.com` HTTPS 主机执行 GET/HEAD，代码层会阻止所有写请求以及订单、客户、付款、优惠券和用户列表接口。运行前会再次确认 staging、dry-run、draft 和禁止删除等安全配置。输出报告写入 `reports/doctor-report.json`，只保留允许字段并统一脱敏。
