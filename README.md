@@ -16,9 +16,9 @@ Python 3.12 项目，用于搭建未来商品同步 worker 的安全基础。本
 
 ## 配置
 
-配置由 `sync_worker.config.load_config()` 从进程环境变量读取。默认值为 `staging`、`DRY_RUN=true`、商品状态 `draft`，并强制 `ALLOW_DELETE=false`。
+配置由 `sync_worker.config.load_config()` 自动从项目根目录的 `.env` 读取，随后由同名进程环境变量覆盖。默认值为 `staging`、`DRY_RUN=true`、商品状态 `draft`，并强制 `ALLOW_DELETE=false`。模块使用标准库解析基础 dotenv 格式，不会输出配置值或执行网络请求。
 
-如需本地配置，可复制 `.env.example` 的字段到你自己的环境变量管理方式中。请勿创建或提交包含真实密钥的配置文件。本项目不会自动读取 `.env` 文件。
+`.env` 和 `.env.*` 已被 Git 忽略，仅 `.env.example` 可提交。请勿提交包含真实密钥的配置文件。
 
 ## 运行测试
 
