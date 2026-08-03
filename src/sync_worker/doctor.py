@@ -2,50 +2,20 @@
 
 from __future__ import annotations
 
-import base64
 import json
 import logging
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from urllib.parse import urlsplit
 
-from .config import ConfigError, Settings
+from .config import Settings
 from .http_client import HttpResponse, ReadOnlyHttpClient
 from .sanitization import Redactor
-
-
-def redactor_for_settings(settings: Settings) -> Redactor:
-    wordpress_token = _basic_token(
-        settings.wp_username, settings.wp_app_password
-    )
-    woocommerce_token = _basic_token(
-        settings.wc_consumer_key, settings.wc_consumer_secret
-    )
-    return Redactor.from_values(
-        (
-            settings.wp_base_url,
-            settings.wp_username,
-            settings.wp_app_password,
-            settings.wc_consumer_key,
-            settings.wc_consumer_secret,
-            wordpress_token,
-            woocommerce_token,
-        )
-    )
-
-
-def _basic_token(username: str, password: str) -> str:
-    if not username or not password:
-        return ""
-    return base64.b64encode(f"{username}:{password}".encode("utf-8")).decode(
-        "ascii"
-    )
-
-
-def _basic_auth(username: str, password: str) -> dict[str, str]:
-    token = _basic_token(username, password)
-    return {"Authorization": f"Basic {token}"} if token else {}
+from .security import (
+    assert_safe_staging_runtime,
+    basic_auth_headers,
+    redactor_for_settings,
+)
 
 
 def _success(status_code: int | None) -> bool:
@@ -125,13 +95,7 @@ class DoctorRunner:
         self._logger.info(json.dumps(payload, ensure_ascii=False, sort_keys=True))
 
     def _assert_safe_before_network(self) -> None:
-        self._settings.validate()
-        checks = self._settings.staging_safety_checks()
-        if not checks.all_passed:
-            raise ConfigError("Doctor staging safety checks failed")
-        configured_hostname = urlsplit(self._settings.wp_base_url).hostname
-        if self._client.hostname != configured_hostname:
-            raise ConfigError("HTTP client target does not match configuration")
+        assert_safe_staging_runtime(self._settings, self._client)
 
     def _fetch_json(
         self,
@@ -187,10 +151,10 @@ class DoctorRunner:
         self._assert_safe_before_network()
         self._log("doctor_started", hostname=self._settings.masked_hostname())
 
-        wordpress_auth = _basic_auth(
+        wordpress_auth = basic_auth_headers(
             self._settings.wp_username, self._settings.wp_app_password
         )
-        woocommerce_auth = _basic_auth(
+        woocommerce_auth = basic_auth_headers(
             self._settings.wc_consumer_key, self._settings.wc_consumer_secret
         )
 

@@ -43,3 +43,13 @@ python -m sync_worker doctor
 ```
 
 `doctor` 仅允许对已验证的 `wpcomstaging.com` HTTPS 主机执行 GET/HEAD，代码层会阻止所有写请求以及订单、客户、付款、优惠券和用户列表接口。运行前会再次确认 staging、dry-run、draft 和禁止删除等安全配置。输出报告写入 `reports/doctor-report.json`，只保留允许字段并统一脱敏。
+
+## 参考产品结构检查
+
+按精确 SKU 只读检查一个参考产品：
+
+```powershell
+python -m sync_worker inspect-product --sku MD-M001-150-A-SUSAN
+```
+
+命令只调用 WooCommerce 产品 GET 接口，并在安全检查通过后提取基础字段、分类、品牌、产品 taxonomy、属性、图片文件名、描述统计和 meta 白名单。未知 meta 只记录 key 并标记 `review_required`；HTML、完整图片 URL、认证信息以及未知 meta value 均不会写入报告。报告保存为 `reports/reference-product-<SKU>.json`，HTTP 写请求计数固定为零。

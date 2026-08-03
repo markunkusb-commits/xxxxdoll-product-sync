@@ -1,4 +1,4 @@
-"""Allowlisted, redacted JSON report persistence for doctor runs."""
+"""Allowlisted, redacted JSON report persistence for read-only commands."""
 
 from __future__ import annotations
 
@@ -75,8 +75,8 @@ def sanitize_report_data(value: Any, redactor: Redactor) -> Any:
     return redactor.value(value)
 
 
-class DoctorReportWriter:
-    """Write a sanitized doctor report atomically."""
+class SafeJsonReportWriter:
+    """Write a sanitized read-only report atomically."""
 
     def __init__(self, path: Path, redactor: Redactor) -> None:
         self._path = path
@@ -85,7 +85,7 @@ class DoctorReportWriter:
     def write(self, report: Mapping[str, object]) -> Path:
         sanitized = sanitize_report_data(report, self._redactor)
         if not isinstance(sanitized, dict):
-            raise TypeError("Doctor report must be a mapping")
+            raise TypeError("Safe report must be a mapping")
         sanitized["write_requests_performed"] = 0
 
         self._path.parent.mkdir(parents=True, exist_ok=True)
@@ -96,3 +96,11 @@ class DoctorReportWriter:
         )
         os.replace(temporary_path, self._path)
         return self._path
+
+
+class DoctorReportWriter(SafeJsonReportWriter):
+    """Backward-compatible writer name for doctor reports."""
+
+
+class ReferenceProductReportWriter(SafeJsonReportWriter):
+    """Writer for reference product inspection reports."""
