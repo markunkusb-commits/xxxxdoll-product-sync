@@ -209,6 +209,14 @@ tempCodeRunnerFile.py
 # PyPI configuration file
 .pypirc
 
+# xxxxdoll-product-sync
+.env
+.env.*
+!.env.example
+**pycache**/
+.pytest_cache/
+reports/*.json
+
 # Marimo
 marimo/_static/
 marimo/_lsp/
