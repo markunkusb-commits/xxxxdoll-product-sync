@@ -117,6 +117,15 @@ def _product() -> dict[str, object]:
         "description": DESCRIPTION_HTML,
         "meta_data": [
             {"key": "_product_addons_exclude_global", "value": "0"},
+            {
+                "key": "_product_addons",
+                "value": {
+                    "option_name": "must-not-be-reported-option",
+                    "price": "must-not-be-reported-price",
+                    "image_url": "https://example.invalid/private-addon.webp",
+                    "html": "<b>must-not-be-reported-html</b>",
+                },
+            },
             {"key": "original_folder", "value": "source/susan"},
             {"key": "local_image_folder", "value": "images/susan"},
             {"key": "_stripe_token", "value": "sensitive-meta-value"},
@@ -313,6 +322,29 @@ class InspectProductTests(unittest.TestCase):
         self.assertNotIn("<section", serialized)
         self.assertNotIn("Private source HTML", serialized)
 
+    def _contains_spec_for_file(self, file_name: str | None) -> bool:
+        product = _product()
+        product["description"] = (
+            f'<img src="/uploads/{file_name}">' if file_name is not None else "<p>No image</p>"
+        )
+        report, _ = self._inspect([product])
+        return bool(report["description_summary"]["contains_spec_webp"])
+
+    def test_exact_spec_webp_is_recognized(self) -> None:
+        self.assertTrue(self._contains_spec_for_file("spec.webp"))
+
+    def test_sku_spec_webp_is_recognized(self) -> None:
+        self.assertTrue(self._contains_spec_for_file(f"{SKU}-spec.webp"))
+
+    def test_uppercase_sku_spec_webp_is_recognized(self) -> None:
+        self.assertTrue(self._contains_spec_for_file(f"{SKU}-SPEC.WEBP"))
+
+    def test_specification_webp_is_not_recognized(self) -> None:
+        self.assertFalse(self._contains_spec_for_file("specification.webp"))
+
+    def test_description_without_spec_image_is_not_recognized(self) -> None:
+        self.assertFalse(self._contains_spec_for_file(None))
+
     def test_meta_whitelist_and_unknown_keys_never_expose_unknown_values(self) -> None:
         report, _ = self._inspect([_product()])
         serialized = json.dumps(report)
@@ -337,6 +369,63 @@ class InspectProductTests(unittest.TestCase):
             "unknown-value",
         ):
             self.assertNotIn(sensitive_value, serialized)
+
+    def test_nonempty_product_addons_outputs_only_safe_structure(self) -> None:
+        report, _ = self._inspect([_product()])
+        summary = report["product_addons_meta_summary"]
+        serialized = json.dumps(report)
+
+        self.assertEqual(
+            summary,
+            {
+                "present": True,
+                "value_type": "object",
+                "is_empty": False,
+                "item_count": 4,
+                "review_required": True,
+            },
+        )
+        self.assertNotIn(
+            "_product_addons",
+            {item["key"] for item in report["unknown_meta_keys"]},
+        )
+        for forbidden in (
+            "must-not-be-reported-option",
+            "must-not-be-reported-price",
+            "private-addon.webp",
+            "must-not-be-reported-html",
+        ):
+            self.assertNotIn(forbidden, serialized)
+        self.assertEqual(
+            set(summary),
+            {"present", "value_type", "is_empty", "item_count", "review_required"},
+        )
+
+    def test_empty_product_addons_shapes_do_not_require_review(self) -> None:
+        cases = (
+            ([], "array", 0),
+            ({}, "object", 0),
+            ("", "string", None),
+            (None, "null", None),
+        )
+
+        for value, value_type, item_count in cases:
+            with self.subTest(value_type=value_type):
+                product = _product()
+                product["meta_data"] = [
+                    {"key": "_product_addons", "value": value}
+                ]
+                report, _ = self._inspect([product])
+                summary = report["product_addons_meta_summary"]
+
+                self.assertTrue(summary["present"])
+                self.assertEqual(summary["value_type"], value_type)
+                self.assertTrue(summary["is_empty"])
+                self.assertFalse(summary["review_required"])
+                if item_count is None:
+                    self.assertNotIn("item_count", summary)
+                else:
+                    self.assertEqual(summary["item_count"], item_count)
 
     def test_yith_global_inheritance_states(self) -> None:
         enabled_report, _ = self._inspect([_product()])

@@ -18,6 +18,11 @@ _SENSITIVE_PARAMETER_PATTERN = re.compile(
     r"(?i)\b(consumer_key|consumer_secret|app_password|password|token|_wpnonce)"
     r"\s*=\s*[^&\s,;]+"
 )
+REPORT_SECRET_SCAN_PATTERN_TEXT = (
+    r"(?<![A-Za-z0-9])(?:ck|cs)_[A-Za-z0-9]{20,}"
+    r"|Authorization|Cookie|WP_APP_PASSWORD"
+)
+REPORT_SECRET_SCAN_PATTERN = re.compile(REPORT_SECRET_SCAN_PATTERN_TEXT)
 
 
 def mask_hostname(hostname: str | None) -> str:

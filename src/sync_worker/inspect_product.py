@@ -29,6 +29,7 @@ _WHITELISTED_META_KEYS = frozenset(
         "local_image_folder",
     }
 )
+_STRUCTURE_ONLY_META_KEY = "_product_addons"
 _BRAND_FIELDS = ("brands", "brand", "product_brand", "product_brands")
 _PRODUCT_TAXONOMY_FIELDS = ("tags", "product_tags", "product_taxonomy_terms")
 
@@ -104,9 +105,14 @@ def _description_summary(product: Mapping[str, object]) -> dict[str, object]:
         "description_image_count": len(parser.image_file_names),
         "description_image_file_names": ordered_names,
         "contains_spec_webp": any(
-            name.lower() == "spec.webp" for name in parser.image_file_names
+            _is_spec_image(name) for name in parser.image_file_names
         ),
     }
+
+
+def _is_spec_image(file_name: str) -> bool:
+    normalized = file_name.casefold()
+    return normalized == "spec.webp" or normalized.endswith("-spec.webp")
 
 
 def _term(value: object) -> dict[str, object] | None:
@@ -263,14 +269,20 @@ def _safe_folder_value(value: object, redactor: Redactor) -> object:
 
 def _meta_summary(
     product: Mapping[str, object], redactor: Redactor
-) -> tuple[dict[str, object], list[dict[str, object]], bool | None]:
+) -> tuple[
+    dict[str, object],
+    list[dict[str, object]],
+    bool | None,
+    dict[str, object],
+]:
     metadata = product.get("meta_data")
     if not isinstance(metadata, list):
-        return {}, [], None
+        return {}, [], None, _product_addons_summary([])
 
     whitelisted: dict[str, object] = {}
     unknown: list[dict[str, object]] = []
     seen_unknown: set[str] = set()
+    product_addons_values: list[object] = []
     for item in metadata[:1000]:
         if not isinstance(item, Mapping):
             continue
@@ -282,6 +294,8 @@ def _meta_summary(
                 whitelisted[key] = _flag_value(item.get("value"))
             else:
                 whitelisted[key] = _safe_folder_value(item.get("value"), redactor)
+        elif key == _STRUCTURE_ONLY_META_KEY:
+            product_addons_values.append(item.get("value"))
         elif key not in seen_unknown and len(unknown) < 500:
             seen_unknown.add(key)
             unknown.append(
@@ -289,7 +303,61 @@ def _meta_summary(
             )
 
     excluded = _flag_value(whitelisted.get("_product_addons_exclude_global"))
-    return whitelisted, unknown, excluded
+    return (
+        whitelisted,
+        unknown,
+        excluded,
+        _product_addons_summary(product_addons_values),
+    )
+
+
+def _single_value_shape(value: object) -> dict[str, object]:
+    if value is None:
+        return {"value_type": "null", "is_empty": True}
+    if isinstance(value, list):
+        return {
+            "value_type": "array",
+            "is_empty": len(value) == 0,
+            "item_count": len(value),
+        }
+    if isinstance(value, Mapping):
+        return {
+            "value_type": "object",
+            "is_empty": len(value) == 0,
+            "item_count": len(value),
+        }
+    if isinstance(value, str):
+        return {"value_type": "string", "is_empty": value == ""}
+    if isinstance(value, bool):
+        return {"value_type": "boolean", "is_empty": False}
+    if isinstance(value, (int, float)):
+        return {"value_type": "number", "is_empty": False}
+    return {"value_type": "unknown", "is_empty": False}
+
+
+def _product_addons_summary(values: list[object]) -> dict[str, object]:
+    if not values:
+        return {
+            "present": False,
+            "value_type": "missing",
+            "is_empty": True,
+            "review_required": False,
+        }
+    if len(values) == 1:
+        shape = _single_value_shape(values[0])
+    else:
+        shapes = [_single_value_shape(value) for value in values]
+        shape = {
+            "value_type": "multiple",
+            "is_empty": all(bool(item["is_empty"]) for item in shapes),
+            "item_count": len(values),
+        }
+    is_empty = bool(shape["is_empty"])
+    return {
+        "present": True,
+        **shape,
+        "review_required": not is_empty,
+    }
 
 
 def _flag_value(value: object) -> bool | None:
@@ -350,6 +418,7 @@ def _empty_report(
         },
         "whitelisted_meta": {},
         "unknown_meta_keys": [],
+        "product_addons_meta_summary": _product_addons_summary([]),
         "global_addons_excluded": None,
         "yith_global_options_inheritance": "unable_to_confirm",
         "get_requests": 0,
@@ -450,9 +519,12 @@ class ReferenceProductInspector:
         product = matching_products[0]
         categories = _categories(product)
         brand_terms, product_terms = _taxonomy_terms(product)
-        whitelisted_meta, unknown_meta, addons_excluded = _meta_summary(
-            product, self._redactor
-        )
+        (
+            whitelisted_meta,
+            unknown_meta,
+            addons_excluded,
+            product_addons_summary,
+        ) = _meta_summary(product, self._redactor)
         product_id = _safe_int(product.get("id"))
         report.update(
             {
@@ -484,6 +556,7 @@ class ReferenceProductInspector:
                 "description_summary": _description_summary(product),
                 "whitelisted_meta": whitelisted_meta,
                 "unknown_meta_keys": unknown_meta,
+                "product_addons_meta_summary": product_addons_summary,
                 "global_addons_excluded": addons_excluded,
                 "yith_global_options_inheritance": _yith_inheritance(
                     categories, addons_excluded

@@ -53,3 +53,11 @@ python -m sync_worker inspect-product --sku MD-M001-150-A-SUSAN
 ```
 
 命令只调用 WooCommerce 产品 GET 接口，并在安全检查通过后提取基础字段、分类、品牌、产品 taxonomy、属性、图片文件名、描述统计和 meta 白名单。未知 meta 只记录 key 并标记 `review_required`；HTML、完整图片 URL、认证信息以及未知 meta value 均不会写入报告。报告保存为 `reports/reference-product-<SKU>.json`，HTTP 写请求计数固定为零。
+
+可以使用以下边界安全的正则扫描参考产品报告中的潜在密钥：
+
+```powershell
+Select-String `
+  -Path reports\reference-product-*.json `
+  -Pattern '(?<![A-Za-z0-9])(?:ck|cs)_[A-Za-z0-9]{20,}|Authorization|Cookie|WP_APP_PASSWORD'
+```
