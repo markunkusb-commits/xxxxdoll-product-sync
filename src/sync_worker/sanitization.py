@@ -32,6 +32,10 @@ _SENSITIVE_JSON_FIELD_PATTERN = re.compile(
     r'(?i)"(private_key|private_key_id|client_email|token_uri|access_token|'
     r'refresh_token)"\s*:\s*"[^"]*"'
 )
+_SENSITIVE_NAMED_VALUE_PATTERN = re.compile(
+    r"(?i)\b(private_key|private_key_id|client_email|token_uri|access_token|"
+    r"refresh_token|token)\s*[:=]\s*(?:\"[^\"]*\"|'[^']*'|[^,;\s]+)"
+)
 REPORT_SECRET_SCAN_PATTERN_TEXT = (
     r"(?<![A-Za-z0-9])(?:ck|cs)_[A-Za-z0-9]{20,}"
     r"|Authorization|Cookie|WP_APP_PASSWORD"
@@ -78,9 +82,12 @@ class Redactor:
         redacted = str(value)
         for secret in self.secrets:
             redacted = redacted.replace(secret, "[REDACTED]")
-        redacted = _PRIVATE_KEY_PATTERN.sub("[REDACTED_PRIVATE_KEY]", redacted)
+        redacted = _PRIVATE_KEY_PATTERN.sub("[REDACTED_CREDENTIAL]", redacted)
         redacted = _SENSITIVE_JSON_FIELD_PATTERN.sub(
-            lambda match: f'"{match.group(1)}":"[REDACTED]"', redacted
+            "[REDACTED_CREDENTIAL_FIELD]", redacted
+        )
+        redacted = _SENSITIVE_NAMED_VALUE_PATTERN.sub(
+            "[REDACTED_CREDENTIAL_FIELD]", redacted
         )
         redacted = _AUTH_HEADER_PATTERN.sub(r"\1: [REDACTED]", redacted)
         redacted = _COOKIE_PATTERN.sub(r"\1: [REDACTED]", redacted)

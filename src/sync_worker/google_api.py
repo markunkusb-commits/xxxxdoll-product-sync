@@ -58,45 +58,58 @@ class OfficialGoogleClientFactory:
 
     def create(self, settings: GoogleSettings) -> GoogleClients:
         settings.validate()
-        try:
-            import httplib2
-            import google_auth_httplib2
-            from google.oauth2 import service_account
-            from googleapiclient.discovery import build
-        except ImportError:
-            raise GoogleClientCreationError(
-                "Official Google client dependencies are unavailable"
-            ) from None
+        redactor = google_redactor_for_settings(settings)
 
         try:
+            from google.oauth2 import service_account
             credentials = service_account.Credentials.from_service_account_file(
                 str(settings.resolved_service_account_file),
                 scopes=[settings.drive_scope, settings.sheets_scope],
             )
-            refresh_http = httplib2.Http(timeout=10)
-            credentials.refresh(google_auth_httplib2.Request(refresh_http))
-            authorized_http = google_auth_httplib2.AuthorizedHttp(
-                credentials, http=httplib2.Http(timeout=20)
-            )
+        except Exception as error:
+            raise _stage_error("credentials_create", error, redactor) from None
+
+        try:
+            from google.auth.transport.requests import Request
+
+            credentials.refresh(Request())
+        except Exception as error:
+            raise _stage_error("token_refresh", error, redactor) from None
+
+        try:
+            from googleapiclient.discovery import build
+
             drive = build(
                 "drive",
                 "v3",
-                http=authorized_http,
+                credentials=credentials,
                 cache_discovery=False,
-                static_discovery=True,
             )
+        except Exception as error:
+            raise _stage_error("drive_client_build", error, redactor) from None
+
+        try:
             sheets = build(
                 "sheets",
                 "v4",
-                http=authorized_http,
+                credentials=credentials,
                 cache_discovery=False,
-                static_discovery=True,
             )
-            return GoogleClients(drive=drive, sheets=sheets)
-        except Exception:
-            raise GoogleClientCreationError(
-                "Google service account authentication or client creation failed"
-            ) from None
+        except Exception as error:
+            raise _stage_error("sheets_client_build", error, redactor) from None
+
+        return GoogleClients(drive=drive, sheets=sheets)
+
+
+def _stage_error(
+    stage: str, error: BaseException, redactor: Redactor
+) -> GoogleClientCreationError:
+    error_type = type(error).__name__
+    summary = redactor.text(str(error), limit=180).strip()
+    message = f"{stage} failed: {error_type}"
+    if summary:
+        message += f": {summary}"
+    return GoogleClientCreationError(message)
 
 
 @dataclass(slots=True)
