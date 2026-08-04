@@ -61,3 +61,20 @@ Select-String `
   -Path reports\reference-product-*.json `
   -Pattern '(?<![A-Za-z0-9])(?:ck|cs)_[A-Za-z0-9]{20,}|Authorization|Cookie|WP_APP_PASSWORD'
 ```
+
+## Google 只读权限检查
+
+项目依赖官方 `google-api-python-client`、`google-auth` 和 `google-auth-httplib2`。配置必须使用项目目录外的服务账号 JSON，并严格设置以下只读 scopes：
+
+```text
+https://www.googleapis.com/auth/drive.readonly
+https://www.googleapis.com/auth/spreadsheets.readonly
+```
+
+安装项目依赖后运行：
+
+```powershell
+python -m sync_worker google-doctor
+```
+
+该命令只检查两个指定根文件夹、最多 100 个一级子项、Spreadsheet 元数据，以及每个工作表的 `A1:Z5` 小样本。报告只保存文件元数据和单元格统计，不保存文件 ID、Spreadsheet ID、单元格内容、凭据内容或下载链接；所有 Google 写操作均不在代码允许列表中。

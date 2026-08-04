@@ -18,6 +18,20 @@ _SENSITIVE_PARAMETER_PATTERN = re.compile(
     r"(?i)\b(consumer_key|consumer_secret|app_password|password|token|_wpnonce)"
     r"\s*=\s*[^&\s,;]+"
 )
+_EMAIL_PATTERN = re.compile(
+    r"\b[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@"
+    r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+    r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+\b"
+)
+_PRIVATE_KEY_PATTERN = re.compile(
+    r"-----BEGIN (?:RSA )?PRIVATE KEY-----.*?"
+    r"-----END (?:RSA )?PRIVATE KEY-----",
+    re.DOTALL,
+)
+_SENSITIVE_JSON_FIELD_PATTERN = re.compile(
+    r'(?i)"(private_key|private_key_id|client_email|token_uri|access_token|'
+    r'refresh_token)"\s*:\s*"[^"]*"'
+)
 REPORT_SECRET_SCAN_PATTERN_TEXT = (
     r"(?<![A-Za-z0-9])(?:ck|cs)_[A-Za-z0-9]{20,}"
     r"|Authorization|Cookie|WP_APP_PASSWORD"
@@ -64,11 +78,16 @@ class Redactor:
         redacted = str(value)
         for secret in self.secrets:
             redacted = redacted.replace(secret, "[REDACTED]")
+        redacted = _PRIVATE_KEY_PATTERN.sub("[REDACTED_PRIVATE_KEY]", redacted)
+        redacted = _SENSITIVE_JSON_FIELD_PATTERN.sub(
+            lambda match: f'"{match.group(1)}":"[REDACTED]"', redacted
+        )
         redacted = _AUTH_HEADER_PATTERN.sub(r"\1: [REDACTED]", redacted)
         redacted = _COOKIE_PATTERN.sub(r"\1: [REDACTED]", redacted)
         redacted = _SENSITIVE_PARAMETER_PATTERN.sub(
             r"\1=[REDACTED]", redacted
         )
+        redacted = _EMAIL_PATTERN.sub("[REDACTED_EMAIL]", redacted)
         redacted = _URL_PATTERN.sub(lambda match: sanitize_url(match.group(0)), redacted)
         if len(redacted) > limit:
             return redacted[: limit - 3] + "..."

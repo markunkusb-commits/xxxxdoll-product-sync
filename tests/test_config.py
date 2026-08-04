@@ -153,6 +153,12 @@ class ConfigTests(unittest.TestCase):
                 "DRY_RUN": "true",
                 "DEFAULT_PRODUCT_STATUS": "draft",
                 "ALLOW_DELETE": "false",
+                "GOOGLE_SERVICE_ACCOUNT_FILE": "",
+                "CLM_SPREADSHEET_ID": "",
+                "CLM_DRIVE_FOLDER_ID": "",
+                "MD_DRIVE_FOLDER_ID": "",
+                "GOOGLE_DRIVE_SCOPE": "https://www.googleapis.com/auth/drive.readonly",
+                "GOOGLE_SHEETS_SCOPE": "https://www.googleapis.com/auth/spreadsheets.readonly",
             },
         )
 

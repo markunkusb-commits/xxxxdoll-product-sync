@@ -17,8 +17,14 @@ class ConfigError(ValueError):
 _TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
 _FALSE_VALUES = frozenset({"0", "false", "no", "off"})
 _ENV_NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_GOOGLE_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{10,}$")
 _DOUBLE_QUOTED_ESCAPE_PATTERN = re.compile(r'\\([\\"nrt])')
 DEFAULT_DOTENV_PATH = Path(__file__).resolve().parents[2] / ".env"
+PROJECT_ROOT = DEFAULT_DOTENV_PATH.parent
+GOOGLE_DRIVE_READONLY_SCOPE = "https://www.googleapis.com/auth/drive.readonly"
+GOOGLE_SHEETS_READONLY_SCOPE = (
+    "https://www.googleapis.com/auth/spreadsheets.readonly"
+)
 
 
 def _decode_double_quoted(value: str) -> str:
@@ -218,6 +224,85 @@ class Settings:
                 raise ConfigError("WP_BASE_URL must not target xxxxdoll.com")
 
 
+def mask_identifier(value: str) -> str:
+    """Return an identifier-safe display form without revealing the full ID."""
+    return "***" + value[-4:] if len(value) >= 4 else "***"
+
+
+@dataclass(frozen=True, slots=True)
+class GoogleSettings:
+    """Validated configuration for read-only Google Drive and Sheets checks."""
+
+    service_account_file: str = field(default="", repr=False)
+    clm_spreadsheet_id: str = field(default="", repr=False)
+    clm_drive_folder_id: str = field(default="", repr=False)
+    md_drive_folder_id: str = field(default="", repr=False)
+    drive_scope: str = field(default="", repr=False)
+    sheets_scope: str = field(default="", repr=False)
+
+    @property
+    def resolved_service_account_file(self) -> Path:
+        return Path(self.service_account_file).expanduser().resolve(strict=False)
+
+    def configured_status(self) -> dict[str, bool]:
+        return {
+            "GOOGLE_SERVICE_ACCOUNT_FILE": bool(self.service_account_file),
+            "CLM_SPREADSHEET_ID": bool(self.clm_spreadsheet_id),
+            "CLM_DRIVE_FOLDER_ID": bool(self.clm_drive_folder_id),
+            "MD_DRIVE_FOLDER_ID": bool(self.md_drive_folder_id),
+            "GOOGLE_DRIVE_SCOPE": bool(self.drive_scope),
+            "GOOGLE_SHEETS_SCOPE": bool(self.sheets_scope),
+        }
+
+    def masked_identifiers(self) -> dict[str, str]:
+        return {
+            "CLM_SPREADSHEET_ID": mask_identifier(self.clm_spreadsheet_id),
+            "CLM_DRIVE_FOLDER_ID": mask_identifier(self.clm_drive_folder_id),
+            "MD_DRIVE_FOLDER_ID": mask_identifier(self.md_drive_folder_id),
+        }
+
+    def validate(self, *, project_root: Path = PROJECT_ROOT) -> None:
+        missing = [
+            name
+            for name, configured in self.configured_status().items()
+            if not configured
+        ]
+        if missing:
+            raise ConfigError("Missing Google configuration: " + ", ".join(missing))
+        for name, value in (
+            ("CLM_SPREADSHEET_ID", self.clm_spreadsheet_id),
+            ("CLM_DRIVE_FOLDER_ID", self.clm_drive_folder_id),
+            ("MD_DRIVE_FOLDER_ID", self.md_drive_folder_id),
+        ):
+            if not _GOOGLE_ID_PATTERN.fullmatch(value):
+                raise ConfigError(f"{name} has an invalid identifier format")
+
+        credentials_path = self.resolved_service_account_file
+        resolved_project_root = project_root.resolve(strict=False)
+        if credentials_path.is_relative_to(resolved_project_root):
+            raise ConfigError("GOOGLE_SERVICE_ACCOUNT_FILE must be outside the project")
+        if credentials_path.suffix.lower() != ".json":
+            raise ConfigError("GOOGLE_SERVICE_ACCOUNT_FILE must use a .json extension")
+        if not credentials_path.is_file():
+            raise ConfigError("GOOGLE_SERVICE_ACCOUNT_FILE does not exist")
+        if self.drive_scope != GOOGLE_DRIVE_READONLY_SCOPE:
+            raise ConfigError("GOOGLE_DRIVE_SCOPE must be the exact read-only scope")
+        if self.sheets_scope != GOOGLE_SHEETS_READONLY_SCOPE:
+            raise ConfigError("GOOGLE_SHEETS_SCOPE must be the exact read-only scope")
+
+
+def _configuration_source(
+    environ: Mapping[str, str] | None,
+    dotenv_path: str | Path | None,
+) -> dict[str, str]:
+    if environ is not None:
+        return dict(environ)
+    path = DEFAULT_DOTENV_PATH if dotenv_path is None else Path(dotenv_path)
+    source = _read_dotenv(path)
+    source.update(os.environ)
+    return source
+
+
 def load_config(
     environ: Mapping[str, str] | None = None,
     *,
@@ -228,12 +313,7 @@ def load_config(
     Passing ``environ`` explicitly skips automatic dotenv loading, which keeps tests
     and callers deterministic. No environment values are logged by this module.
     """
-    if environ is None:
-        path = DEFAULT_DOTENV_PATH if dotenv_path is None else Path(dotenv_path)
-        source: dict[str, str] = _read_dotenv(path)
-        source.update(os.environ)
-    else:
-        source = dict(environ)
+    source = _configuration_source(environ, dotenv_path)
     settings = Settings(
         wp_base_url=_read_text(source, "WP_BASE_URL"),
         wp_username=_read_text(source, "WP_USERNAME"),
@@ -248,4 +328,24 @@ def load_config(
         allow_delete=_read_bool(source, "ALLOW_DELETE", False),
     )
     settings.validate()
+    return settings
+
+
+def load_google_config(
+    environ: Mapping[str, str] | None = None,
+    *,
+    dotenv_path: str | Path | None = None,
+    project_root: Path = PROJECT_ROOT,
+) -> GoogleSettings:
+    """Load and validate Google settings without reading credential JSON content."""
+    source = _configuration_source(environ, dotenv_path)
+    settings = GoogleSettings(
+        service_account_file=_read_text(source, "GOOGLE_SERVICE_ACCOUNT_FILE"),
+        clm_spreadsheet_id=_read_text(source, "CLM_SPREADSHEET_ID"),
+        clm_drive_folder_id=_read_text(source, "CLM_DRIVE_FOLDER_ID"),
+        md_drive_folder_id=_read_text(source, "MD_DRIVE_FOLDER_ID"),
+        drive_scope=_read_text(source, "GOOGLE_DRIVE_SCOPE"),
+        sheets_scope=_read_text(source, "GOOGLE_SHEETS_SCOPE"),
+    )
+    settings.validate(project_root=project_root)
     return settings
