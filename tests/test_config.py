@@ -159,6 +159,10 @@ class ConfigTests(unittest.TestCase):
                 "MD_DRIVE_FOLDER_ID": "",
                 "GOOGLE_DRIVE_SCOPE": "https://www.googleapis.com/auth/drive.readonly",
                 "GOOGLE_SHEETS_SCOPE": "https://www.googleapis.com/auth/spreadsheets.readonly",
+                "GOOGLE_PROXY_MODE": "",
+                "GOOGLE_PROXY_HOST": "",
+                "GOOGLE_PROXY_PORT": "",
+                "GOOGLE_PROXY_RDNS": "true",
             },
         )
 

@@ -12,6 +12,7 @@ dependencies = [
     "google-api-python-client>=2,<3",
     "google-auth>=2,<3",
     "google-auth-httplib2>=0.2,<1",
+    "PySocks>=1.7,<2",
 ]
 
 [tool.setuptools.packages.find]

@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock, call, patch
@@ -12,6 +13,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from sync_worker.config import (  # noqa: E402
+    ConfigError,
     GOOGLE_DRIVE_READONLY_SCOPE,
     GOOGLE_SHEETS_READONLY_SCOPE,
     load_google_config,
@@ -57,17 +59,26 @@ class OfficialGoogleClientFactoryTests(unittest.TestCase):
             "MD_DRIVE_FOLDER_ID": "md_folder_ID_1234567890",
             "GOOGLE_DRIVE_SCOPE": GOOGLE_DRIVE_READONLY_SCOPE,
             "GOOGLE_SHEETS_SCOPE": GOOGLE_SHEETS_READONLY_SCOPE,
+            "GOOGLE_PROXY_MODE": "socks5",
+            "GOOGLE_PROXY_HOST": "127.0.0.1",
+            "GOOGLE_PROXY_PORT": "26001",
+            "GOOGLE_PROXY_RDNS": "true",
         }
         self.settings = load_google_config(self.values)
         self.credentials = MagicMock(name="credentials")
+        self.from_service_account_file = MagicMock(return_value=self.credentials)
+        self.proxy_type_socks5 = object()
+        self.proxy_info_instance = object()
+        self.proxy_info_class = MagicMock(return_value=self.proxy_info_instance)
+        self.raw_http = object()
+        self.http_class = MagicMock(return_value=self.raw_http)
         self.request_instance = object()
         self.request_class = MagicMock(return_value=self.request_instance)
-        self.from_service_account_file = MagicMock(return_value=self.credentials)
+        self.authorized_http = object()
+        self.authorized_http_class = MagicMock(return_value=self.authorized_http)
         self.drive_client = MagicMock(name="drive_client")
         self.sheets_client = MagicMock(name="sheets_client")
-        self.build = MagicMock(
-            side_effect=[self.drive_client, self.sheets_client]
-        )
+        self.build = MagicMock(side_effect=[self.drive_client, self.sheets_client])
         self.modules = self._fake_google_modules()
 
     def tearDown(self) -> None:
@@ -75,10 +86,6 @@ class OfficialGoogleClientFactoryTests(unittest.TestCase):
 
     def _fake_google_modules(self) -> dict[str, ModuleType]:
         google = _package("google")
-        google_auth = _package("google.auth")
-        google_transport = _package("google.auth.transport")
-        google_requests = ModuleType("google.auth.transport.requests")
-        google_requests.Request = self.request_class  # type: ignore[attr-defined]
         google_oauth2 = _package("google.oauth2")
         service_account = ModuleType("google.oauth2.service_account")
         service_account.Credentials = SimpleNamespace(  # type: ignore[attr-defined]
@@ -86,24 +93,35 @@ class OfficialGoogleClientFactoryTests(unittest.TestCase):
         )
         google_oauth2.service_account = service_account  # type: ignore[attr-defined]
 
+        socks_module = ModuleType("socks")
+        socks_module.PROXY_TYPE_SOCKS5 = self.proxy_type_socks5  # type: ignore[attr-defined]
+        httplib2_module = ModuleType("httplib2")
+        httplib2_module.ProxyInfo = self.proxy_info_class  # type: ignore[attr-defined]
+        httplib2_module.Http = self.http_class  # type: ignore[attr-defined]
+        google_auth_httplib2 = ModuleType("google_auth_httplib2")
+        google_auth_httplib2.Request = self.request_class  # type: ignore[attr-defined]
+        google_auth_httplib2.AuthorizedHttp = (  # type: ignore[attr-defined]
+            self.authorized_http_class
+        )
+
         googleapiclient = _package("googleapiclient")
         discovery = ModuleType("googleapiclient.discovery")
         discovery.build = self.build  # type: ignore[attr-defined]
         googleapiclient.discovery = discovery  # type: ignore[attr-defined]
         return {
             "google": google,
-            "google.auth": google_auth,
-            "google.auth.transport": google_transport,
-            "google.auth.transport.requests": google_requests,
             "google.oauth2": google_oauth2,
             "google.oauth2.service_account": service_account,
+            "socks": socks_module,
+            "httplib2": httplib2_module,
+            "google_auth_httplib2": google_auth_httplib2,
             "googleapiclient": googleapiclient,
             "googleapiclient.discovery": discovery,
         }
 
-    def _create(self):
+    def _create(self, settings=None):
         with patch.dict(sys.modules, self.modules):
-            return OfficialGoogleClientFactory().create(self.settings)
+            return OfficialGoogleClientFactory().create(settings or self.settings)
 
     def _sensitive_error_text(self) -> str:
         return (
@@ -111,7 +129,9 @@ class OfficialGoogleClientFactoryTests(unittest.TestCase):
             f"client_email=service-account@example.invalid token=unsafe-token "
             f"path={self.credentials_path} "
             f"folder={self.values['CLM_DRIVE_FOLDER_ID']} "
-            f"spreadsheet={self.values['CLM_SPREADSHEET_ID']}"
+            f"spreadsheet={self.values['CLM_SPREADSHEET_ID']} "
+            f"proxy=socks5://{self.values['GOOGLE_PROXY_HOST']}:"
+            f"{self.values['GOOGLE_PROXY_PORT']}"
         )
 
     def _assert_safe_stage_error(
@@ -133,50 +153,102 @@ class OfficialGoogleClientFactoryTests(unittest.TestCase):
             str(self.credentials_path),
             self.values["CLM_DRIVE_FOLDER_ID"],
             self.values["CLM_SPREADSHEET_ID"],
+            self.values["GOOGLE_PROXY_HOST"],
+            self.values["GOOGLE_PROXY_PORT"],
+            "socks5://",
         ):
             self.assertNotIn(forbidden.lower(), lowered)
         self.assertIsNone(caught.exception.__cause__)
         return message
 
-    def test_credentials_refresh_and_build_follow_verified_call_path(self) -> None:
+    def test_socks5_transport_is_explicit_and_shared(self) -> None:
         clients = self._create()
 
         self.from_service_account_file.assert_called_once_with(
             str(self.settings.resolved_service_account_file),
             scopes=[self.settings.drive_scope, self.settings.sheets_scope],
         )
-        self.request_class.assert_called_once_with()
+        self.proxy_info_class.assert_called_once_with(
+            proxy_type=self.proxy_type_socks5,
+            proxy_host="127.0.0.1",
+            proxy_port=26001,
+            proxy_rdns=True,
+        )
+        self.http_class.assert_called_once_with(
+            proxy_info=self.proxy_info_instance,
+            timeout=30,
+        )
+        self.request_class.assert_called_once_with(self.raw_http)
         self.credentials.refresh.assert_called_once_with(self.request_instance)
+        self.authorized_http_class.assert_called_once_with(
+            self.credentials,
+            http=self.raw_http,
+        )
         self.assertEqual(
             self.build.call_args_list,
             [
                 call(
                     "drive",
                     "v3",
-                    credentials=self.credentials,
+                    http=self.authorized_http,
                     cache_discovery=False,
                 ),
                 call(
                     "sheets",
                     "v4",
-                    credentials=self.credentials,
+                    http=self.authorized_http,
                     cache_discovery=False,
                 ),
             ],
         )
         for build_call in self.build.call_args_list:
-            self.assertNotIn("http", build_call.kwargs)
+            self.assertNotIn("credentials", build_call.kwargs)
         self.assertIs(clients.drive, self.drive_client)
         self.assertIs(clients.sheets, self.sheets_client)
+
+    def test_none_mode_explicitly_disables_proxy_auto_discovery(self) -> None:
+        settings = load_google_config(
+            {
+                **self.values,
+                "GOOGLE_PROXY_MODE": "none",
+                "GOOGLE_PROXY_HOST": "",
+                "GOOGLE_PROXY_PORT": "",
+            }
+        )
+
+        self._create(settings)
+
+        self.proxy_info_class.assert_not_called()
+        self.http_class.assert_called_once_with(proxy_info=None, timeout=30)
+        self.request_class.assert_called_once_with(self.raw_http)
+        self.authorized_http_class.assert_called_once_with(
+            self.credentials, http=self.raw_http
+        )
+
+    def test_invalid_proxy_settings_stop_before_credentials_or_transport(self) -> None:
+        unsafe_settings = (
+            replace(self.settings, google_proxy_mode="automatic"),
+            replace(self.settings, google_proxy_port=0),
+            replace(self.settings, google_proxy_rdns="yes"),
+        )
+
+        for settings in unsafe_settings:
+            with self.subTest(settings=settings):
+                with self.assertRaises(ConfigError):
+                    self._create(settings)
+
+        self.from_service_account_file.assert_not_called()
+        self.proxy_info_class.assert_not_called()
+        self.http_class.assert_not_called()
+        self.request_class.assert_not_called()
+        self.build.assert_not_called()
 
     def test_credentials_create_failure_reports_safe_stage(self) -> None:
         self.from_service_account_file.side_effect = CredentialsCreateFailure(
             self._sensitive_error_text()
         )
 
-        self._assert_safe_stage_error(
-            "credentials_create", CredentialsCreateFailure
-        )
+        self._assert_safe_stage_error("credentials_create", CredentialsCreateFailure)
         self.credentials.refresh.assert_not_called()
         self.build.assert_not_called()
 
@@ -204,9 +276,9 @@ class OfficialGoogleClientFactoryTests(unittest.TestCase):
         self.assertEqual(self.build.call_count, 2)
         self.drive_client.files.assert_not_called()
 
-    def test_factory_failure_report_has_zero_data_and_write_requests(self) -> None:
+    def test_factory_failure_report_has_no_proxy_and_zero_requests(self) -> None:
         self.credentials.refresh.side_effect = TokenRefreshFailure(
-            self._sensitive_error_text()
+            "proxy=socks5://127.0.0.1:26001"
         )
 
         with patch.dict(sys.modules, self.modules):
@@ -219,9 +291,15 @@ class OfficialGoogleClientFactoryTests(unittest.TestCase):
         self.assertEqual(report["read_requests_performed"], 0)
         self.assertEqual(report["write_requests_performed"], 0)
         self.assertIn("token_refresh", serialized)
-        self.assertNotIn("private_key", serialized)
-        self.assertNotIn("client_email", serialized)
-        self.assertNotIn(str(self.credentials_path).lower(), serialized)
+        for forbidden in (
+            "private_key",
+            "client_email",
+            str(self.credentials_path).lower(),
+            self.values["GOOGLE_PROXY_HOST"],
+            self.values["GOOGLE_PROXY_PORT"],
+            "socks5://",
+        ):
+            self.assertNotIn(forbidden, serialized)
         self.drive_client.files.assert_not_called()
         self.sheets_client.spreadsheets.assert_not_called()
 

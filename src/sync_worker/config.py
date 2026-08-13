@@ -6,6 +6,7 @@ import os
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from ipaddress import ip_address
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -18,6 +19,12 @@ _TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
 _FALSE_VALUES = frozenset({"0", "false", "no", "off"})
 _ENV_NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _GOOGLE_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{10,}$")
+_PROXY_HOSTNAME_PATTERN = re.compile(
+    r"^(?=.{1,253}$)"
+    r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+    r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$"
+)
+_PORT_PATTERN = re.compile(r"^[0-9]+$")
 _DOUBLE_QUOTED_ESCAPE_PATTERN = re.compile(r'\\([\\"nrt])')
 DEFAULT_DOTENV_PATH = Path(__file__).resolve().parents[2] / ".env"
 PROJECT_ROOT = DEFAULT_DOTENV_PATH.parent
@@ -104,6 +111,44 @@ def _read_bool(environ: Mapping[str, str], name: str, default: bool) -> bool:
     if normalized in _FALSE_VALUES:
         return False
     raise ConfigError(f"{name} must be a boolean value")
+
+
+def _read_strict_bool(
+    environ: Mapping[str, str], name: str, default: bool
+) -> bool:
+    raw_value = environ.get(name)
+    if raw_value is None:
+        return default
+
+    normalized = raw_value.strip().lower()
+    if normalized == "true":
+        return True
+    if normalized == "false":
+        return False
+    raise ConfigError(f"{name} must be exactly true or false")
+
+
+def _read_optional_port(environ: Mapping[str, str], name: str) -> int | None:
+    raw_value = environ.get(name)
+    if raw_value is None or not raw_value.strip():
+        return None
+    normalized = raw_value.strip()
+    if not _PORT_PATTERN.fullmatch(normalized):
+        raise ConfigError(f"{name} must be an integer from 1 to 65535")
+    value = int(normalized)
+    if not 1 <= value <= 65535:
+        raise ConfigError(f"{name} must be an integer from 1 to 65535")
+    return value
+
+
+def _valid_proxy_host(value: str) -> bool:
+    if not value or any(character.isspace() for character in value):
+        return False
+    try:
+        ip_address(value)
+    except ValueError:
+        return bool(_PROXY_HOSTNAME_PATTERN.fullmatch(value))
+    return True
 
 
 def _hostname(url: str) -> str | None:
@@ -239,6 +284,10 @@ class GoogleSettings:
     md_drive_folder_id: str = field(default="", repr=False)
     drive_scope: str = field(default="", repr=False)
     sheets_scope: str = field(default="", repr=False)
+    google_proxy_mode: str = field(default="none", repr=False)
+    google_proxy_host: str = field(default="", repr=False)
+    google_proxy_port: int | None = field(default=None, repr=False)
+    google_proxy_rdns: bool = field(default=True, repr=False)
 
     @property
     def resolved_service_account_file(self) -> Path:
@@ -262,6 +311,24 @@ class GoogleSettings:
         }
 
     def validate(self, *, project_root: Path = PROJECT_ROOT) -> None:
+        if self.google_proxy_mode not in {"none", "socks5"}:
+            raise ConfigError("GOOGLE_PROXY_MODE must be none or socks5")
+        if not isinstance(self.google_proxy_rdns, bool):
+            raise ConfigError("GOOGLE_PROXY_RDNS must be exactly true or false")
+        if self.google_proxy_mode == "socks5":
+            if not _valid_proxy_host(self.google_proxy_host):
+                raise ConfigError(
+                    "GOOGLE_PROXY_HOST must be a valid host in socks5 mode"
+                )
+            if (
+                not isinstance(self.google_proxy_port, int)
+                or isinstance(self.google_proxy_port, bool)
+                or not 1 <= self.google_proxy_port <= 65535
+            ):
+                raise ConfigError(
+                    "GOOGLE_PROXY_PORT must be an integer from 1 to 65535"
+                )
+
         missing = [
             name
             for name, configured in self.configured_status().items()
@@ -339,6 +406,9 @@ def load_google_config(
 ) -> GoogleSettings:
     """Load and validate Google settings without reading credential JSON content."""
     source = _configuration_source(environ, dotenv_path)
+    proxy_mode = _read_text(source, "GOOGLE_PROXY_MODE", "none").lower()
+    if not proxy_mode:
+        proxy_mode = "none"
     settings = GoogleSettings(
         service_account_file=_read_text(source, "GOOGLE_SERVICE_ACCOUNT_FILE"),
         clm_spreadsheet_id=_read_text(source, "CLM_SPREADSHEET_ID"),
@@ -346,6 +416,12 @@ def load_google_config(
         md_drive_folder_id=_read_text(source, "MD_DRIVE_FOLDER_ID"),
         drive_scope=_read_text(source, "GOOGLE_DRIVE_SCOPE"),
         sheets_scope=_read_text(source, "GOOGLE_SHEETS_SCOPE"),
+        google_proxy_mode=proxy_mode,
+        google_proxy_host=_read_text(source, "GOOGLE_PROXY_HOST"),
+        google_proxy_port=_read_optional_port(source, "GOOGLE_PROXY_PORT"),
+        google_proxy_rdns=_read_strict_bool(
+            source, "GOOGLE_PROXY_RDNS", True
+        ),
     )
     settings.validate(project_root=project_root)
     return settings

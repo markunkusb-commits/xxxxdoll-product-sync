@@ -29,6 +29,10 @@ class GoogleConfigTests(unittest.TestCase):
             "MD_DRIVE_FOLDER_ID": "md_folder_ID_1234567890",
             "GOOGLE_DRIVE_SCOPE": GOOGLE_DRIVE_READONLY_SCOPE,
             "GOOGLE_SHEETS_SCOPE": GOOGLE_SHEETS_READONLY_SCOPE,
+            "GOOGLE_PROXY_MODE": "none",
+            "GOOGLE_PROXY_HOST": "",
+            "GOOGLE_PROXY_PORT": "",
+            "GOOGLE_PROXY_RDNS": "true",
         }
 
     def tearDown(self) -> None:
@@ -96,7 +100,64 @@ class GoogleConfigTests(unittest.TestCase):
         representation = repr(settings)
 
         for value in self.valid.values():
-            self.assertNotIn(value, representation)
+            if value:
+                self.assertNotIn(value, representation)
+
+    def test_socks5_proxy_configuration_is_parsed_strictly(self) -> None:
+        settings = load_google_config(
+            {
+                **self.valid,
+                "GOOGLE_PROXY_MODE": "socks5",
+                "GOOGLE_PROXY_HOST": "127.0.0.1",
+                "GOOGLE_PROXY_PORT": "26001",
+                "GOOGLE_PROXY_RDNS": "false",
+            }
+        )
+
+        self.assertEqual(settings.google_proxy_mode, "socks5")
+        self.assertEqual(settings.google_proxy_host, "127.0.0.1")
+        self.assertEqual(settings.google_proxy_port, 26001)
+        self.assertFalse(settings.google_proxy_rdns)
+
+    def test_invalid_proxy_mode_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ConfigError, "GOOGLE_PROXY_MODE"):
+            load_google_config(
+                {**self.valid, "GOOGLE_PROXY_MODE": "automatic"}
+            )
+
+    def test_socks5_requires_valid_host(self) -> None:
+        for host in ("", "https://127.0.0.1", "bad host", "user@host"):
+            with self.subTest(host=host):
+                with self.assertRaisesRegex(ConfigError, "GOOGLE_PROXY_HOST"):
+                    load_google_config(
+                        {
+                            **self.valid,
+                            "GOOGLE_PROXY_MODE": "socks5",
+                            "GOOGLE_PROXY_HOST": host,
+                            "GOOGLE_PROXY_PORT": "26001",
+                        }
+                    )
+
+    def test_invalid_proxy_port_is_rejected(self) -> None:
+        for port in ("", "0", "65536", "not-a-port", "1.5"):
+            with self.subTest(port=port):
+                with self.assertRaisesRegex(ConfigError, "GOOGLE_PROXY_PORT"):
+                    load_google_config(
+                        {
+                            **self.valid,
+                            "GOOGLE_PROXY_MODE": "socks5",
+                            "GOOGLE_PROXY_HOST": "127.0.0.1",
+                            "GOOGLE_PROXY_PORT": port,
+                        }
+                    )
+
+    def test_proxy_rdns_accepts_only_true_or_false(self) -> None:
+        for value in ("1", "yes", "on", "", "sometimes"):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ConfigError, "GOOGLE_PROXY_RDNS"):
+                    load_google_config(
+                        {**self.valid, "GOOGLE_PROXY_RDNS": value}
+                    )
 
 
 if __name__ == "__main__":

@@ -43,12 +43,25 @@ def ensure_google_operation_allowed(operation: str) -> None:
 
 
 def google_redactor_for_settings(settings: GoogleSettings) -> Redactor:
+    proxy_url = None
+    if settings.google_proxy_host and settings.google_proxy_port is not None:
+        proxy_url = (
+            f"socks5://{settings.google_proxy_host}:"
+            f"{settings.google_proxy_port}"
+        )
     return Redactor.from_values(
         (
             str(settings.resolved_service_account_file),
             settings.clm_spreadsheet_id,
             settings.clm_drive_folder_id,
             settings.md_drive_folder_id,
+            settings.google_proxy_host,
+            (
+                str(settings.google_proxy_port)
+                if settings.google_proxy_port is not None
+                else None
+            ),
+            proxy_url,
         )
     )
 
@@ -70,11 +83,38 @@ class OfficialGoogleClientFactory:
             raise _stage_error("credentials_create", error, redactor) from None
 
         try:
-            from google.auth.transport.requests import Request
+            import httplib2
+            import socks
+            from google_auth_httplib2 import AuthorizedHttp, Request
 
-            credentials.refresh(Request())
+            if settings.google_proxy_mode == "socks5":
+                proxy_info = httplib2.ProxyInfo(
+                    proxy_type=socks.PROXY_TYPE_SOCKS5,
+                    proxy_host=settings.google_proxy_host,
+                    proxy_port=settings.google_proxy_port,
+                    proxy_rdns=settings.google_proxy_rdns,
+                )
+            else:
+                proxy_info = None
+            raw_http = httplib2.Http(
+                proxy_info=proxy_info,
+                timeout=30,
+            )
+        except Exception as error:
+            raise _stage_error("transport_create", error, redactor) from None
+
+        try:
+            credentials.refresh(Request(raw_http))
         except Exception as error:
             raise _stage_error("token_refresh", error, redactor) from None
+
+        try:
+            authorized_http = AuthorizedHttp(
+                credentials,
+                http=raw_http,
+            )
+        except Exception as error:
+            raise _stage_error("transport_authorize", error, redactor) from None
 
         try:
             from googleapiclient.discovery import build
@@ -82,7 +122,7 @@ class OfficialGoogleClientFactory:
             drive = build(
                 "drive",
                 "v3",
-                credentials=credentials,
+                http=authorized_http,
                 cache_discovery=False,
             )
         except Exception as error:
@@ -92,7 +132,7 @@ class OfficialGoogleClientFactory:
             sheets = build(
                 "sheets",
                 "v4",
-                credentials=credentials,
+                http=authorized_http,
                 cache_discovery=False,
             )
         except Exception as error:
