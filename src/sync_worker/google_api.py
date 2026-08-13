@@ -277,3 +277,25 @@ class ReadOnlyGoogleGateway:
             valueRenderOption="FORMULA",
         )
         return self._execute("sheets.values.get", request)
+
+    def inspect_sheet_layout(
+        self,
+        spreadsheet_id: str,
+        sheet_title: str,
+        a1_range: str,
+    ) -> object:
+        """Read one bounded grid region with display values and merge metadata."""
+        escaped_title = sheet_title.replace("'", "''")
+        request = self._sheets.spreadsheets().get(
+            spreadsheetId=spreadsheet_id,
+            includeGridData=True,
+            ranges=[f"'{escaped_title}'!{a1_range}"],
+            fields=(
+                "properties(title),"
+                "sheets(properties(title),"
+                "merges(startRowIndex,endRowIndex,startColumnIndex,"
+                "endColumnIndex),"
+                "data(startRow,startColumn,rowData(values(formattedValue))))"
+            ),
+        )
+        return self._execute("sheets.spreadsheets.get", request)

@@ -24,6 +24,12 @@ from .report import (
 )
 from .sanitization import Redactor
 from .security import redactor_for_settings
+from .sheet_layout import (
+    SheetLayoutInspector,
+    parse_a1_range,
+    safe_sheet_report_filename,
+    validate_sheet_title,
+)
 from .supplier_inventory import SupplierInventoryRunner, validate_max_depth
 
 
@@ -248,6 +254,74 @@ def _max_depth_argument(value: str) -> int:
         raise argparse.ArgumentTypeError(str(error)) from None
 
 
+def _sheet_title_argument(value: str) -> str:
+    try:
+        return validate_sheet_title(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(str(error)) from None
+
+
+def _sheet_range_argument(value: str) -> str:
+    try:
+        return parse_a1_range(value).a1
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(str(error)) from None
+
+
+def _run_inspect_sheet_layout(
+    logger: logging.Logger,
+    sheet_title: str,
+    a1_range: str,
+) -> int:
+    try:
+        validated_sheet = validate_sheet_title(sheet_title)
+        validated_range = parse_a1_range(a1_range).a1
+        settings = load_google_config()
+    except Exception as error:
+        _log_failure(logger, error, event="inspect_sheet_layout_aborted")
+        return 2
+
+    redactor = google_redactor_for_settings(settings)
+    try:
+        report = SheetLayoutInspector(
+            settings,
+            OfficialGoogleClientFactory(),
+            sheet_title=validated_sheet,
+            a1_range=validated_range,
+            redactor=redactor,
+            logger=logger,
+        ).run()
+        report_name = safe_sheet_report_filename(validated_sheet)
+        report_path = PROJECT_ROOT / "reports" / report_name
+        SafeJsonReportWriter(report_path, redactor).write(report)
+    except Exception as error:
+        logger.error(
+            json.dumps(
+                {
+                    "event": "inspect_sheet_layout_aborted",
+                    "error": redactor.exception(error),
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        )
+        return 2
+
+    logger.info(
+        json.dumps(
+            {
+                "event": "sheet_layout_report_written",
+                "path": f"reports/{report_name}",
+                "status": report.get("status"),
+                "write_requests_performed": 0,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+    )
+    return 0 if report.get("status") == "ok" else 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="python -m sync_worker")
     subcommands = parser.add_subparsers(dest="command", required=True)
@@ -271,6 +345,23 @@ def build_parser() -> argparse.ArgumentParser:
         default=4,
         help="Maximum Drive folder depth (1-6; default: 4)",
     )
+    inspect_sheet_layout = subcommands.add_parser(
+        "inspect-sheet-layout",
+        help="Inspect one bounded Sheet grid region without formulas or writes",
+    )
+    inspect_sheet_layout.add_argument(
+        "--sheet",
+        required=True,
+        type=_sheet_title_argument,
+        help="Exact Sheet title (1-150 characters)",
+    )
+    inspect_sheet_layout.add_argument(
+        "--range",
+        required=True,
+        dest="a1_range",
+        type=_sheet_range_argument,
+        help="Single bounded A1 range, up to AZ, 100 rows, and 5200 cells",
+    )
     return parser
 
 
@@ -285,4 +376,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_google_doctor(logger)
     if arguments.command == "supplier-inventory":
         return _run_supplier_inventory(logger, arguments.max_depth)
+    if arguments.command == "inspect-sheet-layout":
+        return _run_inspect_sheet_layout(
+            logger, arguments.sheet, arguments.a1_range
+        )
     raise AssertionError("Unhandled command")

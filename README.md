@@ -87,3 +87,13 @@ python -m sync_worker supplier-inventory --max-depth 4
 ```
 
 该命令递归扫描 CLM 与 MD 文件夹（深度限制 1–6、每目录最多 500 项），并仅从各工作表读取 `A1:AZ10` 结构样本。报告写入 `reports/supplier-inventory.json`，不保存 Google 文件、文件夹、Spreadsheet 或 Sheet ID，也不会下载文件或图片。
+
+## Sheet 版式检查
+
+```powershell
+python -m sync_worker inspect-sheet-layout `
+  --sheet "RMB Price List" `
+  --range "A1:AZ50"
+```
+
+该命令只读检查一个明确限制的 Sheet 区域（最多 100 行、52 列和 5200 个单元格），保留格式化显示值、真实 A1 坐标以及 merged ranges。报告不会保存公式原文，也不会执行任何写请求；输出文件为 `reports/sheet-layout-<safe-sheet-name>.json`，并由现有 `reports/*.json` Git ignore 规则保护。
