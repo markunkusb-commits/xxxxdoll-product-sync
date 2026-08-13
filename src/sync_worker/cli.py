@@ -24,6 +24,7 @@ from .report import (
 )
 from .sanitization import Redactor
 from .security import redactor_for_settings
+from .supplier_inventory import SupplierInventoryRunner, validate_max_depth
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -194,6 +195,59 @@ def _run_google_doctor(logger: logging.Logger) -> int:
     )
 
 
+def _run_supplier_inventory(logger: logging.Logger, max_depth: int) -> int:
+    try:
+        settings = load_google_config()
+    except Exception as error:
+        _log_failure(logger, error, event="supplier_inventory_aborted")
+        return 2
+
+    redactor = google_redactor_for_settings(settings)
+    try:
+        report = SupplierInventoryRunner(
+            settings,
+            OfficialGoogleClientFactory(),
+            max_depth=max_depth,
+            redactor=redactor,
+            logger=logger,
+        ).run()
+        report_path = PROJECT_ROOT / "reports" / "supplier-inventory.json"
+        SafeJsonReportWriter(report_path, redactor).write(report)
+    except Exception as error:
+        logger.error(
+            json.dumps(
+                {
+                    "event": "supplier_inventory_aborted",
+                    "error": redactor.exception(error),
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        )
+        return 2
+
+    logger.info(
+        json.dumps(
+            {
+                "event": "supplier_inventory_report_written",
+                "path": "reports/supplier-inventory.json",
+                "status": report.get("status"),
+                "write_requests_performed": 0,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+    )
+    return 0 if report.get("status") == "ok" else 1
+
+
+def _max_depth_argument(value: str) -> int:
+    try:
+        return validate_max_depth(int(value))
+    except (TypeError, ValueError) as error:
+        raise argparse.ArgumentTypeError(str(error)) from None
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="python -m sync_worker")
     subcommands = parser.add_subparsers(dest="command", required=True)
@@ -207,6 +261,16 @@ def build_parser() -> argparse.ArgumentParser:
     subcommands.add_parser(
         "google-doctor", help="Run read-only Google Drive and Sheets diagnostics"
     )
+    supplier_inventory = subcommands.add_parser(
+        "supplier-inventory",
+        help="Build a bounded read-only supplier Drive and Sheets inventory",
+    )
+    supplier_inventory.add_argument(
+        "--max-depth",
+        type=_max_depth_argument,
+        default=4,
+        help="Maximum Drive folder depth (1-6; default: 4)",
+    )
     return parser
 
 
@@ -219,4 +283,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_inspect_product(logger, arguments.sku)
     if arguments.command == "google-doctor":
         return _run_google_doctor(logger)
+    if arguments.command == "supplier-inventory":
+        return _run_supplier_inventory(logger, arguments.max_depth)
     raise AssertionError("Unhandled command")

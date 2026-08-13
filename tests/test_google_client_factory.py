@@ -74,7 +74,10 @@ class OfficialGoogleClientFactoryTests(unittest.TestCase):
         self.http_class = MagicMock(return_value=self.raw_http)
         self.request_instance = object()
         self.request_class = MagicMock(return_value=self.request_instance)
-        self.authorized_http = object()
+        self.authorized_http_request = MagicMock(name="authorized_http_request")
+        self.authorized_http = SimpleNamespace(
+            request=self.authorized_http_request
+        )
         self.authorized_http_class = MagicMock(return_value=self.authorized_http)
         self.drive_client = MagicMock(name="drive_client")
         self.sheets_client = MagicMock(name="sheets_client")
@@ -205,6 +208,22 @@ class OfficialGoogleClientFactoryTests(unittest.TestCase):
             self.assertNotIn("credentials", build_call.kwargs)
         self.assertIs(clients.drive, self.drive_client)
         self.assertIs(clients.sheets, self.sheets_client)
+
+    def test_authorized_transport_blocks_write_http_methods(self) -> None:
+        self._create()
+
+        for method in ("POST", "PUT", "PATCH", "DELETE"):
+            with self.subTest(method=method):
+                with self.assertRaisesRegex(Exception, "only GET and HEAD"):
+                    self.authorized_http.request(
+                        "https://www.googleapis.com/blocked", method
+                    )
+        self.authorized_http.request(
+            "https://www.googleapis.com/read-only", "GET"
+        )
+        self.authorized_http_request.assert_called_once_with(
+            "https://www.googleapis.com/read-only", "GET"
+        )
 
     def test_none_mode_explicitly_disables_proxy_auto_discovery(self) -> None:
         settings = load_google_config(

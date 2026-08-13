@@ -35,11 +35,31 @@ _ALLOWED_GOOGLE_OPERATIONS = frozenset(
         "sheets.values.get",
     }
 )
+_ALLOWED_GOOGLE_HTTP_METHODS = frozenset({"GET", "HEAD"})
 
 
 def ensure_google_operation_allowed(operation: str) -> None:
     if operation not in _ALLOWED_GOOGLE_OPERATIONS:
         raise GoogleOperationBlocked("Google operation is not in the read-only allowlist")
+
+
+def ensure_google_http_method_allowed(method: object) -> None:
+    if str(method).upper() not in _ALLOWED_GOOGLE_HTTP_METHODS:
+        raise GoogleOperationBlocked("Google transport allows only GET and HEAD")
+
+
+def protect_google_transport(authorized_http: Any) -> Any:
+    """Install a fail-closed HTTP verb guard while retaining the same transport."""
+    original_request = authorized_http.request
+
+    def read_only_request(
+        uri: str, method: str = "GET", *args: object, **kwargs: object
+    ) -> object:
+        ensure_google_http_method_allowed(method)
+        return original_request(uri, method, *args, **kwargs)
+
+    authorized_http.request = read_only_request
+    return authorized_http
 
 
 def google_redactor_for_settings(settings: GoogleSettings) -> Redactor:
@@ -113,6 +133,7 @@ class OfficialGoogleClientFactory:
                 credentials,
                 http=raw_http,
             )
+            protect_google_transport(authorized_http)
         except Exception as error:
             raise _stage_error("transport_authorize", error, redactor) from None
 
@@ -192,6 +213,22 @@ class ReadOnlyGoogleGateway:
         )
         return self._execute("drive.files.list", request)
 
+    def list_inventory_children(
+        self, folder_id: str, *, item_limit: int = 500
+    ) -> object:
+        """Read one bounded child page for recursive inventory traversal."""
+        if not 1 <= item_limit <= 500:
+            raise ValueError("Drive inventory item_limit must be from 1 to 500")
+        request = self._drive.files().list(
+            q=f"'{folder_id}' in parents and trashed = false",
+            pageSize=item_limit,
+            fields="nextPageToken,files(id,name,mimeType)",
+            orderBy="name",
+            includeItemsFromAllDrives=True,
+            supportsAllDrives=True,
+        )
+        return self._execute("drive.files.list", request)
+
     def get_spreadsheet(self, spreadsheet_id: str) -> object:
         request = self._sheets.spreadsheets().get(
             spreadsheetId=spreadsheet_id,
@@ -211,5 +248,32 @@ class ReadOnlyGoogleGateway:
             spreadsheetId=spreadsheet_id,
             range=f"'{escaped_title}'!A1:Z5",
             majorDimension="ROWS",
+        )
+        return self._execute("sheets.values.get", request)
+
+    def get_inventory_spreadsheet(self, spreadsheet_id: str) -> object:
+        """Read only inventory-safe sheet metadata without requesting sheet IDs."""
+        request = self._sheets.spreadsheets().get(
+            spreadsheetId=spreadsheet_id,
+            includeGridData=False,
+            fields=(
+                "properties(title),"
+                "sheets(properties(title,index,hidden,"
+                "gridProperties(rowCount,columnCount,frozenRowCount,"
+                "frozenColumnCount)))"
+            ),
+        )
+        return self._execute("sheets.spreadsheets.get", request)
+
+    def get_inventory_sheet_sample(
+        self, spreadsheet_id: str, sheet_title: str
+    ) -> object:
+        """Read the fixed, bounded structure sample A1:AZ10."""
+        escaped_title = sheet_title.replace("'", "''")
+        request = self._sheets.spreadsheets().values().get(
+            spreadsheetId=spreadsheet_id,
+            range=f"'{escaped_title}'!A1:AZ10",
+            majorDimension="ROWS",
+            valueRenderOption="FORMULA",
         )
         return self._execute("sheets.values.get", request)

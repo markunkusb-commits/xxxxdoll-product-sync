@@ -78,3 +78,12 @@ python -m sync_worker google-doctor
 ```
 
 该命令只检查两个指定根文件夹、最多 100 个一级子项、Spreadsheet 元数据，以及每个工作表的 `A1:Z5` 小样本。报告只保存文件元数据和单元格统计，不保存文件 ID、Spreadsheet ID、单元格内容、凭据内容或下载链接；所有 Google 写操作均不在代码允许列表中。
+
+## 供应商结构清单
+
+```powershell
+python -m sync_worker supplier-inventory
+python -m sync_worker supplier-inventory --max-depth 4
+```
+
+该命令递归扫描 CLM 与 MD 文件夹（深度限制 1–6、每目录最多 500 项），并仅从各工作表读取 `A1:AZ10` 结构样本。报告写入 `reports/supplier-inventory.json`，不保存 Google 文件、文件夹、Spreadsheet 或 Sheet ID，也不会下载文件或图片。
