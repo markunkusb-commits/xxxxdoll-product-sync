@@ -8,6 +8,7 @@ import logging
 from collections.abc import Sequence
 from pathlib import Path
 
+from .additional_option_dry_run import run_additional_option_dry_run
 from .config import load_config, load_google_config
 from .clm_price_dry_run import run_clm_parser_dry_run
 from .doctor import DoctorRunner
@@ -352,6 +353,37 @@ def _run_parse_clm_price_list(logger: logging.Logger, input_path: Path) -> int:
     return 0 if report.get("status") == "ok" else 1
 
 
+def _run_parse_additional_option(
+    logger: logging.Logger, input_path: Path
+) -> int:
+    try:
+        report, _ = run_additional_option_dry_run(
+            input_path,
+            project_root=PROJECT_ROOT,
+        )
+    except Exception as error:
+        _log_failure(logger, error, event="parse_additional_option_aborted")
+        return 2
+
+    logger.info(
+        json.dumps(
+            {
+                "event": "additional_option_dry_run_report_written",
+                "path": "reports/additional-option-dry-run.json",
+                "status": report.get("status"),
+                "detected_option_count": report.get(
+                    "detected_option_count", 0
+                ),
+                "network_requests_performed": 0,
+                "write_requests_performed": 0,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+    )
+    return 0 if report.get("status") == "ok" else 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="python -m sync_worker")
     subcommands = parser.add_subparsers(dest="command", required=True)
@@ -403,6 +435,17 @@ def build_parser() -> argparse.ArgumentParser:
         dest="input_path",
         help="Local sheet-layout JSON file",
     )
+    parse_additional_option = subcommands.add_parser(
+        "parse-additional-option",
+        help="Parse a local Additional Option layout into a dry-run report",
+    )
+    parse_additional_option.add_argument(
+        "--input",
+        required=True,
+        type=Path,
+        dest="input_path",
+        help="Local Additional Option sheet-layout JSON file",
+    )
     return parser
 
 
@@ -423,4 +466,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     if arguments.command == "parse-clm-price-list":
         return _run_parse_clm_price_list(logger, arguments.input_path)
+    if arguments.command == "parse-additional-option":
+        return _run_parse_additional_option(logger, arguments.input_path)
     raise AssertionError("Unhandled command")
