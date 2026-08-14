@@ -101,3 +101,12 @@ python -m sync_worker inspect-sheet-layout `
 ## CLM RMB Price List Parser V1
 
 `sync_worker.clm_price_parser` 是纯本地、无网络和无写入的中间模型解析器。它接收已经生成的 sheet-layout 结构，依据每个动态系列标题划分产品 Block，并提取规格、included features、upgrade options、价格、notice 与图片链接占位符。未知规格和商业字段会连同坐标保留，不会被静默丢弃；`Height(Model)` 保持为独立原始规格并附加 warning，不会猜测拆分。
+
+使用本地 sheet-layout JSON 生成脱敏 dry-run 报告：
+
+```powershell
+python -m sync_worker parse-clm-price-list `
+  --input reports/sheet-layout-RMB-Price-List-A45-AZ100.json
+```
+
+该命令不会加载 `.env`、服务账号或 Google API 客户端，也不会发起网络或外部写请求。输出固定写入 `reports/clm-parser-dry-run.json`；报告只保留允许的产品结构，供应商 URL 会在写入前脱敏。

@@ -9,6 +9,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from .config import load_config, load_google_config
+from .clm_price_dry_run import run_clm_parser_dry_run
 from .doctor import DoctorRunner
 from .http_client import ReadOnlyHttpClient
 from .google_api import OfficialGoogleClientFactory, google_redactor_for_settings
@@ -322,6 +323,35 @@ def _run_inspect_sheet_layout(
     return 0 if report.get("status") == "ok" else 1
 
 
+def _run_parse_clm_price_list(logger: logging.Logger, input_path: Path) -> int:
+    try:
+        report, _ = run_clm_parser_dry_run(
+            input_path,
+            project_root=PROJECT_ROOT,
+        )
+    except Exception as error:
+        _log_failure(logger, error, event="parse_clm_price_list_aborted")
+        return 2
+
+    logger.info(
+        json.dumps(
+            {
+                "event": "clm_parser_dry_run_report_written",
+                "path": "reports/clm-parser-dry-run.json",
+                "status": report.get("status"),
+                "detected_product_count": report.get(
+                    "detected_product_count", 0
+                ),
+                "network_requests_performed": 0,
+                "write_requests_performed": 0,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+    )
+    return 0 if report.get("status") == "ok" else 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="python -m sync_worker")
     subcommands = parser.add_subparsers(dest="command", required=True)
@@ -362,6 +392,17 @@ def build_parser() -> argparse.ArgumentParser:
         type=_sheet_range_argument,
         help="Single bounded A1 range, up to AZ, 100 rows, and 5200 cells",
     )
+    parse_clm_price_list = subcommands.add_parser(
+        "parse-clm-price-list",
+        help="Parse one local sheet-layout JSON into a sanitized dry-run report",
+    )
+    parse_clm_price_list.add_argument(
+        "--input",
+        required=True,
+        type=Path,
+        dest="input_path",
+        help="Local sheet-layout JSON file",
+    )
     return parser
 
 
@@ -380,4 +421,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_inspect_sheet_layout(
             logger, arguments.sheet, arguments.a1_range
         )
+    if arguments.command == "parse-clm-price-list":
+        return _run_parse_clm_price_list(logger, arguments.input_path)
     raise AssertionError("Unhandled command")
