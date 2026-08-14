@@ -428,6 +428,22 @@ class CLMPriceParserTests(unittest.TestCase):
         self.assertEqual(price.currency, "USD")
         self.assertEqual(price.amount, 850)
 
+    def test_minimum_retail_label_and_value_on_separate_rows_are_parsed(
+        self,
+    ) -> None:
+        cells = [
+            cell(2, 2, "CLM Pro"),
+            cell(3, 34, "Minimum Retail Price"),
+            cell(4, 34, "US$270"),
+            cell(5, 2, "Photo download link"),
+        ]
+
+        price = self.parser.parse(layout(*cells))[0].pricing.minimum_retail_price
+
+        self.assertEqual(price.raw_value, "US$270")
+        self.assertEqual(price.currency, "USD")
+        self.assertEqual(price.amount, 270)
+
     def test_normal_options_price_is_parsed(self) -> None:
         cells, _ = block(
             2,
@@ -437,6 +453,22 @@ class CLMPriceParserTests(unittest.TestCase):
 
         price = self.parser.parse(layout(*cells))[0].pricing.normal_options_price
 
+        self.assertEqual(price.currency, "CNY")
+        self.assertEqual(price.amount, 2500)
+
+    def test_normal_options_label_and_yuan_value_on_separate_rows_are_parsed(
+        self,
+    ) -> None:
+        cells = [
+            cell(2, 2, "CLM Classic"),
+            cell(3, 34, "Normal options Price"),
+            cell(4, 34, "¥2500"),
+            cell(5, 2, "Photo download link"),
+        ]
+
+        price = self.parser.parse(layout(*cells))[0].pricing.normal_options_price
+
+        self.assertEqual(price.raw_value, "¥2500")
         self.assertEqual(price.currency, "CNY")
         self.assertEqual(price.amount, 2500)
 
@@ -458,6 +490,68 @@ class CLMPriceParserTests(unittest.TestCase):
         self.assertEqual(
             pricing.including_head_price.context, "including_head_price"
         )
+
+    def test_fob_prices_use_following_body_and_head_context_rows(self) -> None:
+        cells = [
+            cell(2, 2, "CLM Ultra"),
+            cell(3, 34, "FOB Unit Price RMB2250"),
+            cell(4, 34, "(Only Body)"),
+            cell(5, 34, "FOB Unit Price RMB2750"),
+            cell(6, 34, "(Price including head)"),
+            cell(7, 2, "Photo download link"),
+        ]
+
+        pricing = self.parser.parse(layout(*cells))[0].pricing
+
+        self.assertIsNone(pricing.fob_unit_price)
+        self.assertEqual(pricing.body_only_price.raw_value, "FOB Unit Price RMB2250")
+        self.assertEqual(pricing.body_only_price.currency, "RMB")
+        self.assertEqual(pricing.body_only_price.amount, 2250)
+        self.assertEqual(
+            pricing.including_head_price.raw_value, "FOB Unit Price RMB2750"
+        )
+        self.assertEqual(pricing.including_head_price.currency, "RMB")
+        self.assertEqual(pricing.including_head_price.amount, 2750)
+
+    def test_ambiguous_price_is_preserved_as_raw_commercial_entry(self) -> None:
+        cells = [
+            cell(2, 2, "CLM Pro"),
+            cell(3, 34, "Minimum Retail Price"),
+            cell(4, 34, "Ask sales"),
+            cell(5, 2, "Photo download link"),
+        ]
+
+        product = self.parser.parse(layout(*cells))[0]
+
+        self.assertIsNone(product.pricing.minimum_retail_price)
+        self.assertEqual(len(product.raw_commercial_entries), 1)
+        self.assertEqual(
+            product.raw_commercial_entries[0].field, "Minimum Retail Price"
+        )
+        self.assertEqual(product.raw_commercial_entries[0].value, "Ask sales")
+        self.assertTrue(any("Ambiguous price" in item for item in product.warnings))
+
+    def test_pricing_normalization_does_not_change_block_boundaries(self) -> None:
+        first = [
+            cell(8, 2, "◆ CLM Classic ◆"),
+            cell(9, 34, "Minimum Retail Price"),
+            cell(10, 34, "US$270"),
+            cell(11, 2, "Photo download link"),
+        ]
+        second = [
+            cell(20, 2, "⭐CLM Pro⭐"),
+            cell(21, 34, "FOB Unit Price RMB2250"),
+            cell(22, 34, "(Only Body)"),
+            cell(23, 2, "Photo download link"),
+        ]
+
+        products = self.parser.parse(layout(*first, *second))
+
+        self.assertEqual([item.series for item in products], ["classic", "pro"])
+        self.assertEqual(products[0].source.start_row, 8)
+        self.assertEqual(products[0].source.end_row, 19)
+        self.assertEqual(products[1].source.start_row, 20)
+        self.assertEqual(products[1].source.end_row, 23)
 
     def test_rmb_usd_and_yuan_price_tokens_are_supported(self) -> None:
         cases = (
@@ -481,11 +575,14 @@ class CLMPriceParserTests(unittest.TestCase):
         )
 
         product = self.parser.parse(layout(*cells))[0]
-        price = product.pricing.fob_unit_price
 
-        self.assertIsNone(price.amount)
-        self.assertEqual(price.raw_value, "Ask sales")
-        self.assertTrue(any("Unparsed price" in item for item in product.warnings))
+        self.assertIsNone(product.pricing.fob_unit_price)
+        self.assertEqual(len(product.raw_commercial_entries), 1)
+        self.assertEqual(
+            product.raw_commercial_entries[0].field, "FOB Unit Price"
+        )
+        self.assertEqual(product.raw_commercial_entries[0].value, "Ask sales")
+        self.assertTrue(any("Ambiguous price" in item for item in product.warnings))
 
     def test_upgrade_price_is_not_misclassified_as_fob(self) -> None:
         cells, _ = block(

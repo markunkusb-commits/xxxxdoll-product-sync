@@ -154,6 +154,14 @@ class _Cell:
     raw_value: str = field(repr=False)
 
 
+@dataclass(frozen=True, slots=True)
+class _PendingPrice:
+    key: str
+    label_cell: _Cell
+    parsed_price: ParsedPrice | None
+    price_cell: _Cell | None
+
+
 def recognize_series_title(value: str) -> str | None:
     normalized = _label_key(value)
     if not normalized.startswith("clm "):
@@ -259,6 +267,15 @@ def _commercial_price_key(value: str) -> str | None:
     for label, key in _PRICE_LABELS:
         if label in normalized:
             return key
+    return None
+
+
+def _price_context_key(value: str) -> str | None:
+    normalized = _label_key(value)
+    if "price including head" in normalized or "including head" in normalized:
+        return "including_head_price"
+    if "only body" in normalized or "body only" in normalized:
+        return "body_only_price"
     return None
 
 
@@ -416,10 +433,9 @@ def _parse_specifications(
 
 def _price_from_cells(
     label_cell: _Cell, row_cells: list[_Cell], context: str
-) -> tuple[ParsedPrice, set[str]]:
-    consumed = {label_cell.coordinate}
+) -> tuple[ParsedPrice | None, _Cell | None]:
     if _PRICE_PATTERN.search(label_cell.raw_value):
-        return parse_price(label_cell.raw_value, context=context), consumed
+        return parse_price(label_cell.raw_value, context=context), label_cell
     right_candidates = [
         candidate
         for candidate in row_cells
@@ -427,13 +443,206 @@ def _price_from_cells(
     ]
     for candidate in right_candidates:
         if _PRICE_PATTERN.search(candidate.raw_value):
-            consumed.add(candidate.coordinate)
-            return parse_price(candidate.raw_value, context=context), consumed
-    if right_candidates:
-        candidate = right_candidates[0]
-        consumed.add(candidate.coordinate)
-        return parse_price(candidate.raw_value, context=context), consumed
-    return parse_price(label_cell.raw_value, context=context), consumed
+            return parse_price(candidate.raw_value, context=context), candidate
+    return None, right_candidates[0] if right_candidates else None
+
+
+def _pending_coordinates(pending: _PendingPrice) -> set[str]:
+    coordinates = {pending.label_cell.coordinate}
+    if pending.price_cell is not None:
+        coordinates.add(pending.price_cell.coordinate)
+    return coordinates
+
+
+def _raw_pending_entry(
+    pending: _PendingPrice,
+    fallback_cell: _Cell | None = None,
+) -> RawCommercialEntry:
+    value_cell = pending.price_cell or fallback_cell
+    if value_cell is None:
+        return RawCommercialEntry(
+            field=None,
+            value=pending.label_cell.value,
+            coordinate=pending.label_cell.coordinate,
+        )
+    return RawCommercialEntry(
+        field=pending.label_cell.value,
+        value=value_cell.value,
+        coordinate=value_cell.coordinate,
+    )
+
+
+def _normalize_prices(
+    rows: Mapping[int, list[_Cell]],
+    *,
+    start_row: int,
+    content_end_row: int,
+    consumed_spec_coordinates: set[str],
+) -> tuple[
+    dict[str, ParsedPrice | None],
+    set[str],
+    list[RawCommercialEntry],
+    list[str],
+]:
+    """Normalize known prices with one-row value/context look-ahead."""
+    price_values: dict[str, ParsedPrice | None] = {
+        "fob_unit_price": None,
+        "minimum_retail_price": None,
+        "normal_options_price": None,
+        "body_only_price": None,
+        "including_head_price": None,
+    }
+    consumed: set[str] = set()
+    raw_entries: list[RawCommercialEntry] = []
+    warnings: list[str] = []
+    pending: _PendingPrice | None = None
+
+    def preserve_pending(
+        item: _PendingPrice,
+        *,
+        fallback_cell: _Cell | None = None,
+        duplicate: bool = False,
+    ) -> None:
+        raw_entries.append(_raw_pending_entry(item, fallback_cell))
+        consumed.update(_pending_coordinates(item))
+        if fallback_cell is not None:
+            consumed.add(fallback_cell.coordinate)
+        warning = (
+            "Duplicate price preserved as raw commercial entry"
+            if duplicate
+            else "Ambiguous price preserved as raw commercial entry"
+        )
+        warnings.append(warning)
+
+    def store_pending(item: _PendingPrice, target_key: str) -> None:
+        if item.parsed_price is None:
+            preserve_pending(item)
+            return
+        if price_values[target_key] is not None:
+            preserve_pending(item, duplicate=True)
+            return
+        price_values[target_key] = ParsedPrice(
+            raw_value=item.parsed_price.raw_value,
+            currency=item.parsed_price.currency,
+            amount=item.parsed_price.amount,
+            context=target_key,
+        )
+        consumed.update(_pending_coordinates(item))
+
+    for row_number in range(start_row, content_end_row + 1):
+        row_cells = [
+            cell
+            for cell in rows.get(row_number, [])
+            if cell.coordinate not in consumed_spec_coordinates
+            and cell.coordinate not in consumed
+        ]
+
+        if pending is not None:
+            context_cell = next(
+                (
+                    cell
+                    for cell in row_cells
+                    if _price_context_key(cell.value) is not None
+                ),
+                None,
+            )
+            if pending.parsed_price is not None:
+                if pending.key == "fob_unit_price" and context_cell is not None:
+                    target_key = _price_context_key(context_cell.value)
+                    assert target_key is not None
+                    store_pending(pending, target_key)
+                    consumed.add(context_cell.coordinate)
+                else:
+                    store_pending(pending, pending.key)
+                pending = None
+                row_cells = [
+                    cell
+                    for cell in row_cells
+                    if cell.coordinate not in consumed
+                ]
+            elif pending.price_cell is not None:
+                preserve_pending(pending)
+                pending = None
+                row_cells = [
+                    cell
+                    for cell in row_cells
+                    if cell.coordinate not in consumed
+                ]
+            else:
+                value_cell = next(
+                    (
+                        cell
+                        for cell in row_cells
+                        if _PRICE_PATTERN.search(cell.raw_value)
+                        and _commercial_price_key(cell.value) is None
+                    ),
+                    None,
+                )
+                if value_cell is not None:
+                    parsed = parse_price(value_cell.raw_value, context=pending.key)
+                    pending = _PendingPrice(
+                        key=pending.key,
+                        label_cell=pending.label_cell,
+                        parsed_price=parsed,
+                        price_cell=value_cell,
+                    )
+                    if pending.key == "fob_unit_price" and context_cell is not None:
+                        target_key = _price_context_key(context_cell.value)
+                        assert target_key is not None
+                        store_pending(pending, target_key)
+                        consumed.add(context_cell.coordinate)
+                        pending = None
+                    elif pending.key != "fob_unit_price":
+                        store_pending(pending, pending.key)
+                        pending = None
+                    row_cells = [
+                        cell
+                        for cell in row_cells
+                        if cell.coordinate not in consumed
+                    ]
+                else:
+                    fallback_cell = next(
+                        (
+                            cell
+                            for cell in row_cells
+                            if _commercial_price_key(cell.value) is None
+                        ),
+                        None,
+                    )
+                    preserve_pending(pending, fallback_cell=fallback_cell)
+                    pending = None
+                    row_cells = [
+                        cell
+                        for cell in row_cells
+                        if cell.coordinate not in consumed
+                    ]
+
+        for label_cell in row_cells:
+            if label_cell.coordinate in consumed:
+                continue
+            price_key = _commercial_price_key(label_cell.value)
+            if price_key is None:
+                continue
+            if pending is not None:
+                store_pending(pending, pending.key)
+            parsed_price, price_cell = _price_from_cells(
+                label_cell, row_cells, price_key
+            )
+            candidate = _PendingPrice(
+                key=price_key,
+                label_cell=label_cell,
+                parsed_price=parsed_price,
+                price_cell=price_cell,
+            )
+            if parsed_price is None or price_key == "fob_unit_price":
+                pending = candidate
+            else:
+                store_pending(candidate, price_key)
+                pending = None
+
+    if pending is not None:
+        store_pending(pending, pending.key)
+    return price_values, consumed, raw_entries, warnings
 
 
 def _upgrade_from_row(cells: list[_Cell]) -> tuple[UpgradeOption | None, set[str]]:
@@ -476,17 +685,19 @@ def _parse_commercial(
     included_features: list[str] = []
     upgrade_options: list[UpgradeOption] = []
     notices: list[str] = []
-    raw_entries: list[RawCommercialEntry] = []
-    warnings: list[str] = []
-    price_values: dict[str, ParsedPrice | None] = {
-        "fob_unit_price": None,
-        "minimum_retail_price": None,
-        "normal_options_price": None,
-        "body_only_price": None,
-        "including_head_price": None,
-    }
+    (
+        price_values,
+        consumed_price_coordinates,
+        raw_entries,
+        warnings,
+    ) = _normalize_prices(
+        rows,
+        start_row=start_row,
+        content_end_row=content_end_row,
+        consumed_spec_coordinates=consumed_spec_coordinates,
+    )
     mode: str | None = None
-    consumed = set(consumed_spec_coordinates)
+    consumed = set(consumed_spec_coordinates) | consumed_price_coordinates
     for row_number in range(start_row, content_end_row + 1):
         unconsumed_row_cells = [
             cell
@@ -532,18 +743,6 @@ def _parse_commercial(
                 notices.append(cell.value)
                 consumed.add(cell.coordinate)
                 continue
-            price_key = _commercial_price_key(cell.value)
-            if price_key is not None:
-                parsed_price, price_consumed = _price_from_cells(
-                    cell, row_cells, price_key
-                )
-                price_values[price_key] = parsed_price
-                consumed.update(price_consumed)
-                mode = None
-                if parsed_price.amount is None:
-                    warnings.append(f"Unparsed price preserved: {cell.value}")
-                continue
-
         remaining = [cell for cell in row_cells if cell.coordinate not in consumed]
         if not remaining:
             continue
