@@ -58,6 +58,25 @@ COMBINED_HEADERS = (
     "Anus\n肛门深度",
 )
 
+REAL_MULTILINE_HEADERS = (
+    "Type\n类型",
+    "Body type\n身型",
+    "FOB Price\n(出厂价格)",
+    "Upper Chest\n上胸围",
+    "Lower Chest\n下胸围",
+    "Waist\n腰围",
+    "Hip\n臀围",
+    "Shoulder\n肩宽",
+    "Leg Length\n小腿长度",
+    "Thigh\n大腿长度",
+    "Arm Length\n手臂长",
+    "Sole\n脚板长度",
+    "N.W.\n净重",
+    "Oral\n口腔深度",
+    "Vagina\n阴部深度",
+    "Anus\n肛门深度",
+)
+
 
 def cell(
     row: int,
@@ -449,6 +468,132 @@ class SizeListParserTests(unittest.TestCase):
         ):
             records = parse_size_list(fixture)
         self.assertEqual(len(records), 1)
+
+    def test_39_full_real_multiline_header_set_is_recognized(self) -> None:
+        record = one_record(headers=REAL_MULTILINE_HEADERS)
+        self.assertEqual(record.identity.body_type, "FD155cm")
+        self.assertEqual(record.supplier_costs.fob_price.amount, 5500)
+
+    def test_40_crlf_multiline_headers_are_recognized(self) -> None:
+        headers = tuple(value.replace("\n", "\r\n") for value in REAL_MULTILINE_HEADERS)
+        record = one_record(headers=headers)
+        self.assertEqual(record.classification.type, "Full Silicone")
+
+    def test_41_multiline_headers_allow_outer_and_repeated_whitespace(self) -> None:
+        headers = list(REAL_MULTILINE_HEADERS)
+        headers[0] = "  Type  \n\n  类型  "
+        headers[1] = "  Body   type  \n  身型  "
+        headers[2] = "  FOB   Price  \n  (出厂价格)  "
+        record = one_record(headers=tuple(headers))
+        self.assertEqual(record.identity.body_type, "FD155cm")
+
+    def test_42_plain_english_headers_remain_compatible(self) -> None:
+        record = one_record(headers=HEADERS)
+        self.assertEqual(record.supplier_costs.fob_price.currency, "RMB")
+
+    def test_43_n_w_with_periods_maps_to_net_weight(self) -> None:
+        record = one_record(
+            cell(2, 13, "54kg\n(119.05LB)"),
+            headers=REAL_MULTILINE_HEADERS,
+        )
+        self.assertEqual(record.measurements.net_weight.metric.value, 54)
+        self.assertEqual(record.measurements.net_weight.imperial.value, 119.05)
+
+    def test_44_chinese_annotation_does_not_change_canonical_field(self) -> None:
+        headers = list(REAL_MULTILINE_HEADERS)
+        headers[3] = "Upper Chest\n(上胸围，供应商说明)"
+        record = one_record(cell(2, 4, "98cm"), headers=tuple(headers))
+        self.assertEqual(record.measurements.upper_chest.metric.value, 98)
+
+    def test_45_unknown_header_is_not_guessed_as_known_measurement(self) -> None:
+        headers = list(REAL_MULTILINE_HEADERS)
+        headers[3] = "Bust Size\n胸部尺寸"
+        record = one_record(cell(2, 4, "98cm"), headers=tuple(headers))
+        self.assertIsNone(record.measurements.upper_chest)
+        self.assertTrue(record.raw_measurements[0].fields[0].startswith("unknown:"))
+
+    def test_46_missing_required_header_still_raises(self) -> None:
+        headers = list(REAL_MULTILINE_HEADERS)
+        headers[2] = "Wholesale Cost\n(出厂价格)"
+        with self.assertRaisesRegex(SizeListParserError, "Required Size List"):
+            one_record(headers=tuple(headers))
+
+    def test_47_two_dimensional_sole_with_integer_length_is_parsed(self) -> None:
+        raw_value = "7*2.5cm\n(2.8*1in)"
+        sole = one_record(cell(2, 12, raw_value)).measurements.sole
+        self.assertEqual((sole.metric.length, sole.metric.width, sole.metric.unit), (7, 2.5, "cm"))
+        self.assertEqual((sole.imperial.length, sole.imperial.width, sole.imperial.unit), (2.8, 1, "in"))
+        self.assertEqual(sole.raw_value, raw_value)
+
+    def test_48_two_dimensional_sole_with_decimal_values_is_parsed(self) -> None:
+        sole = one_record(cell(2, 12, "8.5*3cm\n(3.3*1.2in)")).measurements.sole
+        self.assertEqual((sole.metric.length, sole.metric.width), (8.5, 3))
+        self.assertEqual((sole.imperial.length, sole.imperial.width), (3.3, 1.2))
+
+    def test_49_valid_metric_survives_imperial_typo(self) -> None:
+        record = one_record(cell(2, 8, "32cm\n(12.06n)"))
+        shoulder = record.measurements.shoulder
+        self.assertEqual((shoulder.metric.value, shoulder.metric.unit), (32, "cm"))
+        self.assertIsNone(shoulder.imperial)
+        self.assertEqual(shoulder.raw_value, "32cm\n(12.06n)")
+        self.assertIn("malformed imperial component: shoulder", record.warnings)
+
+    def test_50_valid_metric_survives_imperial_without_unit(self) -> None:
+        record = one_record(cell(2, 11, "60cm\n(23.62)"))
+        arm = record.measurements.arm_length
+        self.assertEqual((arm.metric.value, arm.metric.unit), (60, "cm"))
+        self.assertIsNone(arm.imperial)
+        self.assertIn("malformed imperial component: arm_length", record.warnings)
+
+    def test_51_valid_kg_survives_lb_without_unit(self) -> None:
+        record = one_record(cell(2, 13, "38kg\n(83.7)"))
+        weight = record.measurements.net_weight
+        self.assertEqual((weight.metric.value, weight.metric.unit), (38, "kg"))
+        self.assertIsNone(weight.imperial)
+        self.assertIn("malformed imperial component: net_weight", record.warnings)
+
+    def test_52_unitless_vagina_is_preserved_without_normalization(self) -> None:
+        record = one_record(cell(2, 15, "22"))
+        self.assertIsNone(record.measurements.vagina)
+        self.assertIn("unitless measurement preserved: vagina", record.warnings)
+        raw = next(item for item in record.raw_measurements if item.fields == ("vagina",))
+        self.assertEqual(raw.raw_value, "22")
+
+    def test_53_unitless_anus_is_preserved_without_normalization(self) -> None:
+        record = one_record(cell(2, 16, "18"))
+        self.assertIsNone(record.measurements.anus)
+        self.assertIn("unitless measurement preserved: anus", record.warnings)
+        raw = next(item for item in record.raw_measurements if item.fields == ("anus",))
+        self.assertEqual(raw.raw_value, "18")
+
+    def test_54_partial_and_unitless_values_do_not_invent_units(self) -> None:
+        record = one_record(
+            cell(2, 11, "60cm\n(23.62)"),
+            cell(2, 13, "38kg\n(83.7)"),
+            cell(2, 15, "22"),
+        )
+        serialized = json.dumps(record.to_dict(), ensure_ascii=False)
+        self.assertNotIn('"value": 23.62', serialized)
+        self.assertNotIn('"value": 83.7', serialized)
+        self.assertNotIn('"value": 22', serialized)
+
+    def test_55_ambiguous_d_e_merge_behavior_remains_unchanged(self) -> None:
+        cells = header_cells()
+        cells.extend(
+            [
+                cell(2, 1, "TPE body + Silicone Head"),
+                cell(2, 2, "870# Torso"),
+                cell(2, 4, "98cm", merged_range="D2:E2"),
+            ]
+        )
+        record = self.parser.parse(
+            layout(*cells, merges=[merge("D2:E2", 2, 2, "D", "E")])
+        )[0]
+        self.assertIsNone(record.measurements.upper_chest)
+        self.assertIsNone(record.measurements.lower_chest)
+        self.assertEqual(record.raw_measurements[0].raw_value, "98cm")
+        self.assertEqual(record.raw_measurements[0].merged_range, "D2:E2")
+        self.assertIn("ambiguous merged measurement D:E", record.warnings)
 
 
 if __name__ == "__main__":

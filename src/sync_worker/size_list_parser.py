@@ -33,10 +33,17 @@ _RANGE_PATTERN = re.compile(
     r"^([A-Z]+)([1-9][0-9]*):([A-Z]+)([1-9][0-9]*)$"
 )
 _URL_PATTERN = re.compile(r"(?i)(?:https?://|www\.)[^\s\"'<>]+")
-_UNIT_PATTERN = re.compile(
-    r"(?i)(?P<value>[0-9]+(?:\.[0-9]+)?)\s*"
-    r"(?P<unit>cm|in|kg|lb|lbs)\b"
+_NUMBER_PATTERN = r"[0-9]+(?:\.[0-9]+)?"
+_UNIT_COMPONENT_PATTERN = re.compile(
+    rf"(?i)^(?P<value>{_NUMBER_PATTERN})\s*"
+    r"(?P<unit>cm|in|kg|lb|lbs)$"
 )
+_TWO_DIMENSIONAL_COMPONENT_PATTERN = re.compile(
+    rf"(?i)^(?P<length>{_NUMBER_PATTERN})\s*[*x×]\s*"
+    rf"(?P<width>{_NUMBER_PATTERN})\s*(?P<unit>cm|in)$"
+)
+_UNITLESS_COMPONENT_PATTERN = re.compile(rf"^{_NUMBER_PATTERN}$")
+_DIMENSION_SEPARATOR_PATTERN = re.compile(r"[*x×]", re.IGNORECASE)
 _FOB_PATTERN = re.compile(
     r"(?i)^\s*(?P<currency>￥|¥|RMB)\s*"
     r"(?P<amount>[0-9]+(?:,[0-9]{3})*(?:\.[0-9]+)?)\s*$"
@@ -45,8 +52,23 @@ _FOB_PATTERN = re.compile(
 
 def _header_form(value: str) -> str:
     normalized = value.casefold().replace("/", " ")
+    normalized = re.sub(r"[()（）\[\]]", " ", normalized)
     normalized = re.sub(r"[.：:]", " ", normalized)
     return " ".join(normalized.split())
+
+
+def _header_candidates(value: str) -> tuple[str, ...]:
+    """Return strict canonical-first representations of one header cell."""
+    normalized_line_endings = value.replace("\r\n", "\n").replace("\r", "\n")
+    lines = [line.strip() for line in normalized_line_endings.split("\n")]
+    non_empty_lines = [line for line in lines if line]
+    if not non_empty_lines:
+        return ()
+    candidates = [_header_form(non_empty_lines[0])]
+    combined = _header_form(" ".join(non_empty_lines))
+    if combined not in candidates:
+        candidates.append(combined)
+    return tuple(candidates)
 
 
 def _aliases(*values: str) -> frozenset[str]:
@@ -102,9 +124,16 @@ class UnitValue:
 
 
 @dataclass(frozen=True, slots=True)
+class TwoDimensionalValue:
+    length: int | float
+    width: int | float
+    unit: str
+
+
+@dataclass(frozen=True, slots=True)
 class NormalizedMeasurement:
-    metric: UnitValue | None
-    imperial: UnitValue | None
+    metric: UnitValue | TwoDimensionalValue | None
+    imperial: UnitValue | TwoDimensionalValue | None
     raw_value: str
 
 
@@ -345,10 +374,10 @@ def _parse_merges(
 
 
 def _header_field(value: str) -> str | None:
-    normalized = _header_form(value)
-    for field_name, aliases in _HEADER_ALIASES.items():
-        if normalized in aliases:
-            return field_name
+    for candidate in _header_candidates(value):
+        for field_name, aliases in _HEADER_ALIASES.items():
+            if candidate in aliases:
+                return field_name
     return None
 
 
@@ -405,37 +434,96 @@ def _parse_measurement(
 ) -> tuple[NormalizedMeasurement | None, str | None]:
     if raw_value.strip() == "/":
         return None, None
-    matches = list(_UNIT_PATTERN.finditer(raw_value))
-    if not matches:
-        return None, f"malformed measurement: {field_name}"
-    remainder = _UNIT_PATTERN.sub("", raw_value)
-    if re.sub(r"[\s()]", "", remainder):
-        return None, f"malformed measurement: {field_name}"
 
-    metric: UnitValue | None = None
-    imperial: UnitValue | None = None
+    normalized_line_endings = raw_value.replace("\r\n", "\n").replace("\r", "\n")
+    components: list[str] = []
+    for line in normalized_line_endings.split("\n"):
+        candidate = line.strip()
+        if not candidate:
+            continue
+        paired = re.fullmatch(r"([^()]+?)\s*\(([^()]*)\)", candidate)
+        if paired is not None:
+            components.extend(part.strip() for part in paired.groups() if part.strip())
+            continue
+        if (
+            len(candidate) >= 2
+            and candidate[0] in "(（"
+            and candidate[-1] in ")）"
+        ):
+            candidate = candidate[1:-1].strip()
+        if candidate:
+            components.append(candidate)
+
+    if not components:
+        return None, f"malformed measurement: {field_name}"
+    if len(components) == 1 and _UNITLESS_COMPONENT_PATTERN.fullmatch(components[0]):
+        return None, f"unitless measurement preserved: {field_name}"
+
+    metric: UnitValue | TwoDimensionalValue | None = None
+    imperial: UnitValue | TwoDimensionalValue | None = None
     expected_metric = "kg" if field_name == "net_weight" else "cm"
     expected_imperial = "lb" if field_name == "net_weight" else "in"
-    for match in matches:
-        unit = match.group("unit").casefold()
+    invalid_components: list[str] = []
+    saw_two_dimensional = any(
+        _DIMENSION_SEPARATOR_PATTERN.search(component) for component in components
+    )
+
+    for component in components:
+        dimensional_match = (
+            _TWO_DIMENSIONAL_COMPONENT_PATTERN.fullmatch(component)
+            if field_name == "sole"
+            else None
+        )
+        scalar_match = _UNIT_COMPONENT_PATTERN.fullmatch(component)
+        if dimensional_match is not None:
+            unit = dimensional_match.group("unit").casefold()
+            parsed_value: UnitValue | TwoDimensionalValue = TwoDimensionalValue(
+                length=_normalized_number(dimensional_match.group("length")),
+                width=_normalized_number(dimensional_match.group("width")),
+                unit=unit,
+            )
+        elif scalar_match is not None:
+            unit = scalar_match.group("unit").casefold()
+            parsed_value = UnitValue(
+                value=_normalized_number(scalar_match.group("value")),
+                unit="lb" if unit == "lbs" else unit,
+            )
+        else:
+            invalid_components.append(component)
+            continue
+
         if unit == "lbs":
             unit = "lb"
-        number = _normalized_number(match.group("value"))
         if unit == expected_metric and metric is None:
-            metric = UnitValue(value=number, unit=expected_metric)
+            metric = parsed_value
         elif unit == expected_imperial and imperial is None:
-            imperial = UnitValue(value=number, unit=expected_imperial)
+            imperial = parsed_value
         else:
-            return None, f"malformed measurement: {field_name}"
+            invalid_components.append(component)
+
     if metric is None and imperial is None:
+        if field_name == "sole" and saw_two_dimensional:
+            return None, f"malformed two-dimensional measurement: {field_name}"
         return None, f"malformed measurement: {field_name}"
+
+    warning: str | None = None
+    if invalid_components:
+        if field_name == "sole" and saw_two_dimensional:
+            warning = f"malformed two-dimensional measurement: {field_name}"
+        elif metric is not None and imperial is None:
+            warning = f"malformed imperial component: {field_name}"
+        elif imperial is not None and metric is None:
+            warning = f"malformed metric component: {field_name}"
+        else:
+            warning = f"malformed measurement: {field_name}"
+
     return (
         NormalizedMeasurement(
             metric=metric,
             imperial=imperial,
             raw_value=raw_value,
         ),
-        None,
+        warning,
     )
 
 
