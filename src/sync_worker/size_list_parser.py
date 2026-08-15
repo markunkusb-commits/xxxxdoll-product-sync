@@ -527,6 +527,18 @@ def _parse_measurement(
     )
 
 
+def parse_measurement_value(
+    field_name: str,
+    raw_value: str,
+) -> tuple[NormalizedMeasurement | None, str | None]:
+    """Parse one known measurement using the Size Parser's strict rules."""
+    if field_name not in _MEASUREMENT_FIELDS:
+        raise SizeListParserError("Unsupported Size List measurement field")
+    if not isinstance(raw_value, str):
+        raise SizeListParserError("Measurement value must be text")
+    return _parse_measurement(field_name, raw_value)
+
+
 def _normalize_identity(raw_body_type: str) -> tuple[str, str]:
     normalized = " ".join(raw_body_type.split())
     return normalized, normalized.casefold()
@@ -663,7 +675,7 @@ class SizeListParser:
                     )
                 )
                 coordinates[field_name] = measurement_cell.coordinate
-                normalized, warning = _parse_measurement(
+                normalized, warning = parse_measurement_value(
                     field_name, measurement_cell.value
                 )
                 normalized_measurements[field_name] = normalized

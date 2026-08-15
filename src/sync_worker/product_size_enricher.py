@@ -21,12 +21,20 @@ from .size_list_parser import (
     SupplierFOBCost,
     TwoDimensionalValue,
     UnitValue,
+    parse_measurement_value,
 )
 
 
 MatchStatus = Literal["matched", "unmatched", "ambiguous"]
 MatchMethod = Literal["exact", "verified_suffix_match"]
 MatchConfidence = Literal["exact", "deterministic", "none"]
+MeasurementComparisonStatus = Literal[
+    "equivalent",
+    "different",
+    "missing_product",
+    "missing_size",
+    "incomparable",
+]
 
 _VERIFIED_BODY_TOKEN = re.compile(
     r"(?i)^(?:[a-z]{1,6}[0-9]{2,3}(?:cm)?|[0-9]{2,3}cm)"
@@ -51,9 +59,16 @@ class MatchMetadata:
 @dataclass(frozen=True, slots=True)
 class SpecificationConflict:
     field: str
-    product_value: str
-    size_value: NormalizedMeasurement
+    product_raw_value: str
+    size_raw_value: str
+    comparison_reason: str
     resolution: Literal["unresolved"] = "unresolved"
+
+
+@dataclass(frozen=True, slots=True)
+class MeasurementComparison:
+    status: MeasurementComparisonStatus
+    reason: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -345,30 +360,97 @@ def _match_product(
     )
 
 
-def _format_number(value: int | float) -> str:
-    if isinstance(value, float) and value.is_integer():
-        return str(int(value))
-    return str(value)
-
-
-def _normalized_value_key(value: UnitValue | TwoDimensionalValue) -> str:
-    if isinstance(value, TwoDimensionalValue):
-        text = (
-            f"{_format_number(value.length)}*{_format_number(value.width)}"
-            f"{value.unit}"
+def _compare_measurement_component(
+    product_value: UnitValue | TwoDimensionalValue,
+    size_value: UnitValue | TwoDimensionalValue,
+    *,
+    component_name: Literal["metric", "imperial"],
+) -> MeasurementComparison:
+    if product_value.unit.casefold() != size_value.unit.casefold():
+        return MeasurementComparison(
+            status="incomparable",
+            reason=f"{component_name}_unit_differs",
         )
-    else:
-        text = f"{_format_number(value.value)}{value.unit}"
-    return _comparison_key(text)
+    if isinstance(product_value, TwoDimensionalValue) != isinstance(
+        size_value, TwoDimensionalValue
+    ):
+        return MeasurementComparison(
+            status="different",
+            reason=f"{component_name}_shape_differs",
+        )
+    if isinstance(product_value, TwoDimensionalValue) and isinstance(
+        size_value, TwoDimensionalValue
+    ):
+        if product_value.length != size_value.length:
+            return MeasurementComparison(
+                status="different",
+                reason=f"{component_name}_length_differs",
+            )
+        if product_value.width != size_value.width:
+            return MeasurementComparison(
+                status="different",
+                reason=f"{component_name}_width_differs",
+            )
+        return MeasurementComparison(
+            status="equivalent",
+            reason=f"{component_name}_dimensions_equal",
+        )
+    if not isinstance(product_value, UnitValue) or not isinstance(
+        size_value, UnitValue
+    ):
+        return MeasurementComparison(
+            status="incomparable",
+            reason=f"{component_name}_representation_unknown",
+        )
+    if product_value.value != size_value.value:
+        return MeasurementComparison(
+            status="different",
+            reason=f"{component_name}_value_differs",
+        )
+    return MeasurementComparison(
+        status="equivalent",
+        reason=f"{component_name}_values_equal",
+    )
 
 
-def _measurement_keys(measurement: NormalizedMeasurement) -> set[str]:
-    keys = {_comparison_key(measurement.raw_value)}
-    if measurement.metric is not None:
-        keys.add(_normalized_value_key(measurement.metric))
-    if measurement.imperial is not None:
-        keys.add(_normalized_value_key(measurement.imperial))
-    return keys
+def compare_measurement_equivalence(
+    field_name: str,
+    product_raw_value: str | None,
+    size_value: NormalizedMeasurement | None,
+) -> MeasurementComparison:
+    """Compare supplied values exactly, without conversion or tolerance."""
+    if product_raw_value is None or not product_raw_value.strip():
+        return MeasurementComparison(
+            status="missing_product",
+            reason="product_measurement_missing",
+        )
+    if size_value is None:
+        return MeasurementComparison(
+            status="missing_size",
+            reason="size_measurement_missing",
+        )
+    product_value, _ = parse_measurement_value(field_name, product_raw_value)
+    if product_value is None:
+        return MeasurementComparison(
+            status="incomparable",
+            reason="product_measurement_unparseable",
+        )
+    if product_value.metric is not None and size_value.metric is not None:
+        return _compare_measurement_component(
+            product_value.metric,
+            size_value.metric,
+            component_name="metric",
+        )
+    if product_value.imperial is not None and size_value.imperial is not None:
+        return _compare_measurement_component(
+            product_value.imperial,
+            size_value.imperial,
+            component_name="imperial",
+        )
+    return MeasurementComparison(
+        status="incomparable",
+        reason="no_common_comparable_unit",
+    )
 
 
 def _specification_conflicts(
@@ -377,22 +459,28 @@ def _specification_conflicts(
 ) -> tuple[SpecificationConflict, ...]:
     if size is None:
         return ()
-    measurement_fields = {
-        field.name for field in fields(size.measurements)
-    }
+    measurement_fields = {field.name for field in fields(size.measurements)}
     conflicts: list[SpecificationConflict] = []
-    for field_name, product_value in product.specifications.normalized.items():
-        if field_name not in measurement_fields or not isinstance(product_value, str):
+    for field_name in sorted(measurement_fields):
+        product_value = product.specifications.normalized.get(field_name)
+        if product_value is not None and not isinstance(product_value, str):
             continue
         size_value = getattr(size.measurements, field_name)
-        if size_value is None or not product_value.strip():
+        if product_value is None and size_value is None:
             continue
-        if _comparison_key(product_value) not in _measurement_keys(size_value):
+        comparison = compare_measurement_equivalence(
+            field_name,
+            product_value,
+            size_value,
+        )
+        if comparison.status == "different":
+            assert product_value is not None and size_value is not None
             conflicts.append(
                 SpecificationConflict(
                     field=field_name,
-                    product_value=product_value,
-                    size_value=size_value,
+                    product_raw_value=product_value,
+                    size_raw_value=size_value.raw_value,
+                    comparison_reason=comparison.reason,
                 )
             )
     return tuple(conflicts)

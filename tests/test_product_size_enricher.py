@@ -25,6 +25,7 @@ from sync_worker.product_model import (  # noqa: E402
     UnknownFields,
 )
 from sync_worker.product_size_enricher import (  # noqa: E402
+    compare_measurement_equivalence,
     enrich_products_with_sizes,
     summarize_enrichment,
 )
@@ -37,7 +38,9 @@ from sync_worker.size_list_parser import (  # noqa: E402
     SizeSource,
     SizeSupplierCosts,
     SupplierFOBCost,
+    TwoDimensionalValue,
     UnitValue,
+    parse_measurement_value,
 )
 
 
@@ -274,8 +277,9 @@ class ProductSizeEnricherTests(unittest.TestCase):
         size = size_record("FD140cm", measurements={"waist": measurement(60)})
         conflict = enrich_one(product, size).conflicts[0]
         self.assertEqual(conflict.field, "waist")
-        self.assertEqual(conflict.product_value, "58cm")
-        self.assertEqual(conflict.size_value.metric.value, 60)
+        self.assertEqual(conflict.product_raw_value, "58cm")
+        self.assertEqual(conflict.size_raw_value, "60cm")
+        self.assertEqual(conflict.comparison_reason, "metric_value_differs")
         self.assertEqual(conflict.resolution, "unresolved")
 
     def test_24_equal_specification_has_no_conflict(self) -> None:
@@ -417,6 +421,206 @@ class ProductSizeEnricherTests(unittest.TestCase):
     def test_41_bare_numeric_prefix_is_not_a_verified_body_token(self) -> None:
         result = enrich_one(product_record("161-Vica"), size_record("161"))
         self.assertEqual(result.match.status, "unmatched")
+
+    def test_42_scalar_metric_and_imperial_representation_is_equivalent(self) -> None:
+        size_value = NormalizedMeasurement(
+            metric=UnitValue(53, "cm"),
+            imperial=UnitValue(20.8, "in"),
+            raw_value="53cm\n(20.8in)",
+        )
+        comparison = compare_measurement_equivalence(
+            "waist", "53cm(20.8in)", size_value
+        )
+        self.assertEqual(comparison.status, "equivalent")
+        self.assertEqual(comparison.reason, "metric_values_equal")
+
+    def test_43_weight_metric_and_imperial_representation_is_equivalent(self) -> None:
+        size_value = NormalizedMeasurement(
+            metric=UnitValue(35, "kg"),
+            imperial=UnitValue(77, "lb"),
+            raw_value="35kg\n(77lb)",
+        )
+        comparison = compare_measurement_equivalence(
+            "net_weight", "35kg(77LB)", size_value
+        )
+        self.assertEqual(comparison.status, "equivalent")
+
+    def test_44_product_measurement_whitespace_is_representation_only(self) -> None:
+        size_value = NormalizedMeasurement(
+            metric=UnitValue(64, "cm"),
+            imperial=UnitValue(25.1, "in"),
+            raw_value="64cm\n(25.1in)",
+        )
+        comparison = compare_measurement_equivalence(
+            "arm_length", " 64cm ( 25.1in ) ", size_value
+        )
+        self.assertEqual(comparison.status, "equivalent")
+
+    def test_45_lb_unit_comparison_is_case_insensitive(self) -> None:
+        size_value = NormalizedMeasurement(
+            metric=None,
+            imperial=UnitValue(77, "lb"),
+            raw_value="77lb",
+        )
+        comparison = compare_measurement_equivalence(
+            "net_weight", "77LB", size_value
+        )
+        self.assertEqual(comparison.status, "equivalent")
+
+    def test_46_integer_and_decimal_numeric_representations_are_equal(self) -> None:
+        size_value = NormalizedMeasurement(
+            metric=UnitValue(53.0, "cm"),
+            imperial=None,
+            raw_value="53.0cm",
+        )
+        comparison = compare_measurement_equivalence(
+            "waist", "53cm", size_value
+        )
+        self.assertEqual(comparison.status, "equivalent")
+
+    def test_47_equal_metric_ignores_imperial_rounding_difference(self) -> None:
+        product = product_record(
+            "FD140cm",
+            specifications={"waist": "53cm(20.8in)"},
+        )
+        size_value = NormalizedMeasurement(
+            metric=UnitValue(53, "cm"),
+            imperial=UnitValue(20.9, "in"),
+            raw_value="53cm\n(20.9in)",
+        )
+        result = enrich_one(
+            product,
+            size_record("FD140cm", measurements={"waist": size_value}),
+        )
+        self.assertEqual(result.conflicts, ())
+
+    def test_48_different_metric_remains_an_unresolved_conflict(self) -> None:
+        product = product_record(
+            "FD140cm",
+            specifications={"waist": "53cm(20.8in)"},
+        )
+        size_value = NormalizedMeasurement(
+            metric=UnitValue(55, "cm"),
+            imperial=UnitValue(21.7, "in"),
+            raw_value="55cm\n(21.7in)",
+        )
+        conflict = enrich_one(
+            product,
+            size_record("FD140cm", measurements={"waist": size_value}),
+        ).conflicts[0]
+        self.assertEqual(conflict.comparison_reason, "metric_value_differs")
+        self.assertEqual(conflict.resolution, "unresolved")
+
+    def test_49_imperial_is_used_when_common_metric_is_absent(self) -> None:
+        size_value = NormalizedMeasurement(
+            metric=None,
+            imperial=UnitValue(20.8, "in"),
+            raw_value="20.8in",
+        )
+        comparison = compare_measurement_equivalence(
+            "waist", "20.8in", size_value
+        )
+        self.assertEqual(comparison.status, "equivalent")
+        self.assertEqual(comparison.reason, "imperial_values_equal")
+
+    def test_50_unparseable_product_measurement_is_incomparable(self) -> None:
+        comparison = compare_measurement_equivalence(
+            "waist",
+            "not available",
+            measurement(53),
+        )
+        self.assertEqual(comparison.status, "incomparable")
+        self.assertEqual(comparison.reason, "product_measurement_unparseable")
+
+    def test_51_missing_product_measurement_is_not_a_conflict(self) -> None:
+        size_value = measurement(53)
+        comparison = compare_measurement_equivalence("waist", None, size_value)
+        result = enrich_one(
+            product_record("FD140cm"),
+            size_record("FD140cm", measurements={"waist": size_value}),
+        )
+        self.assertEqual(comparison.status, "missing_product")
+        self.assertEqual(result.conflicts, ())
+
+    def test_52_missing_size_measurement_is_not_a_conflict(self) -> None:
+        comparison = compare_measurement_equivalence("waist", "53cm", None)
+        result = enrich_one(
+            product_record("FD140cm", specifications={"waist": "53cm"}),
+            size_record("FD140cm"),
+        )
+        self.assertEqual(comparison.status, "missing_size")
+        self.assertEqual(result.conflicts, ())
+
+    def test_53_two_dimensional_sole_is_equivalent(self) -> None:
+        size_value = NormalizedMeasurement(
+            metric=TwoDimensionalValue(7, 2.5, "cm"),
+            imperial=TwoDimensionalValue(2.8, 1, "in"),
+            raw_value="7*2.5cm\n(2.8*1in)",
+        )
+        comparison = compare_measurement_equivalence(
+            "sole", "7*2.5cm(2.8*1in)", size_value
+        )
+        self.assertEqual(comparison.status, "equivalent")
+        self.assertEqual(comparison.reason, "metric_dimensions_equal")
+
+    def test_54_two_dimensional_sole_length_difference_is_conflict(self) -> None:
+        size_value = NormalizedMeasurement(
+            metric=TwoDimensionalValue(8, 2.5, "cm"),
+            imperial=TwoDimensionalValue(2.8, 1, "in"),
+            raw_value="8*2.5cm\n(2.8*1in)",
+        )
+        comparison = compare_measurement_equivalence(
+            "sole", "7*2.5cm(2.8*1in)", size_value
+        )
+        self.assertEqual(comparison.status, "different")
+        self.assertEqual(comparison.reason, "metric_length_differs")
+
+    def test_55_two_dimensional_sole_width_difference_is_conflict(self) -> None:
+        size_value = NormalizedMeasurement(
+            metric=TwoDimensionalValue(7, 3, "cm"),
+            imperial=TwoDimensionalValue(2.8, 1, "in"),
+            raw_value="7*3cm\n(2.8*1in)",
+        )
+        comparison = compare_measurement_equivalence(
+            "sole", "7*2.5cm(2.8*1in)", size_value
+        )
+        self.assertEqual(comparison.status, "different")
+        self.assertEqual(comparison.reason, "metric_width_differs")
+
+    def test_56_comparator_does_not_convert_between_units(self) -> None:
+        size_value = NormalizedMeasurement(
+            metric=None,
+            imperial=UnitValue(20.8, "in"),
+            raw_value="20.8in",
+        )
+        comparison = compare_measurement_equivalence(
+            "waist", "53cm", size_value
+        )
+        self.assertEqual(comparison.status, "incomparable")
+        self.assertEqual(comparison.reason, "no_common_comparable_unit")
+
+    def test_57_comparator_reuses_size_parser_measurement_parser(self) -> None:
+        size_value = measurement(53)
+        with patch(
+            "sync_worker.product_size_enricher.parse_measurement_value",
+            wraps=parse_measurement_value,
+        ) as parser:
+            comparison = compare_measurement_equivalence(
+                "waist", "53cm", size_value
+            )
+        self.assertEqual(comparison.status, "equivalent")
+        parser.assert_called_once_with("waist", "53cm")
+
+    def test_58_matching_and_price_boundaries_remain_unchanged(self) -> None:
+        retail = money(850, currency="USD", context="minimum_retail_price")
+        size_fob = SupplierFOBCost(2200, "RMB", "RMB2200")
+        result = enrich_one(
+            product_record("SiQ157cm-Miko", retail=retail),
+            size_record("SiQ157cm", fob=size_fob),
+        )
+        self.assertEqual(result.match.method, "verified_suffix_match")
+        self.assertIs(result.retail_pricing.minimum_retail_price, retail)
+        self.assertIs(result.supplier_costs.size_list_fob, size_fob)
 
 
 if __name__ == "__main__":
