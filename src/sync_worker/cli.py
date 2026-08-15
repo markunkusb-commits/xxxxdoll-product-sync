@@ -26,6 +26,7 @@ from .report import (
 )
 from .sanitization import Redactor
 from .security import redactor_for_settings
+from .size_list_dry_run import run_size_list_dry_run
 from .sheet_layout import (
     SheetLayoutInspector,
     parse_a1_range,
@@ -384,6 +385,35 @@ def _run_parse_additional_option(
     return 0 if report.get("status") == "ok" else 1
 
 
+def _run_parse_size_list(logger: logging.Logger, input_path: Path) -> int:
+    try:
+        report, _ = run_size_list_dry_run(
+            input_path,
+            project_root=PROJECT_ROOT,
+        )
+    except Exception as error:
+        _log_failure(logger, error, event="parse_size_list_aborted")
+        return 2
+
+    logger.info(
+        json.dumps(
+            {
+                "event": "size_list_dry_run_report_written",
+                "path": "reports/size-list-dry-run.json",
+                "status": report.get("status"),
+                "detected_record_count": report.get(
+                    "detected_record_count", 0
+                ),
+                "network_requests_performed": 0,
+                "write_requests_performed": 0,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+    )
+    return 0 if report.get("status") == "ok" else 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="python -m sync_worker")
     subcommands = parser.add_subparsers(dest="command", required=True)
@@ -446,6 +476,17 @@ def build_parser() -> argparse.ArgumentParser:
         dest="input_path",
         help="Local Additional Option sheet-layout JSON file",
     )
+    parse_size_list = subcommands.add_parser(
+        "parse-size-list",
+        help="Parse a local Size List layout into a sanitized dry-run report",
+    )
+    parse_size_list.add_argument(
+        "--input",
+        required=True,
+        type=Path,
+        dest="input_path",
+        help="Local Size List sheet-layout JSON file",
+    )
     return parser
 
 
@@ -468,4 +509,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_parse_clm_price_list(logger, arguments.input_path)
     if arguments.command == "parse-additional-option":
         return _run_parse_additional_option(logger, arguments.input_path)
+    if arguments.command == "parse-size-list":
+        return _run_parse_size_list(logger, arguments.input_path)
     raise AssertionError("Unhandled command")
