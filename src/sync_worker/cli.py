@@ -19,6 +19,9 @@ from .inspect_product import (
     ReferenceProductInspector,
     reference_product_report_filename,
 )
+from .product_size_enrichment_dry_run import (
+    run_product_size_enrichment_dry_run,
+)
 from .report import (
     DoctorReportWriter,
     ReferenceProductReportWriter,
@@ -414,6 +417,38 @@ def _run_parse_size_list(logger: logging.Logger, input_path: Path) -> int:
     return 0 if report.get("status") == "ok" else 1
 
 
+def _run_enrich_product_size(
+    logger: logging.Logger,
+    product_input_path: Path,
+    size_input_path: Path,
+) -> int:
+    try:
+        report, _ = run_product_size_enrichment_dry_run(
+            product_input_path,
+            size_input_path,
+            project_root=PROJECT_ROOT,
+        )
+    except Exception as error:
+        _log_failure(logger, error, event="enrich_product_size_aborted")
+        return 2
+
+    logger.info(
+        json.dumps(
+            {
+                "event": "product_size_enrichment_dry_run_report_written",
+                "path": "reports/product-size-enrichment-dry-run.json",
+                "status": report.get("status"),
+                "summary": report.get("summary", {}),
+                "network_requests_performed": 0,
+                "write_requests_performed": 0,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+    )
+    return 0 if report.get("status") == "ok" else 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="python -m sync_worker")
     subcommands = parser.add_subparsers(dest="command", required=True)
@@ -487,6 +522,24 @@ def build_parser() -> argparse.ArgumentParser:
         dest="input_path",
         help="Local Size List sheet-layout JSON file",
     )
+    enrich_product_size = subcommands.add_parser(
+        "enrich-product-size",
+        help="Join local CLM and Size dry-run reports without external access",
+    )
+    enrich_product_size.add_argument(
+        "--products",
+        required=True,
+        type=Path,
+        dest="product_input_path",
+        help="Local CLM parser dry-run JSON file",
+    )
+    enrich_product_size.add_argument(
+        "--sizes",
+        required=True,
+        type=Path,
+        dest="size_input_path",
+        help="Local Size List dry-run JSON file",
+    )
     return parser
 
 
@@ -511,4 +564,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_parse_additional_option(logger, arguments.input_path)
     if arguments.command == "parse-size-list":
         return _run_parse_size_list(logger, arguments.input_path)
+    if arguments.command == "enrich-product-size":
+        return _run_enrich_product_size(
+            logger,
+            arguments.product_input_path,
+            arguments.size_input_path,
+        )
     raise AssertionError("Unhandled command")
