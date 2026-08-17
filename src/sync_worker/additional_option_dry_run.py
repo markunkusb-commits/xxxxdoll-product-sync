@@ -15,7 +15,14 @@ from .report import SafeJsonReportWriter
 from .sanitization import Redactor
 
 
-CATEGORY_NAMES = ("appearance", "material", "function", "accessory", "other")
+CATEGORY_NAMES = (
+    "product_extra_option",
+    "appearance",
+    "material",
+    "function",
+    "accessory",
+    "other",
+)
 REPORT_FILENAME = "additional-option-dry-run.json"
 
 

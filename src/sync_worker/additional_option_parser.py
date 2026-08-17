@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass
+from decimal import Decimal, InvalidOperation
 from typing import Literal
 
 from .sanitization import REPORT_SECRET_SCAN_PATTERN, Redactor
@@ -12,6 +13,7 @@ from .sheet_layout import column_index_to_label, column_label_to_index
 
 
 OptionCategory = Literal[
+    "product_extra_option",
     "appearance",
     "material",
     "function",
@@ -21,11 +23,11 @@ OptionCategory = Literal[
 
 _PRICE_PATTERN = re.compile(
     r"(?i)(?<![A-Za-z0-9])"
-    r"(?P<raw>(?P<plus>\+)?\s*(?P<currency>RMB|US\$|¥)\s*"
+    r"(?P<raw>(?P<plus>\+)?\s*(?P<currency>RMB|US\$|¥|￥)\s*"
     r"(?P<amount>[0-9]+(?:,[0-9]{3})*(?:\.[0-9]+)?|[A-Za-z]+))"
     r"(?![A-Za-z0-9])"
 )
-_CURRENCY_ONLY_PATTERN = re.compile(r"(?i)^\s*(RMB|US\$|¥)\s*$")
+_CURRENCY_ONLY_PATTERN = re.compile(r"(?i)^\s*(RMB|US\$|¥|￥)\s*$")
 _URL_PATTERN = re.compile(r"(?i)(?:https?://|www\.)[^\s\"'<>]+")
 _COORDINATE_PATTERN = re.compile(r"^([A-Z]+)([1-9][0-9]*)$")
 _NON_WORD_PATTERN = re.compile(r"[^a-z0-9]+")
@@ -70,7 +72,7 @@ class AdditionalOptionIdentity:
 
 @dataclass(frozen=True, slots=True)
 class AdditionalOptionPricing:
-    amount: int | float | None
+    amount: Decimal | int | float | None
     currency: str | None
     raw_price: str | None
     price_range: str | None = None
@@ -174,11 +176,14 @@ def _category(option_name: str) -> tuple[OptionCategory, tuple[str, ...]]:
     return "other", ("unknown option category",)
 
 
-def _numeric_amount(value: str) -> int | float | None:
+def _numeric_amount(value: str) -> Decimal | None:
     normalized = value.replace(",", "")
     if not re.fullmatch(r"[0-9]+(?:\.[0-9]+)?", normalized):
         return None
-    return float(normalized) if "." in normalized else int(normalized)
+    try:
+        return Decimal(normalized)
+    except InvalidOperation:
+        return None
 
 
 def _raw_entry(
@@ -199,7 +204,7 @@ def _currency(currency_token: str) -> str:
 
 def _separate_price(
     raw_price: str,
-) -> tuple[int | float | None, str | None, str, tuple[str, ...]]:
+) -> tuple[Decimal | None, str | None, str, tuple[str, ...]]:
     matches = list(_PRICE_PATTERN.finditer(raw_price))
     if len(matches) == 1:
         match = matches[0]
@@ -361,7 +366,7 @@ class AdditionalOptionParser:
         raw_entries: list[RawAdditionalOptionEntry] = []
 
         for name_column, price_column, category_override in (
-            ("A", "B", None),
+            ("A", "B", "product_extra_option"),
             ("D", "E", "accessory"),
         ):
             for raw_cell, raw_name, source in cells:

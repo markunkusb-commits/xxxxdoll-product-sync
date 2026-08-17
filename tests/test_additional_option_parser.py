@@ -4,6 +4,7 @@ import builtins
 import socket
 import sys
 import unittest
+from decimal import Decimal
 from pathlib import Path
 from unittest.mock import patch
 
@@ -132,6 +133,154 @@ class AdditionalOptionParserTests(unittest.TestCase):
 
         self.assertEqual(len(result.options), 2)
         self.assertEqual(result.raw_entries, ())
+
+    def test_fullwidth_yen_decimal_price_is_parsed_as_rmb(self) -> None:
+        result = self.parser.parse(
+            layout(
+                cell("硅胶头植发", coordinate="A2"),
+                cell("￥500.00", coordinate="B2"),
+            )
+        )
+
+        pricing = result.options[0].pricing
+        self.assertEqual(pricing.amount, Decimal("500.00"))
+        self.assertEqual(pricing.currency, "RMB")
+
+    def test_fullwidth_yen_thousands_separator_is_parsed(self) -> None:
+        result = self.parser.parse(
+            layout(
+                cell("硅胶头植毛", coordinate="A3"),
+                cell("￥1,200.00", coordinate="B3"),
+            )
+        )
+
+        self.assertEqual(
+            result.options[0].pricing.amount,
+            Decimal("1200.00"),
+        )
+
+    def test_fullwidth_yen_small_decimal_price_is_parsed(self) -> None:
+        result = self.parser.parse(
+            layout(
+                cell("肤色选项", coordinate="A4"),
+                cell("￥30.00", coordinate="B4"),
+            )
+        )
+
+        self.assertEqual(result.options[0].pricing.amount, Decimal("30.00"))
+
+    def test_fullwidth_yen_raw_price_is_unchanged(self) -> None:
+        result = self.parser.parse(
+            layout(
+                cell("硅胶头植发", coordinate="A2"),
+                cell("￥1,000.00", coordinate="B2"),
+            )
+        )
+
+        self.assertEqual(result.options[0].pricing.raw_price, "￥1,000.00")
+
+    def test_a_b_region_sets_product_extra_option_category(self) -> None:
+        result = self.parser.parse(
+            layout(
+                cell("硅胶头植发", coordinate="A2"),
+                cell("￥500.00", coordinate="B2"),
+            )
+        )
+
+        self.assertEqual(result.options[0].category, "product_extra_option")
+
+    def test_a_b_category_does_not_depend_on_chinese_option_name(self) -> None:
+        fixture = layout(
+            cell("硅胶头植毛", coordinate="A3"),
+            cell("￥300.00", coordinate="B3"),
+            cell("Si70系列硅胶头", coordinate="A14"),
+            cell("￥50.00", coordinate="B14"),
+        )
+
+        result = self.parser.parse(fixture)
+
+        self.assertEqual(
+            [option.category for option in result.options],
+            ["product_extra_option", "product_extra_option"],
+        )
+
+    def test_d_e_region_sets_accessory_category(self) -> None:
+        result = self.parser.parse(
+            layout(
+                cell("挂钩", coordinate="D2"),
+                cell("￥50.00", coordinate="E2"),
+            )
+        )
+
+        self.assertEqual(result.options[0].category, "accessory")
+
+    def test_structured_region_does_not_add_unknown_category_warning(self) -> None:
+        result = self.parser.parse(
+            layout(
+                cell("无法推断的中文自定义项", coordinate="A5"),
+                cell("￥30.00", coordinate="B5"),
+            )
+        )
+
+        option = result.options[0]
+        self.assertEqual(option.category, "product_extra_option")
+        self.assertNotIn("unknown option category", option.warnings)
+
+    def test_unknown_secondary_category_is_not_guessed(self) -> None:
+        result = self.parser.parse(
+            layout(
+                cell("硅胶头植发", coordinate="A2"),
+                cell("￥500.00", coordinate="B2"),
+            )
+        )
+
+        option = result.options[0]
+        self.assertFalse(hasattr(option, "secondary_category"))
+        self.assertEqual(option.warnings, ())
+
+    def test_merged_fullwidth_price_is_consumed_once_and_range_is_kept(
+        self,
+    ) -> None:
+        fixture = {
+            "non_empty_cells": [
+                cell("硅胶头植发", coordinate="A3"),
+                {
+                    **cell("￥500.00", coordinate="B3"),
+                    "merged_range": "B3:B4",
+                },
+                cell("硅胶头植毛", coordinate="A4"),
+            ],
+            "merged_ranges": [
+                {
+                    "range": "B3:B4",
+                    "start_row": 3,
+                    "end_row": 4,
+                    "start_column": "B",
+                    "end_column": "B",
+                }
+            ],
+        }
+
+        result = self.parser.parse(fixture)
+        priced = [
+            option
+            for option in result.options
+            if option.pricing.amount == Decimal("500.00")
+        ]
+
+        self.assertEqual(len(priced), 1)
+        self.assertEqual(
+            [option.pricing.price_range for option in result.options],
+            ["B3:B4", "B3:B4"],
+        )
+        self.assertIn(
+            "merged price range requires review",
+            result.options[0].warnings,
+        )
+        self.assertIn(
+            "merged price range not reused",
+            result.options[1].warnings,
+        )
 
 
 if __name__ == "__main__":

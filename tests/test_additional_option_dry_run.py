@@ -72,7 +72,7 @@ class AdditionalOptionDryRunTests(unittest.TestCase):
 
         gel = next(item for item in result.options if item.identity.option_name == "Gel Butt")
         self.assertEqual(gel.source.raw_coordinate, "A2")
-        self.assertEqual(gel.category, "function")
+        self.assertEqual(gel.category, "product_extra_option")
         self.assertEqual(gel.pricing.amount, 300)
 
     def test_d_e_accessory_pair_forces_accessory_category(self) -> None:
@@ -129,7 +129,7 @@ class AdditionalOptionDryRunTests(unittest.TestCase):
         )
         self.assertTrue(all(item.warnings for item in result.options))
 
-    def test_unknown_option_is_preserved_in_dry_run_report(self) -> None:
+    def test_a_b_unknown_name_uses_explicit_primary_category(self) -> None:
         report = build_additional_option_report(
             {
                 "non_empty_cells": [
@@ -141,9 +141,9 @@ class AdditionalOptionDryRunTests(unittest.TestCase):
         )
 
         self.assertEqual(report["detected_option_count"], 1)
-        self.assertEqual(report["category_summary"]["other"], 1)
+        self.assertEqual(report["category_summary"]["product_extra_option"], 1)
         self.assertEqual(report["options"][0]["option_name"], "Custom Shoulder Setup")
-        self.assertGreater(report["warnings_count"], 0)
+        self.assertEqual(report["warnings_count"], 0)
 
     def test_report_shape_and_zero_request_counters(self) -> None:
         report = build_additional_option_report(
