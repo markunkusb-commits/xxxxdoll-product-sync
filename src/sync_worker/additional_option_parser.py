@@ -76,6 +76,8 @@ class AdditionalOptionPricing:
     currency: str | None
     raw_price: str | None
     price_range: str | None = None
+    price_anchor: str | None = None
+    shared_price_source: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -233,6 +235,8 @@ def _parse_candidate(
     *,
     separate_price: str | None = None,
     price_range: str | None = None,
+    price_anchor: str | None = None,
+    shared_price_source: bool = False,
     category_override: OptionCategory | None = None,
     extra_warnings: tuple[str, ...] = (),
 ) -> AdditionalOptionRecord | RawAdditionalOptionEntry:
@@ -286,6 +290,8 @@ def _parse_candidate(
             currency=currency,
             raw_price=raw_price,
             price_range=price_range,
+            price_anchor=price_anchor,
+            shared_price_source=shared_price_source,
         ),
         category=category,
         source=source,
@@ -293,10 +299,31 @@ def _parse_candidate(
     )
 
 
+@dataclass(frozen=True, slots=True)
+class _MergedPriceRange:
+    raw_range: str
+    start_row: int
+    end_row: int
+    start_column: str
+    end_column: str
+    anchor: str
+    anchor_is_valid: bool
+    range_is_valid: bool
+
+    def is_shared_vertical_price_range(self, price_column: str) -> bool:
+        return (
+            self.start_row < self.end_row
+            and self.start_column == price_column
+            and self.end_column == price_column
+            and self.anchor_is_valid
+            and self.range_is_valid
+        )
+
+
 def _merged_price_positions(
     layout: Mapping[str, object],
-) -> dict[tuple[int, str], str]:
-    positions: dict[tuple[int, str], str] = {}
+) -> dict[tuple[int, str], _MergedPriceRange]:
+    positions: dict[tuple[int, str], _MergedPriceRange] = {}
     raw_merges = layout.get("merged_ranges")
     if not isinstance(raw_merges, list):
         return positions
@@ -317,16 +344,72 @@ def _merged_price_positions(
         ):
             continue
         try:
-            start_index = column_label_to_index(start_column)
-            end_index = column_label_to_index(end_column)
+            normalized_start_column = start_column.upper().strip()
+            normalized_end_column = end_column.upper().strip()
+            start_index = column_label_to_index(normalized_start_column)
+            end_index = column_label_to_index(normalized_end_column)
         except ValueError:
             continue
+        expected_anchor = f"{normalized_start_column}{start_row}"
+        expected_range = (
+            f"{normalized_start_column}{start_row}:"
+            f"{normalized_end_column}{end_row}"
+        )
+        raw_anchor = raw_merge.get("anchor")
+        if isinstance(raw_anchor, str) and raw_anchor.strip():
+            anchor = raw_anchor.upper().strip()
+            anchor_is_valid = anchor == expected_anchor
+        else:
+            anchor = expected_anchor
+            anchor_is_valid = True
+        merged_range = _MergedPriceRange(
+            raw_range=raw_range,
+            start_row=start_row,
+            end_row=end_row,
+            start_column=normalized_start_column,
+            end_column=normalized_end_column,
+            anchor=anchor,
+            anchor_is_valid=anchor_is_valid,
+            range_is_valid=raw_range.upper().strip() == expected_range,
+        )
         for row in range(start_row, end_row + 1):
             for column in ("B", "E"):
                 column_index = column_label_to_index(column)
                 if start_index <= column_index <= end_index:
-                    positions[(row, column)] = raw_range
+                    positions[(row, column)] = merged_range
     return positions
+
+
+def _shared_merged_price_item(
+    merged_range: _MergedPriceRange | None,
+    *,
+    name_column: str,
+    price_column: str,
+    by_position: Mapping[
+        tuple[int, str],
+        tuple[Mapping[str, object], str, AdditionalOptionSource],
+    ],
+) -> tuple[Mapping[str, object], str, AdditionalOptionSource] | None:
+    if (
+        merged_range is None
+        or not merged_range.is_shared_vertical_price_range(price_column)
+    ):
+        return None
+    anchor_item = by_position.get(
+        (merged_range.start_row, price_column)
+    )
+    if anchor_item is None:
+        return None
+    for row in range(merged_range.start_row, merged_range.end_row + 1):
+        name_item = by_position.get((row, name_column))
+        if name_item is None or name_item[1].casefold() in _HEADER_NAMES:
+            return None
+        if (
+            row != merged_range.start_row
+            and by_position.get((row, price_column)) is not None
+        ):
+            return None
+    return anchor_item
 
 
 class AdditionalOptionParser:
@@ -374,12 +457,36 @@ class AdditionalOptionParser:
                     continue
                 used_coordinates.add(source.raw_coordinate)
                 price_item = by_position.get((source.row, price_column))
-                price_range = merged_positions.get((source.row, price_column))
-                if price_item is not None:
+                merged_range = merged_positions.get(
+                    (source.row, price_column)
+                )
+                price_range = (
+                    merged_range.raw_range
+                    if merged_range is not None
+                    else None
+                )
+                price_anchor = (
+                    merged_range.anchor
+                    if merged_range is not None
+                    else None
+                )
+                shared_item = _shared_merged_price_item(
+                    merged_range,
+                    name_column=name_column,
+                    price_column=price_column,
+                    by_position=by_position,
+                )
+                shared_price_source = shared_item is not None
+                if shared_item is not None:
+                    _, price_value, price_source = shared_item
+                    used_coordinates.add(price_source.raw_coordinate)
+                elif price_item is not None:
                     raw_price_cell, price_value, price_source = price_item
                     cell_range = raw_price_cell.get("merged_range")
                     if isinstance(cell_range, str):
                         price_range = cell_range
+                        if price_anchor is None:
+                            price_anchor = price_source.raw_coordinate
                     if price_range is not None and price_range in used_price_ranges:
                         price_value = None
                     else:
@@ -390,7 +497,7 @@ class AdditionalOptionParser:
                     price_value = None
 
                 extra_warnings: tuple[str, ...] = ()
-                if price_range is not None:
+                if price_range is not None and not shared_price_source:
                     if price_value is None:
                         extra_warnings = ("merged price range not reused",)
                     else:
@@ -402,6 +509,8 @@ class AdditionalOptionParser:
                     source,
                     separate_price=price_value,
                     price_range=price_range,
+                    price_anchor=price_anchor,
+                    shared_price_source=shared_price_source,
                     category_override=category_override,
                     extra_warnings=extra_warnings,
                 )

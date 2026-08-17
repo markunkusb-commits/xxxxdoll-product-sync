@@ -66,6 +66,8 @@ def _option_report(option: AdditionalOptionRecord) -> dict[str, object]:
             "currency": option.pricing.currency,
             "raw_price": option.pricing.raw_price,
             "price_range": option.pricing.price_range,
+            "price_anchor": option.pricing.price_anchor,
+            "shared_price_source": option.pricing.shared_price_source,
         },
         "source_coordinate": option.source.raw_coordinate,
         "warnings": list(option.warnings),

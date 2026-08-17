@@ -100,7 +100,7 @@ class AdditionalOptionDryRunTests(unittest.TestCase):
             "unable to parse price", by_name["Hair Implant"].warnings
         )
 
-    def test_merged_price_is_retained_once_with_range_and_warnings(self) -> None:
+    def test_shared_merged_price_keeps_one_provenance_for_both_options(self) -> None:
         merged_layout = {
             "non_empty_cells": [
                 cell("A2", "Gel Butt"),
@@ -122,12 +122,27 @@ class AdditionalOptionDryRunTests(unittest.TestCase):
         result = parse_additional_options(merged_layout)
         amounts = [item.pricing.amount for item in result.options]
 
-        self.assertEqual(amounts.count(500.0), 1)
+        self.assertEqual(amounts.count(500.0), 2)
         self.assertEqual(
             [item.pricing.price_range for item in result.options],
             ["B2:B3", "B2:B3"],
         )
-        self.assertTrue(all(item.warnings for item in result.options))
+        self.assertEqual(
+            [item.pricing.price_anchor for item in result.options],
+            ["B2", "B2"],
+        )
+        self.assertTrue(
+            all(item.pricing.shared_price_source for item in result.options)
+        )
+        self.assertTrue(all(not item.warnings for item in result.options))
+
+        report = build_additional_option_report(
+            merged_layout,
+            input_file="fixture.json",
+        )
+        prices = [item["price"] for item in report["options"]]
+        self.assertTrue(all(item["shared_price_source"] for item in prices))
+        self.assertEqual({item["price_anchor"] for item in prices}, {"B2"})
 
     def test_a_b_unknown_name_uses_explicit_primary_category(self) -> None:
         report = build_additional_option_report(

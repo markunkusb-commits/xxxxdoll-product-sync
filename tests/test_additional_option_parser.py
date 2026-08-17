@@ -238,7 +238,7 @@ class AdditionalOptionParserTests(unittest.TestCase):
         self.assertFalse(hasattr(option, "secondary_category"))
         self.assertEqual(option.warnings, ())
 
-    def test_merged_fullwidth_price_is_consumed_once_and_range_is_kept(
+    def test_shared_merged_price_is_referenced_by_each_covered_option(
         self,
     ) -> None:
         fixture = {
@@ -262,20 +262,240 @@ class AdditionalOptionParserTests(unittest.TestCase):
         }
 
         result = self.parser.parse(fixture)
-        priced = [
-            option
-            for option in result.options
-            if option.pricing.amount == Decimal("500.00")
-        ]
-
-        self.assertEqual(len(priced), 1)
+        self.assertEqual(
+            [option.pricing.amount for option in result.options],
+            [Decimal("500.00"), Decimal("500.00")],
+        )
         self.assertEqual(
             [option.pricing.price_range for option in result.options],
             ["B3:B4", "B3:B4"],
         )
-        self.assertIn(
-            "merged price range requires review",
-            result.options[0].warnings,
+        self.assertEqual(
+            [option.pricing.price_anchor for option in result.options],
+            ["B3", "B3"],
+        )
+        self.assertTrue(
+            all(option.pricing.shared_price_source for option in result.options)
+        )
+        self.assertEqual(
+            {
+                (
+                    option.pricing.price_range,
+                    option.pricing.price_anchor,
+                )
+                for option in result.options
+            },
+            {("B3:B4", "B3")},
+        )
+        self.assertTrue(all(not option.warnings for option in result.options))
+
+    def test_non_merged_blank_price_does_not_inherit_previous_price(self) -> None:
+        result = self.parser.parse(
+            layout(
+                cell("选项一", coordinate="A2"),
+                cell("￥300.00", coordinate="B2"),
+                cell("选项二", coordinate="A3"),
+            )
+        )
+
+        self.assertEqual(result.options[0].pricing.amount, Decimal("300.00"))
+        self.assertIsNone(result.options[1].pricing.amount)
+        self.assertIsNone(result.options[1].pricing.price_range)
+        self.assertFalse(result.options[1].pricing.shared_price_source)
+
+    def test_row_outside_shared_merged_range_does_not_inherit(self) -> None:
+        fixture = {
+            "non_empty_cells": [
+                cell("选项一", coordinate="A3"),
+                {
+                    **cell("￥300.00", coordinate="B3"),
+                    "merged_range": "B3:B4",
+                },
+                cell("选项二", coordinate="A4"),
+                cell("选项三", coordinate="A5"),
+            ],
+            "merged_ranges": [
+                {
+                    "range": "B3:B4",
+                    "start_row": 3,
+                    "end_row": 4,
+                    "start_column": "B",
+                    "end_column": "B",
+                    "anchor": "B3",
+                }
+            ],
+        }
+
+        result = self.parser.parse(fixture)
+
+        self.assertEqual(
+            [option.pricing.amount for option in result.options],
+            [Decimal("300.00"), Decimal("300.00"), None],
+        )
+        self.assertFalse(result.options[2].pricing.shared_price_source)
+
+    def test_merged_price_does_not_cross_option_category_group(self) -> None:
+        fixture = {
+            "non_empty_cells": [
+                cell("产品选项", coordinate="A3"),
+                {
+                    **cell("￥300.00", coordinate="B3"),
+                    "merged_range": "B3:B4",
+                },
+                cell("配件选项", coordinate="D4"),
+            ],
+            "merged_ranges": [
+                {
+                    "range": "B3:B4",
+                    "start_row": 3,
+                    "end_row": 4,
+                    "start_column": "B",
+                    "end_column": "B",
+                    "anchor": "B3",
+                }
+            ],
+        }
+
+        result = self.parser.parse(fixture)
+        by_category = {option.category: option for option in result.options}
+
+        self.assertEqual(
+            by_category["product_extra_option"].pricing.amount,
+            Decimal("300.00"),
+        )
+        self.assertFalse(
+            by_category["product_extra_option"].pricing.shared_price_source
+        )
+        self.assertIsNone(by_category["accessory"].pricing.amount)
+
+    def test_horizontal_merge_does_not_activate_shared_price_rule(self) -> None:
+        fixture = {
+            "non_empty_cells": [
+                cell("产品选项", coordinate="A3"),
+                {
+                    **cell("￥300.00", coordinate="B3"),
+                    "merged_range": "B3:E3",
+                },
+                cell("配件选项", coordinate="D3"),
+            ],
+            "merged_ranges": [
+                {
+                    "range": "B3:E3",
+                    "start_row": 3,
+                    "end_row": 3,
+                    "start_column": "B",
+                    "end_column": "E",
+                    "anchor": "B3",
+                }
+            ],
+        }
+
+        result = self.parser.parse(fixture)
+
+        self.assertFalse(
+            any(option.pricing.shared_price_source for option in result.options)
+        )
+        self.assertEqual(result.options[0].pricing.amount, Decimal("300.00"))
+        self.assertIsNone(result.options[1].pricing.amount)
+
+    def test_accessory_vertical_merge_shares_only_with_accessories(self) -> None:
+        fixture = {
+            "non_empty_cells": [
+                cell("挂钩", coordinate="D3"),
+                {
+                    **cell("￥50.00", coordinate="E3"),
+                    "merged_range": "E3:E4",
+                },
+                cell("大娃假发", coordinate="D4"),
+            ],
+            "merged_ranges": [
+                {
+                    "range": "E3:E4",
+                    "start_row": 3,
+                    "end_row": 4,
+                    "start_column": "E",
+                    "end_column": "E",
+                    "anchor": "E3",
+                }
+            ],
+        }
+
+        result = self.parser.parse(fixture)
+
+        self.assertEqual(
+            [option.category for option in result.options],
+            ["accessory", "accessory"],
+        )
+        self.assertEqual(
+            [option.pricing.amount for option in result.options],
+            [Decimal("50.00"), Decimal("50.00")],
+        )
+        self.assertTrue(
+            all(option.pricing.shared_price_source for option in result.options)
+        )
+
+    def test_invalid_merged_anchor_prevents_price_sharing(self) -> None:
+        fixture = {
+            "non_empty_cells": [
+                cell("选项一", coordinate="A3"),
+                {
+                    **cell("￥300.00", coordinate="B3"),
+                    "merged_range": "B3:B4",
+                },
+                cell("选项二", coordinate="A4"),
+            ],
+            "merged_ranges": [
+                {
+                    "range": "B3:B4",
+                    "start_row": 3,
+                    "end_row": 4,
+                    "start_column": "B",
+                    "end_column": "B",
+                    "anchor": "B4",
+                }
+            ],
+        }
+
+        result = self.parser.parse(fixture)
+
+        self.assertEqual(
+            [option.pricing.amount for option in result.options],
+            [Decimal("300.00"), None],
+        )
+        self.assertFalse(
+            any(option.pricing.shared_price_source for option in result.options)
+        )
+
+    def test_inconsistent_merged_range_text_prevents_price_sharing(self) -> None:
+        fixture = {
+            "non_empty_cells": [
+                cell("选项一", coordinate="A3"),
+                {
+                    **cell("￥300.00", coordinate="B3"),
+                    "merged_range": "B3:B5",
+                },
+                cell("选项二", coordinate="A4"),
+            ],
+            "merged_ranges": [
+                {
+                    "range": "B3:B5",
+                    "start_row": 3,
+                    "end_row": 4,
+                    "start_column": "B",
+                    "end_column": "B",
+                    "anchor": "B3",
+                }
+            ],
+        }
+
+        result = self.parser.parse(fixture)
+
+        self.assertEqual(
+            [option.pricing.amount for option in result.options],
+            [Decimal("300.00"), None],
+        )
+        self.assertFalse(
+            any(option.pricing.shared_price_source for option in result.options)
         )
         self.assertIn(
             "merged price range not reused",
