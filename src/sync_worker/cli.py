@@ -6,6 +6,7 @@ import argparse
 import json
 import logging
 from collections.abc import Sequence
+from decimal import Decimal
 from pathlib import Path
 
 from .additional_option_dry_run import run_additional_option_dry_run
@@ -18,6 +19,11 @@ from .google_doctor import GoogleDoctorRunner
 from .inspect_product import (
     ReferenceProductInspector,
     reference_product_report_filename,
+)
+from .option_pricing_dry_run import (
+    OptionPricingDryRunInputError,
+    parse_rmb_to_usd_rate,
+    run_option_pricing_dry_run,
 )
 from .product_size_enrichment_dry_run import (
     run_product_size_enrichment_dry_run,
@@ -274,6 +280,13 @@ def _sheet_range_argument(value: str) -> str:
         raise argparse.ArgumentTypeError(str(error)) from None
 
 
+def _rmb_to_usd_argument(value: str) -> Decimal:
+    try:
+        return parse_rmb_to_usd_rate(value)
+    except OptionPricingDryRunInputError as error:
+        raise argparse.ArgumentTypeError(str(error)) from None
+
+
 def _run_inspect_sheet_layout(
     logger: logging.Logger,
     sheet_title: str,
@@ -378,6 +391,38 @@ def _run_parse_additional_option(
                 "detected_option_count": report.get(
                     "detected_option_count", 0
                 ),
+                "network_requests_performed": 0,
+                "write_requests_performed": 0,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+    )
+    return 0 if report.get("status") == "ok" else 1
+
+
+def _run_price_additional_options(
+    logger: logging.Logger,
+    input_path: Path,
+    rmb_to_usd_rate: Decimal,
+) -> int:
+    try:
+        report, _ = run_option_pricing_dry_run(
+            input_path,
+            rmb_to_usd_rate=rmb_to_usd_rate,
+            project_root=PROJECT_ROOT,
+        )
+    except Exception as error:
+        _log_failure(logger, error, event="price_additional_options_aborted")
+        return 2
+
+    logger.info(
+        json.dumps(
+            {
+                "event": "option_pricing_dry_run_report_written",
+                "path": "reports/option-pricing-dry-run.json",
+                "status": report.get("status"),
+                "summary": report.get("summary", {}),
                 "network_requests_performed": 0,
                 "write_requests_performed": 0,
             },
@@ -511,6 +556,24 @@ def build_parser() -> argparse.ArgumentParser:
         dest="input_path",
         help="Local Additional Option sheet-layout JSON file",
     )
+    price_additional_options = subcommands.add_parser(
+        "price-additional-options",
+        help="Price a local Additional Option dry-run report with injected FX",
+    )
+    price_additional_options.add_argument(
+        "--input",
+        required=True,
+        type=Path,
+        dest="input_path",
+        help="Local Additional Option dry-run JSON file",
+    )
+    price_additional_options.add_argument(
+        "--rmb-to-usd",
+        required=True,
+        type=_rmb_to_usd_argument,
+        dest="rmb_to_usd_rate",
+        help="Explicit positive RMB-to-USD Decimal rate",
+    )
     parse_size_list = subcommands.add_parser(
         "parse-size-list",
         help="Parse a local Size List layout into a sanitized dry-run report",
@@ -562,6 +625,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_parse_clm_price_list(logger, arguments.input_path)
     if arguments.command == "parse-additional-option":
         return _run_parse_additional_option(logger, arguments.input_path)
+    if arguments.command == "price-additional-options":
+        return _run_price_additional_options(
+            logger,
+            arguments.input_path,
+            arguments.rmb_to_usd_rate,
+        )
     if arguments.command == "parse-size-list":
         return _run_parse_size_list(logger, arguments.input_path)
     if arguments.command == "enrich-product-size":
