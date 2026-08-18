@@ -28,6 +28,9 @@ from .option_pricing_dry_run import (
 from .product_size_enrichment_dry_run import (
     run_product_size_enrichment_dry_run,
 )
+from .product_option_linking_dry_run import (
+    run_product_option_linking_dry_run,
+)
 from .report import (
     DoctorReportWriter,
     ReferenceProductReportWriter,
@@ -494,6 +497,38 @@ def _run_enrich_product_size(
     return 0 if report.get("status") == "ok" else 1
 
 
+def _run_link_product_options(
+    logger: logging.Logger,
+    product_input_path: Path,
+    option_input_path: Path,
+) -> int:
+    try:
+        report, _ = run_product_option_linking_dry_run(
+            product_input_path,
+            option_input_path,
+            project_root=PROJECT_ROOT,
+        )
+    except Exception as error:
+        _log_failure(logger, error, event="link_product_options_aborted")
+        return 2
+
+    logger.info(
+        json.dumps(
+            {
+                "event": "product_option_linking_dry_run_report_written",
+                "path": "reports/product-option-linking-dry-run.json",
+                "status": report.get("status"),
+                "summary": report.get("summary", {}),
+                "network_requests_performed": 0,
+                "write_requests_performed": 0,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+    )
+    return 0 if report.get("status") == "ok" else 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="python -m sync_worker")
     subcommands = parser.add_subparsers(dest="command", required=True)
@@ -603,6 +638,24 @@ def build_parser() -> argparse.ArgumentParser:
         dest="size_input_path",
         help="Local Size List dry-run JSON file",
     )
+    link_product_options = subcommands.add_parser(
+        "link-product-options",
+        help="Link local Product and Additional Option dry-run reports",
+    )
+    link_product_options.add_argument(
+        "--products",
+        required=True,
+        type=Path,
+        dest="product_input_path",
+        help="Local CLM parser dry-run JSON file",
+    )
+    link_product_options.add_argument(
+        "--options",
+        required=True,
+        type=Path,
+        dest="option_input_path",
+        help="Local Additional Option dry-run JSON file",
+    )
     return parser
 
 
@@ -638,5 +691,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             logger,
             arguments.product_input_path,
             arguments.size_input_path,
+        )
+    if arguments.command == "link-product-options":
+        return _run_link_product_options(
+            logger,
+            arguments.product_input_path,
+            arguments.option_input_path,
         )
     raise AssertionError("Unhandled command")
