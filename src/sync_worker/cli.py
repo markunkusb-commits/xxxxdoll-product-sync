@@ -32,6 +32,9 @@ from .product_size_enrichment_dry_run import (
 from .product_option_linking_dry_run import (
     run_product_option_linking_dry_run,
 )
+from .product_option_pricing_dry_run import (
+    run_product_option_pricing_dry_run,
+)
 from .report import (
     DoctorReportWriter,
     ReferenceProductReportWriter,
@@ -532,6 +535,38 @@ def _run_link_product_options(
     return 0 if report.get("status") == "ok" else 1
 
 
+def _run_price_linked_product_options(
+    logger: logging.Logger,
+    input_path: Path,
+    rmb_to_usd_rate: Decimal,
+) -> int:
+    try:
+        report, _ = run_product_option_pricing_dry_run(
+            input_path,
+            rmb_to_usd_rate=rmb_to_usd_rate,
+            project_root=PROJECT_ROOT,
+        )
+    except Exception as error:
+        _log_failure(logger, error, event="price_linked_product_options_aborted")
+        return 2
+
+    logger.info(
+        json.dumps(
+            {
+                "event": "product_option_pricing_dry_run_report_written",
+                "path": "reports/product-option-pricing-dry-run.json",
+                "status": report.get("status"),
+                "summary": report.get("summary", {}),
+                "network_requests_performed": 0,
+                "write_requests_performed": 0,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+    )
+    return 0 if report.get("status") == "ok" else 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="python -m sync_worker")
     subcommands = parser.add_subparsers(dest="command", required=True)
@@ -666,6 +701,24 @@ def build_parser() -> argparse.ArgumentParser:
         dest="mapping_registry_version",
         help="Explicit approved option mapping registry version",
     )
+    price_linked_options = subcommands.add_parser(
+        "price-linked-product-options",
+        help="Price a local Product Option Linking report with injected FX",
+    )
+    price_linked_options.add_argument(
+        "--input",
+        required=True,
+        type=Path,
+        dest="input_path",
+        help="Local Product Option Linking dry-run JSON file",
+    )
+    price_linked_options.add_argument(
+        "--rmb-to-usd",
+        required=True,
+        type=_rmb_to_usd_argument,
+        dest="rmb_to_usd_rate",
+        help="Explicit positive RMB-to-USD Decimal rate",
+    )
     return parser
 
 
@@ -708,5 +761,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             arguments.product_input_path,
             arguments.option_input_path,
             arguments.mapping_registry_version,
+        )
+    if arguments.command == "price-linked-product-options":
+        return _run_price_linked_product_options(
+            logger,
+            arguments.input_path,
+            arguments.rmb_to_usd_rate,
         )
     raise AssertionError("Unhandled command")
