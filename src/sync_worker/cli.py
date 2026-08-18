@@ -25,6 +25,7 @@ from .option_pricing_dry_run import (
     parse_rmb_to_usd_rate,
     run_option_pricing_dry_run,
 )
+from .option_mapping_registry import REGISTRY_VERSION
 from .product_size_enrichment_dry_run import (
     run_product_size_enrichment_dry_run,
 )
@@ -501,12 +502,14 @@ def _run_link_product_options(
     logger: logging.Logger,
     product_input_path: Path,
     option_input_path: Path,
+    mapping_registry_version: str | None,
 ) -> int:
     try:
         report, _ = run_product_option_linking_dry_run(
             product_input_path,
             option_input_path,
             project_root=PROJECT_ROOT,
+            mapping_registry_version=mapping_registry_version,
         )
     except Exception as error:
         _log_failure(logger, error, event="link_product_options_aborted")
@@ -656,6 +659,13 @@ def build_parser() -> argparse.ArgumentParser:
         dest="option_input_path",
         help="Local Additional Option dry-run JSON file",
     )
+    link_product_options.add_argument(
+        "--mapping-registry",
+        choices=(REGISTRY_VERSION,),
+        default=None,
+        dest="mapping_registry_version",
+        help="Explicit approved option mapping registry version",
+    )
     return parser
 
 
@@ -697,5 +707,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             logger,
             arguments.product_input_path,
             arguments.option_input_path,
+            arguments.mapping_registry_version,
         )
     raise AssertionError("Unhandled command")

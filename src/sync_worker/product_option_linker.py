@@ -296,7 +296,9 @@ def link_products_to_options(
                 )
                 continue
 
-            if mapping_registry is not None:
+            if mapping_registry is not None and (
+                mapping_registry.aliases or mapping_registry.composites
+            ):
                 resolution = mapping_registry.resolve(upgrade, catalog)
                 mapping_resolutions.append(resolution)
                 if resolution.status in {"exact_catalog", "alias"}:

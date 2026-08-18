@@ -17,6 +17,11 @@ from .additional_option_parser import (
     OptionCategory,
 )
 from .product_model import MonetaryValue, ProductRecord, from_clm_product
+from .option_mapping_registry import (
+    REGISTRY_VERSION,
+    OptionMappingRegistry,
+    OptionMappingResolution,
+)
 from .product_option_linker import (
     OptionAliasRegistry,
     ProductOptionLinkResult,
@@ -32,6 +37,7 @@ from .sanitization import REPORT_SECRET_SCAN_PATTERN, Redactor
 
 
 REPORT_FILENAME = "product-option-linking-dry-run.json"
+_DISABLED_REGISTRY_VERSION = "disabled"
 _COORDINATE_PATTERN = re.compile(r"^([A-Z]+)([1-9][0-9]*)$")
 _REPORT_URL_PATTERN = re.compile(r"(?i)https?://[^\s\"'<>]+")
 _OPTION_CATEGORIES = frozenset(get_args(OptionCategory))
@@ -39,6 +45,24 @@ _OPTION_CATEGORIES = frozenset(get_args(OptionCategory))
 
 class ProductOptionLinkingInputError(ValueError):
     """Safe structural error for local Product + Option reports."""
+
+
+def select_option_mapping_registry(
+    registry_version: str | None,
+) -> OptionMappingRegistry:
+    """Select only an explicitly approved registry; never guess or fall back."""
+
+    if registry_version is None:
+        return OptionMappingRegistry(
+            version=_DISABLED_REGISTRY_VERSION,
+            aliases=(),
+            composites=(),
+        )
+    if registry_version == REGISTRY_VERSION:
+        return OptionMappingRegistry.approved_v1()
+    raise ProductOptionLinkingInputError(
+        f"Unsupported option mapping registry: {registry_version}"
+    )
 
 
 def load_local_json_report(input_path: Path) -> Mapping[str, object]:
@@ -242,10 +266,95 @@ def _supplier_pricing(value: AdditionalOptionPricing) -> dict[str, object]:
     }
 
 
+def _composite_mapping_report(
+    resolution: OptionMappingResolution,
+) -> dict[str, object]:
+    combined = resolution.combined_supplier_cost
+    return {
+        "product_upgrade_name": resolution.product_upgrade_name,
+        "product_raw_value": resolution.product_raw_value,
+        "mapping_type": "composite",
+        "registry_version": resolution.registry_version,
+        "components": [
+            {
+                "option_name": component.option_name,
+                "category": component.category,
+                "supplier_cost": _supplier_pricing(component.supplier_cost),
+                "source_coordinate": component.source.raw_coordinate,
+            }
+            for component in resolution.components
+        ],
+        "combined_supplier_cost": (
+            {
+                "amount": combined.amount,
+                "currency": combined.currency,
+            }
+            if combined is not None
+            else None
+        ),
+        "warnings": list(resolution.warnings),
+    }
+
+
+def _mapping_issue_report(
+    resolution: OptionMappingResolution,
+) -> dict[str, object]:
+    return {
+        "product_upgrade_name": resolution.product_upgrade_name,
+        "product_raw_value": resolution.product_raw_value,
+        "mapping_type": resolution.mapping_type,
+        "status": resolution.status,
+        "registry_version": resolution.registry_version,
+        "components": [
+            {
+                "option_name": component.option_name,
+                "category": component.category,
+                "supplier_cost": _supplier_pricing(component.supplier_cost),
+                "source_coordinate": component.source.raw_coordinate,
+            }
+            for component in resolution.components
+        ],
+        "missing_component_names": list(resolution.missing_component_names),
+        "warnings": list(resolution.warnings),
+    }
+
+
 def _result_report(
     product: ProductRecord,
     result: ProductOptionLinkResult,
+    *,
+    mapping_registry_enabled: bool,
 ) -> dict[str, object]:
+    linked_options = [
+        {
+            "product_upgrade_name": linked.product_option.name,
+            "product_raw_value": linked.product_raw_option,
+            "mapping_type": (
+                "alias" if linked.match_method == "approved_alias" else "exact"
+            ),
+            "registry_version": linked.registry_version,
+            "catalog_option_name": linked.matched_catalog_option.option_name,
+            "catalog_category": linked.category,
+            "supplier_cost": _supplier_pricing(linked.pricing),
+            "catalog_source_coordinate": (
+                linked.pricing_source.raw_coordinate
+            ),
+            "warnings": list(linked.warnings),
+            # Backward-compatible report keys for the exact-only baseline.
+            "product_raw_option": linked.product_raw_option,
+            "matched_catalog_option": linked.matched_catalog_option.option_name,
+            "category": linked.category,
+            "supplier_pricing": _supplier_pricing(linked.pricing),
+            "match_method": linked.match_method,
+        }
+        for linked in result.linked_upgrade_options
+    ]
+    if mapping_registry_enabled:
+        linked_options.extend(
+            _composite_mapping_report(resolution)
+            for resolution in result.mapping_resolutions
+            if resolution.status == "composite"
+        )
     return {
         "series": result.series,
         "product_identity": {
@@ -261,22 +370,7 @@ def _result_report(
         "raw_upgrade_options": [
             upgrade.raw_value for upgrade in product.options.upgrade_options
         ],
-        "linked_upgrade_options": [
-            {
-                "product_raw_option": linked.product_raw_option,
-                "matched_catalog_option": (
-                    linked.matched_catalog_option.option_name
-                ),
-                "category": linked.category,
-                "supplier_pricing": _supplier_pricing(linked.pricing),
-                "match_method": linked.match_method,
-                "catalog_source_coordinate": (
-                    linked.pricing_source.raw_coordinate
-                ),
-                "warnings": list(linked.warnings),
-            }
-            for linked in result.linked_upgrade_options
-        ],
+        "linked_upgrade_options": linked_options,
         "unmatched_upgrade_options": [
             {
                 "product_raw_option": unmatched.product_raw_option,
@@ -308,6 +402,20 @@ def _result_report(
             }
             for conflict in result.included_upgrade_conflicts
         ],
+        "mapping_issues": (
+            [
+                _mapping_issue_report(resolution)
+                for resolution in result.mapping_resolutions
+                if resolution.status
+                in {
+                    "incomplete_composite",
+                    "currency_conflict",
+                    "missing_component_price",
+                }
+            ]
+            if mapping_registry_enabled
+            else []
+        ),
         "retail_pricing": {
             "minimum_retail_price": _money(
                 result.retail_pricing.minimum_retail_price
@@ -323,15 +431,19 @@ def build_product_option_linking_report(
     *,
     product_input_file: str,
     option_input_file: str,
+    mapping_registry_version: str | None = None,
     redactor: Redactor | None = None,
 ) -> dict[str, object]:
-    """Call the canonical exact-match linker with an explicitly empty alias set."""
+    """Call the canonical linker with an explicit versioned registry choice."""
 
     alias_registry = OptionAliasRegistry()
+    mapping_registry = select_option_mapping_registry(mapping_registry_version)
+    mapping_registry_enabled = mapping_registry_version is not None
     results = link_products_to_options(
         products,
         options,
         alias_registry=alias_registry,
+        mapping_registry=mapping_registry,
     )
     linked_summary = summarize_option_linking(results)
     total_upgrade_options = sum(
@@ -340,10 +452,19 @@ def build_product_option_linking_report(
     products_with_upgrades = sum(
         bool(product.options.upgrade_options) for product in products
     )
+    resolutions = [
+        resolution
+        for result in results
+        for resolution in result.mapping_resolutions
+    ]
     report: dict[str, object] = {
         "status": "ok",
         "product_input_file": product_input_file,
         "option_input_file": option_input_file,
+        "mapping_registry": {
+            "enabled": mapping_registry_enabled,
+            "version": mapping_registry_version,
+        },
         "summary": {
             "total_products": len(products),
             "products_with_upgrade_options": products_with_upgrades,
@@ -352,8 +473,34 @@ def build_product_option_linking_report(
             ),
             "total_upgrade_options": total_upgrade_options,
             "linked_options": linked_summary.linked_options,
+            "exact_matches": sum(
+                linked.match_method == "exact"
+                for result in results
+                for linked in result.linked_upgrade_options
+            ),
+            "alias_matches": sum(
+                linked.match_method == "approved_alias"
+                for result in results
+                for linked in result.linked_upgrade_options
+            ),
+            "composite_matches": sum(
+                resolution.status == "composite"
+                for resolution in resolutions
+            ),
             "unmatched_options": linked_summary.unmatched_options,
             "ambiguous_options": linked_summary.ambiguous_options,
+            "incomplete_composites": sum(
+                resolution.status == "incomplete_composite"
+                for resolution in resolutions
+            ),
+            "currency_conflicts": sum(
+                resolution.status == "currency_conflict"
+                for resolution in resolutions
+            ),
+            "missing_component_prices": sum(
+                resolution.status == "missing_component_price"
+                for resolution in resolutions
+            ),
             "included_features_count": (
                 linked_summary.included_features_count
             ),
@@ -362,7 +509,11 @@ def build_product_option_linking_report(
         "network_requests_performed": 0,
         "write_requests_performed": 0,
         "results": [
-            _result_report(product, result)
+            _result_report(
+                product,
+                result,
+                mapping_registry_enabled=mapping_registry_enabled,
+            )
             for product, result in zip(products, results, strict=True)
         ],
     }
@@ -390,8 +541,10 @@ def run_product_option_linking_dry_run(
     option_input_path: Path,
     *,
     project_root: Path,
+    mapping_registry_version: str | None = None,
     redactor: Redactor | None = None,
 ) -> tuple[dict[str, object], Path]:
+    select_option_mapping_registry(mapping_registry_version)
     product_path = Path(product_input_path)
     option_path = Path(option_input_path)
     product_report = load_local_json_report(product_path)
@@ -404,6 +557,7 @@ def run_product_option_linking_dry_run(
         options,
         product_input_file=_safe_input_reference(product_path, project_root),
         option_input_file=_safe_input_reference(option_path, project_root),
+        mapping_registry_version=mapping_registry_version,
         redactor=active_redactor,
     )
     report_path = project_root / "reports" / REPORT_FILENAME

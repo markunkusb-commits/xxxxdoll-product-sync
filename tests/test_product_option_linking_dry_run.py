@@ -14,17 +14,23 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from sync_worker.cli import build_parser, main  # noqa: E402
+from sync_worker.option_mapping_registry import (  # noqa: E402
+    REGISTRY_VERSION,
+    OptionMappingRegistry,
+)
 from sync_worker.product_model import from_clm_product  # noqa: E402
 from sync_worker.product_option_linker import (  # noqa: E402
     OptionAliasRegistry,
     link_products_to_options,
 )
 from sync_worker.product_option_linking_dry_run import (  # noqa: E402
+    ProductOptionLinkingInputError,
     build_product_option_linking_report,
     load_local_json_report,
     restore_option_records,
     restore_product_records,
     run_product_option_linking_dry_run,
+    select_option_mapping_registry,
 )
 
 
@@ -87,6 +93,7 @@ def option_item(
     *,
     category: str = "product_extra_option",
     amount: str | None = "500.00",
+    currency: str | None = "RMB",
     raw_price: str | None = "￥500.00",
     coordinate: str = "A2",
     warnings: list[str] | None = None,
@@ -99,7 +106,7 @@ def option_item(
         "option_name": name,
         "price": {
             "amount": amount,
-            "currency": "RMB" if amount is not None else None,
+            "currency": currency if amount is not None else None,
             "raw_price": raw_price,
             "price_range": price_range,
             "price_anchor": price_anchor,
@@ -179,6 +186,71 @@ def restored_fixture():
     )
 
 
+def approved_fixture_reports() -> tuple[dict[str, object], dict[str, object]]:
+    return (
+        {
+            "products": [
+                product_item(
+                    "U1",
+                    upgrades=[
+                        upgrade("Gel Butt", raw_value="1. Gel Butt"),
+                        upgrade("Hair Implant", raw_value="2. Hair Implant"),
+                        upgrade(
+                            "Eyebrows/Eyelashes Implant",
+                            raw_value="3. Eyebrows/Eyelashes Implant",
+                        ),
+                        upgrade(
+                            "Hard Hands and Feet",
+                            raw_value="4. Hard Hands and Feet",
+                        ),
+                    ],
+                    retail=999,
+                ),
+                product_item(
+                    "E1",
+                    upgrades=[upgrade("Exact Option")],
+                    start_row=30,
+                ),
+                product_item(
+                    "C1",
+                    upgrades=[upgrade("Gel Butt")],
+                    included=["Gel Butt"],
+                    start_row=40,
+                ),
+            ]
+        },
+        {
+            "options": [
+                option_item("凝胶屁股", amount="500", coordinate="A2"),
+                option_item("硅胶头植发", amount="500", coordinate="A3"),
+                option_item(
+                    "硬手硬脚(仅限硅胶)", amount="400", coordinate="A4"
+                ),
+                option_item("硅胶头植眉毛", amount="300", coordinate="A5"),
+                option_item("硅胶头植睫毛", amount="300", coordinate="A6"),
+                option_item("Exact Option", amount="250", coordinate="A7"),
+            ]
+        },
+    )
+
+
+def enabled_report_for(
+    product_report: dict[str, object],
+    option_report: dict[str, object],
+) -> dict[str, object]:
+    return build_product_option_linking_report(
+        restore_product_records(product_report),
+        restore_option_records(option_report),
+        product_input_file="mock-products.json",
+        option_input_file="mock-options.json",
+        mapping_registry_version=REGISTRY_VERSION,
+    )
+
+
+def approved_built_report() -> dict[str, object]:
+    return enabled_report_for(*approved_fixture_reports())
+
+
 def built_report() -> dict[str, object]:
     products, options = restored_fixture()
     return build_product_option_linking_report(
@@ -248,10 +320,17 @@ class ProductOptionLinkingDryRunTests(unittest.TestCase):
 
     def test_07_report_reuses_existing_product_option_linker(self) -> None:
         products, options = restored_fixture()
-        with patch(
-            "sync_worker.product_option_linking_dry_run.link_products_to_options",
-            wraps=link_products_to_options,
-        ) as linker:
+        with (
+            patch(
+                "sync_worker.product_option_linking_dry_run.link_products_to_options",
+                wraps=link_products_to_options,
+            ) as linker,
+            patch.object(
+                OptionMappingRegistry,
+                "resolve",
+                side_effect=AssertionError("disabled registry must not resolve"),
+            ) as resolver,
+        ):
             build_product_option_linking_report(
                 products,
                 options,
@@ -261,6 +340,7 @@ class ProductOptionLinkingDryRunTests(unittest.TestCase):
         linker.assert_called_once()
         self.assertIs(linker.call_args.args[0], products)
         self.assertIs(linker.call_args.args[1], options)
+        resolver.assert_not_called()
 
     def test_08_default_alias_registry_is_explicitly_empty(self) -> None:
         products, options = restored_fixture()
@@ -520,12 +600,379 @@ class ProductOptionLinkingDryRunTests(unittest.TestCase):
                 "products_without_upgrade_options",
                 "total_upgrade_options",
                 "linked_options",
+                "exact_matches",
+                "alias_matches",
+                "composite_matches",
                 "unmatched_options",
                 "ambiguous_options",
+                "incomplete_composites",
+                "currency_conflicts",
+                "missing_component_prices",
                 "included_features_count",
                 "included_upgrade_conflicts",
             },
         )
+
+    def test_31_cli_mapping_registry_defaults_to_none(self) -> None:
+        arguments = build_parser().parse_args(
+            [
+                "link-product-options",
+                "--products",
+                "products.json",
+                "--options",
+                "options.json",
+            ]
+        )
+        self.assertIsNone(arguments.mapping_registry_version)
+
+    def test_32_cli_accepts_the_approved_registry_version(self) -> None:
+        arguments = build_parser().parse_args(
+            [
+                "link-product-options",
+                "--products",
+                "products.json",
+                "--options",
+                "options.json",
+                "--mapping-registry",
+                REGISTRY_VERSION,
+            ]
+        )
+        self.assertEqual(arguments.mapping_registry_version, REGISTRY_VERSION)
+
+    def test_33_cli_rejects_unknown_registry_version(self) -> None:
+        with self.assertRaises(SystemExit) as caught:
+            build_parser().parse_args(
+                [
+                    "link-product-options",
+                    "--products",
+                    "products.json",
+                    "--options",
+                    "options.json",
+                    "--mapping-registry",
+                    "fake-version",
+                ]
+            )
+        self.assertEqual(caught.exception.code, 2)
+        with self.assertRaises(ProductOptionLinkingInputError):
+            select_option_mapping_registry("fake-version")
+
+    def test_34_approved_registry_version_loads_existing_registry(self) -> None:
+        registry = select_option_mapping_registry(REGISTRY_VERSION)
+        self.assertIsInstance(registry, OptionMappingRegistry)
+        self.assertEqual(registry.version, REGISTRY_VERSION)
+        self.assertEqual(len(registry.aliases), 3)
+        self.assertEqual(len(registry.composites), 1)
+
+    def test_35_default_path_passes_an_explicitly_empty_mapping_registry(
+        self,
+    ) -> None:
+        products, options = restored_fixture()
+        with patch(
+            "sync_worker.product_option_linking_dry_run.link_products_to_options",
+            wraps=link_products_to_options,
+        ) as linker:
+            build_product_option_linking_report(
+                products,
+                options,
+                product_input_file="products.json",
+                option_input_file="options.json",
+            )
+        registry = linker.call_args.kwargs["mapping_registry"]
+        self.assertIsInstance(registry, OptionMappingRegistry)
+        self.assertEqual(registry.aliases, ())
+        self.assertEqual(registry.composites, ())
+
+    def test_36_default_report_marks_mapping_registry_disabled(self) -> None:
+        self.assertEqual(
+            built_report()["mapping_registry"],
+            {"enabled": False, "version": None},
+        )
+
+    def test_37_approved_report_records_registry_version(self) -> None:
+        self.assertEqual(
+            approved_built_report()["mapping_registry"],
+            {"enabled": True, "version": REGISTRY_VERSION},
+        )
+
+    def test_38_exact_match_remains_higher_priority_than_alias(self) -> None:
+        report = enabled_report_for(
+            {"products": [product_item("P1", upgrades=[upgrade("Gel Butt")])]},
+            {
+                "options": [
+                    option_item("凝胶屁股", coordinate="A2"),
+                    option_item("Gel Butt", coordinate="A3"),
+                ]
+            },
+        )
+        linked = report["results"][0]["linked_upgrade_options"][0]
+        self.assertEqual(linked["mapping_type"], "exact")
+        self.assertEqual(linked["catalog_source_coordinate"], "A3")
+        self.assertEqual(report["summary"]["alias_matches"], 0)
+
+    def test_39_gel_butt_alias_report_structure(self) -> None:
+        linked = approved_built_report()["results"][0][
+            "linked_upgrade_options"
+        ][0]
+        self.assertEqual(linked["product_upgrade_name"], "Gel Butt")
+        self.assertEqual(linked["product_raw_value"], "1. Gel Butt")
+        self.assertEqual(linked["mapping_type"], "alias")
+        self.assertEqual(linked["catalog_option_name"], "凝胶屁股")
+        self.assertEqual(linked["supplier_cost"]["amount"], "500")
+
+    def test_40_hair_implant_alias_is_enabled(self) -> None:
+        linked = approved_built_report()["results"][0][
+            "linked_upgrade_options"
+        ][1]
+        self.assertEqual(linked["product_upgrade_name"], "Hair Implant")
+        self.assertEqual(linked["catalog_option_name"], "硅胶头植发")
+
+    def test_41_hard_hands_and_feet_alias_is_enabled(self) -> None:
+        linked = approved_built_report()["results"][0][
+            "linked_upgrade_options"
+        ][2]
+        self.assertEqual(linked["product_upgrade_name"], "Hard Hands and Feet")
+        self.assertEqual(linked["catalog_option_name"], "硬手硬脚(仅限硅胶)")
+        self.assertEqual(linked["supplier_cost"]["amount"], "400")
+
+    def test_42_composite_is_one_linked_customer_option(self) -> None:
+        linked = approved_built_report()["results"][0][
+            "linked_upgrade_options"
+        ][3]
+        self.assertEqual(linked["mapping_type"], "composite")
+        self.assertEqual(
+            linked["product_upgrade_name"], "Eyebrows/Eyelashes Implant"
+        )
+        self.assertEqual(len(linked["components"]), 2)
+
+    def test_43_composite_combines_rmb_300_plus_rmb_300(self) -> None:
+        linked = approved_built_report()["results"][0][
+            "linked_upgrade_options"
+        ][3]
+        self.assertEqual(
+            linked["combined_supplier_cost"],
+            {"amount": "600", "currency": "RMB"},
+        )
+
+    def test_44_exact_match_summary_count(self) -> None:
+        self.assertEqual(approved_built_report()["summary"]["exact_matches"], 1)
+
+    def test_45_alias_match_summary_count(self) -> None:
+        self.assertEqual(approved_built_report()["summary"]["alias_matches"], 3)
+
+    def test_46_composite_match_summary_count(self) -> None:
+        report = approved_built_report()
+        self.assertEqual(report["summary"]["composite_matches"], 1)
+        self.assertEqual(report["summary"]["linked_options"], 5)
+
+    def test_47_unmatched_summary_with_registry_enabled(self) -> None:
+        report = enabled_report_for(
+            {
+                "products": [
+                    product_item("P1", upgrades=[upgrade("Unknown Upgrade")])
+                ]
+            },
+            {"options": []},
+        )
+        self.assertEqual(report["summary"]["unmatched_options"], 1)
+
+    def test_48_ambiguous_alias_summary(self) -> None:
+        report = enabled_report_for(
+            {"products": [product_item("P1", upgrades=[upgrade("Gel Butt")])]},
+            {
+                "options": [
+                    option_item("凝胶屁股", coordinate="A2"),
+                    option_item("凝胶屁股", coordinate="A3"),
+                ]
+            },
+        )
+        self.assertEqual(report["summary"]["ambiguous_options"], 1)
+
+    def test_49_incomplete_composite_summary(self) -> None:
+        report = enabled_report_for(
+            {
+                "products": [
+                    product_item(
+                        "P1",
+                        upgrades=[upgrade("Eyebrows/Eyelashes Implant")],
+                    )
+                ]
+            },
+            {"options": [option_item("硅胶头植眉毛", amount="300")]},
+        )
+        self.assertEqual(report["summary"]["incomplete_composites"], 1)
+        self.assertEqual(
+            report["results"][0]["mapping_issues"][0]["status"],
+            "incomplete_composite",
+        )
+
+    def test_50_currency_conflict_summary(self) -> None:
+        report = enabled_report_for(
+            {
+                "products": [
+                    product_item(
+                        "P1",
+                        upgrades=[upgrade("Eyebrows/Eyelashes Implant")],
+                    )
+                ]
+            },
+            {
+                "options": [
+                    option_item("硅胶头植眉毛", amount="300", currency="RMB"),
+                    option_item(
+                        "硅胶头植睫毛",
+                        amount="50",
+                        currency="USD",
+                        coordinate="A3",
+                    ),
+                ]
+            },
+        )
+        self.assertEqual(report["summary"]["currency_conflicts"], 1)
+
+    def test_51_missing_component_price_summary(self) -> None:
+        report = enabled_report_for(
+            {
+                "products": [
+                    product_item(
+                        "P1",
+                        upgrades=[upgrade("Eyebrows/Eyelashes Implant")],
+                    )
+                ]
+            },
+            {
+                "options": [
+                    option_item("硅胶头植眉毛", amount="300"),
+                    option_item(
+                        "硅胶头植睫毛",
+                        amount=None,
+                        raw_price=None,
+                        coordinate="A3",
+                    ),
+                ]
+            },
+        )
+        self.assertEqual(report["summary"]["missing_component_prices"], 1)
+
+    def test_52_included_conflict_precedes_registry_mapping(self) -> None:
+        report = approved_built_report()
+        conflict_product = report["results"][2]
+        self.assertEqual(report["summary"]["included_upgrade_conflicts"], 1)
+        self.assertEqual(conflict_product["linked_upgrade_options"], [])
+
+    def test_53_registry_does_not_change_product_retail_price(self) -> None:
+        report = approved_built_report()
+        retail = report["results"][0]["retail_pricing"][
+            "minimum_retail_price"
+        ]
+        self.assertEqual(retail["amount"], 999)
+        self.assertEqual(retail["currency"], "USD")
+
+    def test_54_registry_report_does_not_call_pricing_policy(self) -> None:
+        products_report, options_report = approved_fixture_reports()
+        with patch(
+            "sync_worker.option_pricing_policy.calculate_option_retail_price"
+        ) as pricing_policy:
+            enabled_report_for(products_report, options_report)
+        pricing_policy.assert_not_called()
+
+    def test_55_registry_report_does_not_call_fx_logic(self) -> None:
+        products_report, options_report = approved_fixture_reports()
+        with patch("sync_worker.option_pricing_policy._rmb_rate") as fx_logic:
+            enabled_report_for(products_report, options_report)
+        fx_logic.assert_not_called()
+
+    def test_56_registry_report_has_no_psychological_or_retail_option_price(
+        self,
+    ) -> None:
+        serialized = json.dumps(approved_built_report(), ensure_ascii=False)
+        for forbidden in (
+            "target_retail_usd",
+            "markup_price",
+            "minimum_profit",
+            "psychological_price",
+            "regular_price",
+            "sale_price",
+            "customer_price",
+        ):
+            self.assertNotIn(forbidden, serialized)
+
+    def test_57_alias_and_composite_source_trace_is_preserved(self) -> None:
+        linked = approved_built_report()["results"][0][
+            "linked_upgrade_options"
+        ]
+        self.assertEqual(linked[0]["catalog_source_coordinate"], "A2")
+        self.assertEqual(
+            [item["source_coordinate"] for item in linked[3]["components"]],
+            ["A5", "A6"],
+        )
+
+    def test_58_linked_alias_and_composite_retain_registry_version(self) -> None:
+        linked = approved_built_report()["results"][0][
+            "linked_upgrade_options"
+        ]
+        self.assertTrue(
+            all(item["registry_version"] == REGISTRY_VERSION for item in linked)
+        )
+
+    def test_59_cli_enabled_registry_uses_only_local_mock_files(self) -> None:
+        products_report, options_report = approved_fixture_reports()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            products_path = root / "products.json"
+            options_path = root / "options.json"
+            products_path.write_text(json.dumps(products_report), encoding="utf-8")
+            options_path.write_text(json.dumps(options_report), encoding="utf-8")
+            with (
+                patch.object(socket, "socket", side_effect=AssertionError("network")),
+                patch(
+                    "sync_worker.cli.load_config",
+                    side_effect=AssertionError(".env configuration"),
+                ) as wp_config,
+                patch(
+                    "sync_worker.cli.load_google_config",
+                    side_effect=AssertionError("Google configuration"),
+                ) as google_config,
+                patch("sync_worker.cli.PROJECT_ROOT", root),
+            ):
+                exit_code = main(
+                    [
+                        "link-product-options",
+                        "--products",
+                        str(products_path),
+                        "--options",
+                        str(options_path),
+                        "--mapping-registry",
+                        REGISTRY_VERSION,
+                    ]
+                )
+            self.assertEqual(exit_code, 0)
+            wp_config.assert_not_called()
+            google_config.assert_not_called()
+            saved = json.loads(
+                (root / "reports" / "product-option-linking-dry-run.json")
+                .read_text(encoding="utf-8")
+            )
+        self.assertEqual(saved["mapping_registry"]["version"], REGISTRY_VERSION)
+        self.assertEqual(saved["network_requests_performed"], 0)
+
+    def test_60_enabled_report_build_performs_no_external_write(self) -> None:
+        products_report, options_report = approved_fixture_reports()
+        products = restore_product_records(products_report)
+        options = restore_option_records(options_report)
+        with patch.object(
+            builtins,
+            "open",
+            side_effect=AssertionError("unexpected file access"),
+        ) as open_mock:
+            report = build_product_option_linking_report(
+                products,
+                options,
+                product_input_file="products.json",
+                option_input_file="options.json",
+                mapping_registry_version=REGISTRY_VERSION,
+            )
+        open_mock.assert_not_called()
+        self.assertEqual(report["write_requests_performed"], 0)
 
 
 if __name__ == "__main__":
