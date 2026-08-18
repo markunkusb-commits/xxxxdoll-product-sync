@@ -14,6 +14,10 @@ from .additional_option_parser import (
     AdditionalOptionSource,
     OptionCategory,
 )
+from .option_mapping_registry import (
+    OptionMappingRegistry,
+    OptionMappingResolution,
+)
 from .product_model import (
     ProductIdentity,
     ProductRecord,
@@ -23,7 +27,7 @@ from .product_model import (
 )
 
 
-OptionMatchMethod = Literal["exact", "approved_alias"]
+OptionMatchMethod = Literal["exact", "approved_alias", "approved_composite"]
 
 
 def _display_name(value: str) -> str:
@@ -88,6 +92,7 @@ class LinkedUpgradeOption:
     pricing_source: AdditionalOptionSource
     match_method: OptionMatchMethod
     warnings: tuple[str, ...]
+    registry_version: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -126,6 +131,7 @@ class ProductOptionLinkResult:
     warnings: tuple[str, ...]
     source: ProductSource
     retail_pricing: RetailPricing
+    mapping_resolutions: tuple[OptionMappingResolution, ...] = ()
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -189,6 +195,7 @@ def _linked_option(
     candidate: _CatalogCandidate,
     *,
     method: OptionMatchMethod,
+    registry_version: str | None = None,
 ) -> LinkedUpgradeOption:
     record = candidate.record
     return LinkedUpgradeOption(
@@ -200,6 +207,7 @@ def _linked_option(
         pricing_source=record.source,
         match_method=method,
         warnings=record.warnings,
+        registry_version=registry_version,
     )
 
 
@@ -208,11 +216,16 @@ def link_products_to_options(
     catalog: Sequence[AdditionalOptionRecord],
     *,
     alias_registry: OptionAliasRegistry | None = None,
+    mapping_registry: OptionMappingRegistry | None = None,
 ) -> list[ProductOptionLinkResult]:
     """Link only explicit product upgrades; perform no I/O or price math."""
     aliases = alias_registry or OptionAliasRegistry()
     if not isinstance(aliases, OptionAliasRegistry):
         raise TypeError("alias_registry must be an OptionAliasRegistry")
+    if mapping_registry is not None and not isinstance(
+        mapping_registry, OptionMappingRegistry
+    ):
+        raise TypeError("mapping_registry must be an OptionMappingRegistry")
 
     catalog_index: dict[str, list[_CatalogCandidate]] = defaultdict(list)
     for position, option in enumerate(catalog):
@@ -230,6 +243,7 @@ def link_products_to_options(
         unmatched: list[UnmatchedUpgradeOption] = []
         ambiguous: list[AmbiguousUpgradeOption] = []
         conflicts: list[IncludedUpgradeConflict] = []
+        mapping_resolutions: list[OptionMappingResolution] = []
         result_warnings: list[str] = list(product.warnings)
 
         for upgrade in product.options.upgrade_options:
@@ -278,6 +292,65 @@ def link_products_to_options(
                             *candidate_warnings,
                             "multiple catalog options matched",
                         ),
+                    )
+                )
+                continue
+
+            if mapping_registry is not None:
+                resolution = mapping_registry.resolve(upgrade, catalog)
+                mapping_resolutions.append(resolution)
+                if resolution.status in {"exact_catalog", "alias"}:
+                    matched_record = resolution.catalog_candidates[0]
+                    linked.append(
+                        _linked_option(
+                            upgrade,
+                            _CatalogCandidate(position=-1, record=matched_record),
+                            method=(
+                                "exact"
+                                if resolution.status == "exact_catalog"
+                                else "approved_alias"
+                            ),
+                            registry_version=resolution.registry_version,
+                        )
+                    )
+                    continue
+                if resolution.status == "ambiguous":
+                    candidate_warnings = tuple(
+                        dict.fromkeys(
+                            warning
+                            for candidate in resolution.catalog_candidates
+                            for warning in candidate.warnings
+                        )
+                    )
+                    ambiguous.append(
+                        AmbiguousUpgradeOption(
+                            product_raw_option=upgrade.raw_value,
+                            product_option=upgrade,
+                            catalog_candidates=resolution.catalog_candidates,
+                            match_method=(
+                                "approved_composite"
+                                if resolution.mapping_type == "composite"
+                                else "approved_alias"
+                            ),
+                            warnings=tuple(
+                                dict.fromkeys(
+                                    (*candidate_warnings, *resolution.warnings)
+                                )
+                            ),
+                        )
+                    )
+                    continue
+                if resolution.status in {
+                    "composite",
+                    "missing_component_price",
+                    "currency_conflict",
+                }:
+                    continue
+                unmatched.append(
+                    UnmatchedUpgradeOption(
+                        product_raw_option=upgrade.raw_value,
+                        product_option=upgrade,
+                        warnings=resolution.warnings,
                     )
                 )
                 continue
@@ -340,6 +413,7 @@ def link_products_to_options(
                 warnings=tuple(dict.fromkeys(result_warnings)),
                 source=product.source,
                 retail_pricing=product.retail_pricing,
+                mapping_resolutions=tuple(mapping_resolutions),
             )
         )
     return results
@@ -360,11 +434,17 @@ def summarize_option_linking(
                 or result.unmatched_upgrade_options
                 or result.ambiguous_upgrade_options
                 or result.included_upgrade_conflicts
+                or result.mapping_resolutions
             )
             for result in results
         ),
         linked_options=sum(
-            len(result.linked_upgrade_options) for result in results
+            len(result.linked_upgrade_options)
+            + sum(
+                resolution.status == "composite"
+                for resolution in result.mapping_resolutions
+            )
+            for result in results
         ),
         unmatched_options=sum(
             len(result.unmatched_upgrade_options) for result in results
@@ -384,6 +464,7 @@ def summarize_option_linking(
                 or result.unmatched_upgrade_options
                 or result.ambiguous_upgrade_options
                 or result.included_upgrade_conflicts
+                or result.mapping_resolutions
             )
             for result in results
         ),
