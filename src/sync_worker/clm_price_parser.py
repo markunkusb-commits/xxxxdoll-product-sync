@@ -25,6 +25,43 @@ _COORDINATE_PATTERN = re.compile(r"^([A-Z]+)([1-9][0-9]*)$")
 _NON_WORD_PATTERN = re.compile(r"[^a-z0-9]+")
 _SPEC_MAX_COLUMN_INDEX = 32  # AF; used only as structural evidence.
 _COMMERCIAL_MIN_COLUMN_INDEX = 33  # AG supports confirmed "More collocation".
+_MERGED_RANGE_PATTERN = re.compile(
+    r"^\$?([A-Z]+)\$?[1-9][0-9]*:\$?([A-Z]+)\$?[1-9][0-9]*$",
+    re.IGNORECASE,
+)
+_SEQUENCE_PREFIX_PATTERN = re.compile(r"^\s*[0-9]+\s*[.:]\s*")
+_DECORATION_CHARACTERS = frozenset(
+    {
+        "❤",
+        "♥",
+        "♡",
+        "❣",
+        "💕",
+        "💞",
+        "💓",
+        "💗",
+        "💖",
+        "💘",
+        "💝",
+        "💟",
+        "🖤",
+        "🤍",
+        "🤎",
+        "⭐",
+        "🌟",
+        "★",
+        "☆",
+        "◆",
+        "◇",
+        "●",
+        "○",
+        "♦",
+        "♢",
+    }
+)
+_ZERO_WIDTH_FORMATTING_CHARACTERS = frozenset(
+    {"\u200b", "\u200c", "\u200d", "\u2060", "\ufeff"}
+)
 
 
 def _label_key(value: str) -> str:
@@ -152,6 +189,7 @@ class _Cell:
     column_index: int
     value: str
     raw_value: str = field(repr=False)
+    merged_range: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -248,6 +286,12 @@ def _parse_cells(layout: Mapping[str, object]) -> list[_Cell]:
                 column_index=column_index,
                 value=_sanitize_value(raw_value),
                 raw_value=raw_value,
+                merged_range=(
+                    raw_cell.get("merged_range").strip()
+                    if isinstance(raw_cell.get("merged_range"), str)
+                    and raw_cell.get("merged_range").strip()
+                    else None
+                ),
             )
         )
     return sorted(cells, key=lambda cell: (cell.row, cell.column_index))
@@ -645,6 +689,89 @@ def _normalize_prices(
     return price_values, consumed, raw_entries, warnings
 
 
+def _without_sequence_prefix(value: str) -> str:
+    return _SEQUENCE_PREFIX_PATTERN.sub("", value, count=1).strip()
+
+
+def _is_decoration_only(value: str) -> bool:
+    found_decoration_or_formatting = False
+    for character in value:
+        codepoint = ord(character)
+        if character.isspace():
+            continue
+        if character in _ZERO_WIDTH_FORMATTING_CHARACTERS:
+            found_decoration_or_formatting = True
+            continue
+        if 0xFE00 <= codepoint <= 0xFE0F or 0xE0100 <= codepoint <= 0xE01EF:
+            found_decoration_or_formatting = True
+            continue
+        if character not in _DECORATION_CHARACTERS:
+            return False
+        found_decoration_or_formatting = True
+    return found_decoration_or_formatting
+
+
+@dataclass(frozen=True, slots=True)
+class _CommercialSectionBand:
+    mode: str
+    start_column: int
+    end_column: int
+
+
+def _commercial_section_band(cell: _Cell, mode: str) -> _CommercialSectionBand:
+    start_column = cell.column_index
+    end_column = cell.column_index
+    if cell.merged_range is not None:
+        matched = _MERGED_RANGE_PATTERN.fullmatch(
+            cell.merged_range.upper().strip()
+        )
+        if matched is not None:
+            try:
+                start_column = column_label_to_index(matched.group(1))
+                end_column = column_label_to_index(matched.group(2))
+            except ValueError:
+                start_column = cell.column_index
+                end_column = cell.column_index
+    return _CommercialSectionBand(
+        mode=mode,
+        start_column=start_column,
+        end_column=end_column,
+    )
+
+
+def _commercial_column_split(
+    sections: Mapping[str, _CommercialSectionBand],
+) -> tuple[int, int] | None:
+    included = sections.get("included")
+    upgrade = sections.get("upgrade")
+    if included is None or upgrade is None:
+        return None
+    if included.start_column >= upgrade.start_column:
+        return None
+    if included.end_column >= upgrade.start_column:
+        return None
+    return included.start_column, upgrade.start_column
+
+
+def _preserve_sequence_source(
+    cell: _Cell,
+    *,
+    field_name: str,
+    raw_entries: list[RawCommercialEntry],
+) -> str:
+    normalized = _without_sequence_prefix(cell.value)
+    decoration_only = _is_decoration_only(normalized)
+    if normalized != cell.value.strip() or decoration_only:
+        raw_entries.append(
+            RawCommercialEntry(
+                field=field_name,
+                value=cell.value,
+                coordinate=cell.coordinate,
+            )
+        )
+    return "" if decoration_only else normalized
+
+
 def _upgrade_from_row(cells: list[_Cell]) -> tuple[UpgradeOption | None, set[str]]:
     if not cells:
         return None, set()
@@ -655,7 +782,9 @@ def _upgrade_from_row(cells: list[_Cell]) -> tuple[UpgradeOption | None, set[str
     if price_cell is not None:
         price = parse_price(price_cell.raw_value, context="upgrade_option")
         name_parts = [
-            _PRICE_PATTERN.sub("", cell.value).strip(" ()+-")
+            _without_sequence_prefix(
+                _PRICE_PATTERN.sub("", cell.value).strip(" ()+-")
+            )
             for cell in cells
             if cell is not price_cell or _PRICE_PATTERN.sub("", cell.value).strip(" ()+-")
         ]
@@ -665,7 +794,12 @@ def _upgrade_from_row(cells: list[_Cell]) -> tuple[UpgradeOption | None, set[str
         raw_value = " | ".join(cell.value for cell in cells)
         return UpgradeOption(name=name, raw_value=raw_value, price=price), consumed
     raw_value = " | ".join(cell.value for cell in cells)
-    return UpgradeOption(name=raw_value, raw_value=raw_value), consumed
+    name = " | ".join(
+        normalized
+        for cell in cells
+        if (normalized := _without_sequence_prefix(cell.value))
+    )
+    return UpgradeOption(name=name or raw_value, raw_value=raw_value), consumed
 
 
 def _parse_commercial(
@@ -697,6 +831,7 @@ def _parse_commercial(
         consumed_spec_coordinates=consumed_spec_coordinates,
     )
     mode: str | None = None
+    commercial_sections: dict[str, _CommercialSectionBand] = {}
     consumed = set(consumed_spec_coordinates) | consumed_price_coordinates
     for row_number in range(start_row, content_end_row + 1):
         unconsumed_row_cells = [
@@ -729,10 +864,16 @@ def _parse_commercial(
                 continue
             if _is_includes_header(cell.value):
                 mode = "included"
+                commercial_sections["included"] = _commercial_section_band(
+                    cell, "included"
+                )
                 consumed.add(cell.coordinate)
                 continue
             if _is_upgrade_header(cell.value):
                 mode = "upgrade"
+                commercial_sections["upgrade"] = _commercial_section_band(
+                    cell, "upgrade"
+                )
                 consumed.add(cell.coordinate)
                 continue
             if _is_photo_label(cell.value):
@@ -746,13 +887,81 @@ def _parse_commercial(
         remaining = [cell for cell in row_cells if cell.coordinate not in consumed]
         if not remaining:
             continue
+        column_split = _commercial_column_split(commercial_sections)
+        if column_split is not None:
+            included_start, upgrade_start = column_split
+            included_cells = [
+                cell
+                for cell in remaining
+                if included_start <= cell.column_index < upgrade_start
+            ]
+            upgrade_cells = [
+                cell for cell in remaining if cell.column_index >= upgrade_start
+            ]
+            outside_cells = [
+                cell for cell in remaining if cell.column_index < included_start
+            ]
+            for cell in included_cells:
+                normalized = _preserve_sequence_source(
+                    cell,
+                    field_name="included_feature",
+                    raw_entries=raw_entries,
+                )
+                if normalized:
+                    included_features.append(normalized)
+                consumed.add(cell.coordinate)
+            if upgrade_cells:
+                normalized_upgrade_cells: list[_Cell] = []
+                for cell in upgrade_cells:
+                    normalized = _preserve_sequence_source(
+                        cell,
+                        field_name="upgrade_option",
+                        raw_entries=raw_entries,
+                    )
+                    consumed.add(cell.coordinate)
+                    if normalized:
+                        normalized_upgrade_cells.append(cell)
+                option, option_consumed = _upgrade_from_row(
+                    normalized_upgrade_cells
+                )
+                if option is not None:
+                    upgrade_options.append(option)
+                    consumed.update(option_consumed)
+            for cell in outside_cells:
+                raw_entries.append(
+                    RawCommercialEntry(
+                        field=None,
+                        value=cell.value,
+                        coordinate=cell.coordinate,
+                    )
+                )
+                consumed.add(cell.coordinate)
+            continue
         if mode == "included":
             for cell in remaining:
-                included_features.append(cell.value)
+                normalized = _preserve_sequence_source(
+                    cell,
+                    field_name="included_feature",
+                    raw_entries=raw_entries,
+                )
+                if normalized:
+                    included_features.append(normalized)
                 consumed.add(cell.coordinate)
             continue
         if mode == "upgrade":
-            option, option_consumed = _upgrade_from_row(remaining)
+            normalized_upgrade_cells = []
+            for cell in remaining:
+                normalized = _preserve_sequence_source(
+                    cell,
+                    field_name="upgrade_option",
+                    raw_entries=raw_entries,
+                )
+                consumed.add(cell.coordinate)
+                if normalized:
+                    normalized_upgrade_cells.append(cell)
+            option, option_consumed = _upgrade_from_row(
+                normalized_upgrade_cells
+            )
             if option is not None:
                 upgrade_options.append(option)
                 consumed.update(option_consumed)

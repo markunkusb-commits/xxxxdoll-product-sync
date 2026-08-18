@@ -18,19 +18,26 @@ from sync_worker.clm_price_parser import (  # noqa: E402
     parse_price,
     recognize_series_title,
 )
+from sync_worker.product_model import from_clm_product  # noqa: E402
 from sync_worker.sheet_layout import column_index_to_label  # noqa: E402
 
 
-def cell(row: int, column_index: int, value: str) -> dict[str, object]:
+def cell(
+    row: int,
+    column_index: int,
+    value: str,
+    *,
+    merged_range: str | None = None,
+) -> dict[str, object]:
     return {
         "coordinate": f"{column_index_to_label(column_index)}{row}",
         "row": row,
         "column": column_index_to_label(column_index),
         "column_index": column_index,
         "formatted_value": value,
-        "is_merged": False,
-        "is_merge_anchor": False,
-        "merged_range": None,
+        "is_merged": merged_range is not None,
+        "is_merge_anchor": merged_range is not None,
+        "merged_range": merged_range,
     }
 
 
@@ -96,6 +103,29 @@ def block(
     else:
         end_row = row
     return result, end_row
+
+
+def parallel_commercial_layout() -> dict[str, object]:
+    return layout(
+        cell(2, 2, "CLM Ultra"),
+        cell(
+            3,
+            34,
+            "Price includes the following:",
+            merged_range="AH3:AR3",
+        ),
+        cell(3, 45, "Upgrade options", merged_range="AS3:AZ3"),
+        cell(4, 34, "1: articulated fingers"),
+        cell(4, 45, "1. Gel Butt"),
+        cell(5, 34, "2: real oral sex"),
+        cell(5, 45, "2.Hair Implant"),
+        cell(6, 34, "3: movable jaw"),
+        cell(6, 45, "3.Eyebrows/Eyelashes Implant"),
+        cell(7, 34, "4: realistic body makeup"),
+        cell(7, 45, "4. Hard Hands and Feet"),
+        cell(8, 34, "5: simulated scalp wig"),
+        cell(9, 2, "Photo download link"),
+    )
 
 
 class CLMPriceParserTests(unittest.TestCase):
@@ -344,6 +374,235 @@ class CLMPriceParserTests(unittest.TestCase):
 
         self.assertEqual(len(product.included_features), 5)
         self.assertIn("EVO skeleton", product.included_features)
+
+    def test_heart_only_commercial_feature_is_filtered(self) -> None:
+        cells, _ = block(2, "CLM Ultra", features=["❤", "EVO skeleton"])
+
+        product = self.parser.parse(layout(*cells))[0]
+
+        self.assertEqual(product.included_features, ["EVO skeleton"])
+
+    def test_star_only_commercial_feature_is_filtered(self) -> None:
+        cells, _ = block(2, "CLM Ultra", features=["⭐", "EVO skeleton"])
+
+        product = self.parser.parse(layout(*cells))[0]
+
+        self.assertEqual(product.included_features, ["EVO skeleton"])
+
+    def test_diamond_only_commercial_feature_is_filtered(self) -> None:
+        cells, _ = block(2, "CLM Ultra", features=["◆", "EVO skeleton"])
+
+        product = self.parser.parse(layout(*cells))[0]
+
+        self.assertEqual(product.included_features, ["EVO skeleton"])
+
+    def test_whitespace_wrapped_heart_is_filtered(self) -> None:
+        cells, _ = block(2, "CLM Ultra", features=[" \t❤️ \n", "EVO skeleton"])
+
+        product = self.parser.parse(layout(*cells))[0]
+
+        self.assertEqual(product.included_features, ["EVO skeleton"])
+
+    def test_variation_selector_heart_is_filtered(self) -> None:
+        cells, _ = block(2, "CLM Ultra", features=["\u2764\ufe0f", "EVO skeleton"])
+
+        product = self.parser.parse(layout(*cells))[0]
+
+        self.assertEqual(product.included_features, ["EVO skeleton"])
+
+    def test_gel_butt_text_is_not_filtered(self) -> None:
+        cells, _ = block(2, "CLM Ultra", features=["Gel Butt"])
+
+        product = self.parser.parse(layout(*cells))[0]
+
+        self.assertEqual(product.included_features, ["Gel Butt"])
+
+    def test_business_text_with_digit_is_not_filtered(self) -> None:
+        cells, _ = block(2, "CLM Ultra", features=["3D Soft vagina"])
+
+        product = self.parser.parse(layout(*cells))[0]
+
+        self.assertEqual(product.included_features, ["3D Soft vagina"])
+
+    def test_business_text_with_plus_is_not_filtered(self) -> None:
+        cells, _ = block(2, "CLM Ultra", features=["Plus+"])
+
+        product = self.parser.parse(layout(*cells))[0]
+
+        self.assertEqual(product.included_features, ["Plus+"])
+
+    def test_upgrade_text_with_symbol_and_price_is_not_filtered(self) -> None:
+        cells, _ = block(2, "CLM Ultra", upgrades=["Gel Butt +¥300"])
+
+        product = self.parser.parse(layout(*cells))[0]
+
+        self.assertEqual(product.upgrade_options[0].name, "Gel Butt")
+        self.assertEqual(product.upgrade_options[0].price.amount, 300)
+
+    def test_filtered_decoration_is_preserved_in_raw_commercial_source(
+        self,
+    ) -> None:
+        cells, _ = block(2, "CLM Ultra", features=["❤️", "EVO skeleton"])
+
+        product = self.parser.parse(layout(*cells))[0]
+
+        self.assertNotIn("❤️", product.included_features)
+        self.assertTrue(
+            any(
+                entry.field == "included_feature"
+                and entry.value == "❤️"
+                and entry.coordinate == "AH4"
+                for entry in product.raw_commercial_entries
+            )
+        )
+
+    def test_upgrade_name_and_raw_value_normalization_is_unchanged(self) -> None:
+        cells, _ = block(2, "CLM Ultra", upgrades=["1. Gel Butt"])
+
+        product = self.parser.parse(layout(*cells))[0]
+
+        self.assertEqual(product.upgrade_options[0].name, "Gel Butt")
+        self.assertEqual(product.upgrade_options[0].raw_value, "1. Gel Butt")
+
+    def test_parallel_commercial_columns_do_not_join_same_row_values(
+        self,
+    ) -> None:
+        product = self.parser.parse(parallel_commercial_layout())[0]
+
+        self.assertEqual(len(product.included_features), 5)
+        self.assertEqual(len(product.upgrade_options), 4)
+        self.assertTrue(
+            all("|" not in option.name for option in product.upgrade_options)
+        )
+
+    def test_real_oral_sex_and_gel_butt_are_separate_business_roles(
+        self,
+    ) -> None:
+        product = self.parser.parse(parallel_commercial_layout())[0]
+
+        self.assertIn("real oral sex", product.included_features)
+        self.assertEqual(product.upgrade_options[0].name, "Gel Butt")
+        self.assertNotIn("Gel Butt", product.included_features)
+
+    def test_movable_jaw_and_hair_implant_are_separate_business_roles(
+        self,
+    ) -> None:
+        product = self.parser.parse(parallel_commercial_layout())[0]
+
+        self.assertIn("movable jaw", product.included_features)
+        self.assertEqual(product.upgrade_options[1].name, "Hair Implant")
+        self.assertNotIn("movable jaw", [
+            option.name for option in product.upgrade_options
+        ])
+
+    def test_body_makeup_and_eyebrow_implant_are_separate_business_roles(
+        self,
+    ) -> None:
+        product = self.parser.parse(parallel_commercial_layout())[0]
+
+        self.assertIn("realistic body makeup", product.included_features)
+        self.assertEqual(
+            product.upgrade_options[2].name,
+            "Eyebrows/Eyelashes Implant",
+        )
+
+    def test_scalp_wig_and_hard_hands_are_separate_business_roles(self) -> None:
+        product = self.parser.parse(parallel_commercial_layout())[0]
+
+        self.assertIn("simulated scalp wig", product.included_features)
+        self.assertEqual(
+            product.upgrade_options[3].name,
+            "Hard Hands and Feet",
+        )
+
+    def test_left_commercial_band_can_contain_only_an_included_feature(
+        self,
+    ) -> None:
+        product = self.parser.parse(parallel_commercial_layout())[0]
+
+        self.assertEqual(product.included_features[-1], "simulated scalp wig")
+        self.assertEqual(len(product.upgrade_options), 4)
+
+    def test_right_commercial_band_can_contain_only_an_upgrade(self) -> None:
+        fixture = parallel_commercial_layout()
+        fixture["non_empty_cells"].insert(
+            -1,
+            cell(8, 45, "5. Extra Upgrade"),
+        )
+
+        product = self.parser.parse(fixture)[0]
+
+        self.assertEqual(product.upgrade_options[-1].name, "Extra Upgrade")
+        self.assertNotIn("Extra Upgrade", product.included_features)
+
+    def test_numeric_dot_and_colon_prefixes_are_safely_removed(self) -> None:
+        product = self.parser.parse(parallel_commercial_layout())[0]
+
+        self.assertEqual(
+            product.included_features[:2],
+            ["articulated fingers", "real oral sex"],
+        )
+        self.assertEqual(
+            [option.name for option in product.upgrade_options[:2]],
+            ["Gel Butt", "Hair Implant"],
+        )
+
+    def test_sequence_normalization_preserves_raw_commercial_sources(
+        self,
+    ) -> None:
+        product = self.parser.parse(parallel_commercial_layout())[0]
+        raw_by_coordinate = {
+            entry.coordinate: (entry.field, entry.value)
+            for entry in product.raw_commercial_entries
+        }
+
+        self.assertEqual(
+            raw_by_coordinate["AH5"],
+            ("included_feature", "2: real oral sex"),
+        )
+        self.assertEqual(
+            raw_by_coordinate["AS5"],
+            ("upgrade_option", "2.Hair Implant"),
+        )
+        self.assertEqual(
+            product.upgrade_options[1].raw_value,
+            "2.Hair Implant",
+        )
+
+    def test_included_features_never_enter_upgrade_options(self) -> None:
+        product = self.parser.parse(parallel_commercial_layout())[0]
+
+        upgrade_names = {option.name for option in product.upgrade_options}
+        self.assertTrue(set(product.included_features).isdisjoint(upgrade_names))
+        self.assertNotIn("articulated fingers", upgrade_names)
+
+    def test_upgrade_options_never_enter_included_features(self) -> None:
+        product = self.parser.parse(parallel_commercial_layout())[0]
+
+        self.assertNotIn("Gel Butt", product.included_features)
+        self.assertNotIn("Hair Implant", product.included_features)
+        self.assertNotIn("Hard Hands and Feet", product.included_features)
+
+    def test_product_model_conversion_keeps_commercial_roles_separate(
+        self,
+    ) -> None:
+        parsed = self.parser.parse(parallel_commercial_layout())[0]
+        record = from_clm_product(parsed)
+
+        self.assertEqual(record.included_features, tuple(parsed.included_features))
+        self.assertEqual(
+            [option.name for option in record.options.upgrade_options],
+            [
+                "Gel Butt",
+                "Hair Implant",
+                "Eyebrows/Eyelashes Implant",
+                "Hard Hands and Feet",
+            ],
+        )
+        self.assertEqual(
+            record.unknown_fields.raw_commercial_entries[0].coordinate,
+            "AH4",
+        )
 
     def test_upgrade_option_count_is_dynamic(self) -> None:
         cells, _ = block(
