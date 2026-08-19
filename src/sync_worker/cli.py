@@ -35,6 +35,9 @@ from .product_option_linking_dry_run import (
 from .product_option_pricing_dry_run import (
     run_product_option_pricing_dry_run,
 )
+from .product_option_presentation_dry_run import (
+    run_product_option_presentation_dry_run,
+)
 from .report import (
     DoctorReportWriter,
     ReferenceProductReportWriter,
@@ -567,6 +570,36 @@ def _run_price_linked_product_options(
     return 0 if report.get("status") == "ok" else 1
 
 
+def _run_present_product_option_prices(
+    logger: logging.Logger,
+    input_path: Path,
+) -> int:
+    try:
+        report, _ = run_product_option_presentation_dry_run(
+            input_path,
+            project_root=PROJECT_ROOT,
+        )
+    except Exception as error:
+        _log_failure(logger, error, event="present_product_option_prices_aborted")
+        return 2
+
+    logger.info(
+        json.dumps(
+            {
+                "event": "product_option_presentation_dry_run_report_written",
+                "path": "reports/product-option-presentation-dry-run.json",
+                "status": report.get("status"),
+                "summary": report.get("summary", {}),
+                "network_requests_performed": 0,
+                "write_requests_performed": 0,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+    )
+    return 0 if report.get("status") == "ok" else 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="python -m sync_worker")
     subcommands = parser.add_subparsers(dest="command", required=True)
@@ -719,6 +752,17 @@ def build_parser() -> argparse.ArgumentParser:
         dest="rmb_to_usd_rate",
         help="Explicit positive RMB-to-USD Decimal rate",
     )
+    present_product_option_prices = subcommands.add_parser(
+        "present-product-option-prices",
+        help="Present prices from a local Product Option Pricing report",
+    )
+    present_product_option_prices.add_argument(
+        "--input",
+        required=True,
+        type=Path,
+        dest="input_path",
+        help="Local Product Option Pricing dry-run JSON file",
+    )
     return parser
 
 
@@ -767,5 +811,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             logger,
             arguments.input_path,
             arguments.rmb_to_usd_rate,
+        )
+    if arguments.command == "present-product-option-prices":
+        return _run_present_product_option_prices(
+            logger,
+            arguments.input_path,
         )
     raise AssertionError("Unhandled command")
