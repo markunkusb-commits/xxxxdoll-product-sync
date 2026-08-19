@@ -38,6 +38,7 @@ from .product_option_pricing_dry_run import (
 from .product_option_presentation_dry_run import (
     run_product_option_presentation_dry_run,
 )
+from .woocommerce_payload_dry_run import run_woocommerce_payload_dry_run
 from .report import (
     DoctorReportWriter,
     ReferenceProductReportWriter,
@@ -600,6 +601,40 @@ def _run_present_product_option_prices(
     return 0 if report.get("status") == "ok" else 1
 
 
+def _run_build_woocommerce_payloads(
+    logger: logging.Logger,
+    product_input_path: Path,
+    size_input_path: Path,
+    presented_option_input_path: Path,
+) -> int:
+    try:
+        report, _ = run_woocommerce_payload_dry_run(
+            product_input_path,
+            size_input_path,
+            presented_option_input_path,
+            project_root=PROJECT_ROOT,
+        )
+    except Exception as error:
+        _log_failure(logger, error, event="woocommerce_payload_dry_run_aborted")
+        return 2
+
+    logger.info(
+        json.dumps(
+            {
+                "event": "woocommerce_payload_dry_run_report_written",
+                "path": "reports/woocommerce-payload-dry-run.json",
+                "status": report.get("status"),
+                "summary": report.get("summary", {}),
+                "network_requests_performed": 0,
+                "write_requests_performed": 0,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+    )
+    return 0 if report.get("status") == "ok" else 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="python -m sync_worker")
     subcommands = parser.add_subparsers(dest="command", required=True)
@@ -763,6 +798,31 @@ def build_parser() -> argparse.ArgumentParser:
         dest="input_path",
         help="Local Product Option Pricing dry-run JSON file",
     )
+    build_woocommerce_payloads = subcommands.add_parser(
+        "build-woocommerce-payloads",
+        help="Build write-disabled WooCommerce payloads from local reports",
+    )
+    build_woocommerce_payloads.add_argument(
+        "--products",
+        required=True,
+        type=Path,
+        dest="product_input_path",
+        help="Local CLM parser dry-run JSON file",
+    )
+    build_woocommerce_payloads.add_argument(
+        "--sizes",
+        required=True,
+        type=Path,
+        dest="size_input_path",
+        help="Local Size List dry-run JSON file",
+    )
+    build_woocommerce_payloads.add_argument(
+        "--presented-options",
+        required=True,
+        type=Path,
+        dest="presented_option_input_path",
+        help="Local Product Option Presentation dry-run JSON file",
+    )
     return parser
 
 
@@ -816,5 +876,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_present_product_option_prices(
             logger,
             arguments.input_path,
+        )
+    if arguments.command == "build-woocommerce-payloads":
+        return _run_build_woocommerce_payloads(
+            logger,
+            arguments.product_input_path,
+            arguments.size_input_path,
+            arguments.presented_option_input_path,
         )
     raise AssertionError("Unhandled command")
