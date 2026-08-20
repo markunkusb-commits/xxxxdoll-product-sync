@@ -47,6 +47,7 @@ from .report import (
 from .sanitization import Redactor
 from .security import redactor_for_settings
 from .size_list_dry_run import run_size_list_dry_run
+from .sku_dry_run import run_sku_dry_run
 from .sheet_layout import (
     SheetLayoutInspector,
     parse_a1_range,
@@ -635,6 +636,36 @@ def _run_build_woocommerce_payloads(
     return 0 if report.get("status") == "ok" else 1
 
 
+def _run_generate_sku_dry_run(
+    logger: logging.Logger,
+    product_input_path: Path,
+) -> int:
+    try:
+        report, _ = run_sku_dry_run(
+            product_input_path,
+            project_root=PROJECT_ROOT,
+        )
+    except Exception as error:
+        _log_failure(logger, error, event="sku_dry_run_aborted")
+        return 2
+
+    logger.info(
+        json.dumps(
+            {
+                "event": "sku_dry_run_report_written",
+                "path": "reports/sku-dry-run.json",
+                "status": report.get("status"),
+                "summary": report.get("summary", {}),
+                "network_requests_performed": 0,
+                "write_requests_performed": 0,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+    )
+    return 0 if report.get("status") == "ok" else 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="python -m sync_worker")
     subcommands = parser.add_subparsers(dest="command", required=True)
@@ -823,6 +854,17 @@ def build_parser() -> argparse.ArgumentParser:
         dest="presented_option_input_path",
         help="Local Product Option Presentation dry-run JSON file",
     )
+    generate_sku_dry_run = subcommands.add_parser(
+        "generate-sku-dry-run",
+        help="Generate stable SKU candidates from a local CLM parser report",
+    )
+    generate_sku_dry_run.add_argument(
+        "--products",
+        required=True,
+        type=Path,
+        dest="product_input_path",
+        help="Local CLM parser dry-run JSON file",
+    )
     return parser
 
 
@@ -883,5 +925,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             arguments.product_input_path,
             arguments.size_input_path,
             arguments.presented_option_input_path,
+        )
+    if arguments.command == "generate-sku-dry-run":
+        return _run_generate_sku_dry_run(
+            logger,
+            arguments.product_input_path,
         )
     raise AssertionError("Unhandled command")
