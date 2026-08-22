@@ -44,6 +44,7 @@ from .retail_price_presentation import (
     RetailPricePresentationResult,
 )
 from .sanitization import REPORT_SECRET_SCAN_PATTERN, Redactor
+from . import sku_policy
 from . import woocommerce_product_mapper
 from .woocommerce_product_mapper import (
     PresentedUpgradeOption,
@@ -569,12 +570,17 @@ def build_woocommerce_payload_report(
     """Delegate to the existing enricher and mapper, then validate the report."""
 
     size_results = product_size_enricher.enrich_products_with_sizes(products, sizes)
+    sku_batch = sku_policy.validate_sku_uniqueness(products)
+    if len(sku_batch.results) != len(products):
+        raise WooCommercePayloadDryRunInputError(
+            "SKU policy result count was inconsistent"
+        )
     size_by_source: dict[tuple[int, int], list[object]] = defaultdict(list)
     product_by_source: dict[tuple[int, int], list[ProductRecord]] = defaultdict(list)
     presentation_by_source: dict[
         tuple[int, int], list[PresentedProductOptions]
     ] = defaultdict(list)
-    for product in products:
+    for product, sku_result in zip(products, sku_batch.results, strict=True):
         product_by_source[_source_key(product)].append(product)
     for result in size_results:
         size_by_source[_source_key(result.product)].append(result)
@@ -604,6 +610,7 @@ def build_woocommerce_payload_report(
 
         mapped = woocommerce_product_mapper.build_woocommerce_product_payload(
             product,
+            sku_result=sku_result,
             size_enrichment=size_result,  # type: ignore[arg-type]
             presented_options=presented_options,
         )
@@ -635,6 +642,21 @@ def build_woocommerce_payload_report(
         "missing_product_name": sum("missing_product_name" in blockers(item) for item in candidates),
         "missing_base_retail_price": sum("missing_base_retail_price" in blockers(item) for item in candidates),
         "unsupported_base_price_currency": sum("unsupported_base_price_currency" in blockers(item) for item in candidates),
+        "products_with_sku": sum(
+            isinstance(item.get("payload"), Mapping)
+            and isinstance(item["payload"].get("sku"), str)  # type: ignore[union-attr]
+            for item in candidates
+        ),
+        "products_without_sku": sum(
+            not (
+                isinstance(item.get("payload"), Mapping)
+                and isinstance(item["payload"].get("sku"), str)  # type: ignore[union-attr]
+            )
+            for item in candidates
+        ),
+        "sku_missing_count": sum(
+            "missing_sku" in blockers(item) for item in candidates
+        ),
         "size_matched": sum(match_status(item) == "matched" for item in candidates),
         "size_unmatched": sum(match_status(item) == "unmatched" for item in candidates),
         "size_ambiguous": sum(match_status(item) == "ambiguous" for item in candidates),

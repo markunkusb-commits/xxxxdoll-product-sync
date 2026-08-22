@@ -19,6 +19,11 @@ from .product_size_enricher import ProductSizeMatchResult
 from .retail_price_presentation import RetailPricePresentationResult
 from .sanitization import REPORT_SECRET_SCAN_PATTERN, Redactor
 from .size_list_parser import NormalizedMeasurement
+from .sku_policy import (
+    MAX_SKU_LENGTH,
+    SKU_POLICY_VERSION,
+    SkuGenerationResult,
+)
 
 
 WOO_API_VERSION = "wc/v3"
@@ -27,6 +32,7 @@ WOO_METHOD = "POST"
 WOO_CORE_PAYLOAD_ALLOWLIST = frozenset(
     {
         "name",
+        "sku",
         "type",
         "status",
         "regular_price",
@@ -72,6 +78,23 @@ _PUBLIC_ATTRIBUTE_NAME_SET = frozenset(_PUBLIC_ATTRIBUTE_NAMES.values())
 _SHIPPING_CANDIDATE_FIELDS = ("carton_size", "gross_weight")
 _USD_CENT = Decimal("0.01")
 _USD_PRICE_PATTERN = re.compile(r"^(?:0|[1-9][0-9]*)\.[0-9]{2}$")
+_SKU_PATTERN = re.compile(
+    r"^CLM-(?:CLASSIC|PRO|ULW|ULTRA)-[A-Z0-9]+(?:-[A-Z0-9]+)*$"
+)
+_FORBIDDEN_SKU_TOKENS = frozenset(
+    {
+        "FOB",
+        "RMB",
+        "USD",
+        "SUPPLIER",
+        "COST",
+        "PRICE",
+        "SOURCE",
+        "ROW",
+        "TIMESTAMP",
+        "UUID",
+    }
+)
 _URL_PATTERN = re.compile(
     r"(?i)(?:https?://|www\.)[^\s\"'<>]+"
     r"|\b(?:drive|docs)\.google\.com(?:/[^\s\"'<>]*)?"
@@ -196,6 +219,67 @@ def _base_regular_price(
     if not amount.is_finite() or amount < 0:
         return None, "invalid_regular_price"
     return format(amount.quantize(_USD_CENT, rounding=ROUND_HALF_UP), "f"), None
+
+
+def _valid_sku(value: object) -> bool:
+    return bool(
+        isinstance(value, str)
+        and len(value) <= MAX_SKU_LENGTH
+        and _SKU_PATTERN.fullmatch(value) is not None
+        and not _FORBIDDEN_SKU_TOKENS.intersection(value.split("-"))
+    )
+
+
+def _sku_payload(
+    sku_result: SkuGenerationResult | None,
+) -> tuple[str | None, dict[str, object], tuple[str, ...]]:
+    if sku_result is None:
+        return (
+            None,
+            {
+                "value": None,
+                "policy_version": None,
+                "raw_identity": None,
+                "normalized_identity": None,
+                "status": "missing",
+            },
+            ("missing_sku",),
+        )
+    if not isinstance(sku_result, SkuGenerationResult):
+        raise TypeError("sku_result must be SkuGenerationResult or None")
+
+    issues = list(sku_result.blocking_issues)
+    value = sku_result.sku
+    if sku_result.policy_version != SKU_POLICY_VERSION:
+        issues.append("invalid_sku_policy_version")
+        value = None
+    elif value is None:
+        if sku_result.status == "missing_identity":
+            issues.append("missing_sku")
+        elif sku_result.status == "too_long":
+            issues.append("sku_too_long")
+        else:
+            issues.append("invalid_sku")
+    elif len(value) > MAX_SKU_LENGTH:
+        issues.append("sku_too_long")
+        value = None
+    elif not _valid_sku(value):
+        issues.append("invalid_sku")
+        value = None
+
+    return (
+        value,
+        {
+            "value": value,
+            "policy_version": sku_result.policy_version,
+            "raw_identity": _safe_text(sku_result.raw_identity or ""),
+            "normalized_identity": _safe_text(
+                sku_result.normalized_identity or ""
+            ),
+            "status": sku_result.status,
+        },
+        _unique(issues),
+    )
 
 
 def _measurement_text(value: NormalizedMeasurement | None) -> str | None:
@@ -427,6 +511,14 @@ def validate_woocommerce_product_payload(
     if _payload_has_internal_data(payload):
         issues.append("unsafe_field_detected_in_payload")
 
+    sku = payload.get("sku")
+    if sku is None:
+        issues.append("missing_sku")
+    elif isinstance(sku, str) and len(sku) > MAX_SKU_LENGTH:
+        issues.append("sku_too_long")
+    elif not _valid_sku(sku):
+        issues.append("invalid_sku")
+
     attributes = payload.get("attributes", [])
     if not isinstance(attributes, list):
         issues.append("unsafe_field_detected_in_payload")
@@ -510,6 +602,7 @@ def validate_woocommerce_product_payload(
 def build_woocommerce_product_payload_candidate(
     product: ProductRecord,
     *,
+    sku_result: SkuGenerationResult | None = None,
     size_enrichment: ProductSizeMatchResult | None = None,
     presented_options: Sequence[PresentedUpgradeOption] = (),
 ) -> WooCommerceProductPayloadCandidate:
@@ -527,7 +620,6 @@ def build_woocommerce_product_payload_candidate(
         raise TypeError("presented_options must be a sequence")
 
     warnings = [
-        "sku_not_assigned",
         "category_mapping_not_configured",
         "images_not_mapped",
         "customer_description_not_generated",
@@ -535,6 +627,10 @@ def build_woocommerce_product_payload_candidate(
     blockers: list[str] = []
     name = _product_name(product)
     payload: dict[str, object] = {"type": "simple", "status": "draft"}
+    sku, sku_audit, sku_issues = _sku_payload(sku_result)
+    blockers.extend(sku_issues)
+    if sku is not None:
+        payload["sku"] = sku
     if name is None:
         blockers.append("missing_product_name")
     else:
@@ -598,6 +694,7 @@ def build_woocommerce_product_payload_candidate(
     )
 
     audit = {
+        "sku": sku_audit,
         "series": product.identity.series,
         "raw_identity": {
             "model": _safe_text(product.identity.model or ""),
@@ -681,6 +778,7 @@ def build_woocommerce_product_payload_candidate(
 def build_woocommerce_product_payload(
     product: ProductRecord,
     *,
+    sku_result: SkuGenerationResult | None = None,
     size_enrichment: ProductSizeMatchResult | None = None,
     presented_options: Sequence[PresentedUpgradeOption] = (),
 ) -> WooCommerceProductPayloadCandidate:
@@ -688,6 +786,7 @@ def build_woocommerce_product_payload(
 
     return build_woocommerce_product_payload_candidate(
         product,
+        sku_result=sku_result,
         size_enrichment=size_enrichment,
         presented_options=presented_options,
     )

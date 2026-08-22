@@ -22,6 +22,10 @@ from sync_worker.product_size_enrichment_dry_run import (  # noqa: E402
     restore_product_records,
     restore_size_records,
 )
+from sync_worker.sku_policy import (  # noqa: E402
+    SkuGenerationResult,
+    validate_sku_uniqueness,
+)
 from sync_worker.woocommerce_payload_dry_run import (  # noqa: E402
     AMBIGUOUS_JOIN_ISSUE,
     UNSAFE_PUBLIC_ISSUE,
@@ -402,8 +406,11 @@ class WooCommercePayloadDryRunTests(unittest.TestCase):
     def test_32_type_is_simple(self) -> None:
         self.assertEqual(candidate(build())["payload"]["type"], "simple")
 
-    def test_33_sku_is_not_guessed(self) -> None:
-        self.assertNotIn("sku", candidate(build())["payload"])
+    def test_33_sku_is_supplied_by_existing_policy(self) -> None:
+        self.assertEqual(
+            candidate(build())["payload"]["sku"],
+            "CLM-ULTRA-SIQ157CM-MIKO",
+        )
 
     def test_34_category_is_not_guessed(self) -> None:
         self.assertNotIn("categories", candidate(build())["payload"])
@@ -514,6 +521,103 @@ class WooCommercePayloadDryRunTests(unittest.TestCase):
         before = deepcopy(fixtures)
         build(product_report=fixtures[0], size_report=fixtures[1], presentation_report=fixtures[2])
         self.assertEqual(fixtures, before)
+
+    def test_57_summary_counts_product_with_sku(self) -> None:
+        summary = build()["summary"]
+        self.assertEqual(summary["products_with_sku"], 1)
+        self.assertEqual(summary["products_without_sku"], 0)
+
+    def test_58_summary_counts_missing_sku(self) -> None:
+        product_report = reports(products=[product_item(None)])[0]
+        summary = build(product_report=product_report)["summary"]
+        self.assertEqual(summary["products_with_sku"], 0)
+        self.assertEqual(summary["products_without_sku"], 1)
+        self.assertEqual(summary["sku_missing_count"], 1)
+
+    def test_59_mapper_receives_sku_generation_result(self) -> None:
+        products = restore_product_records(reports()[0])
+        sizes = restore_size_records(reports()[1])
+        presented = restore_presented_product_options(reports()[2])
+        with patch(
+            "sync_worker.woocommerce_payload_dry_run.woocommerce_product_mapper.build_woocommerce_product_payload",
+            wraps=build_woocommerce_product_payload,
+        ) as mapper:
+            build_woocommerce_payload_report(
+                products,
+                sizes,
+                presented,
+                product_input_file="p",
+                size_input_file="s",
+                presented_option_input_file="o",
+            )
+        self.assertIsInstance(mapper.call_args.kwargs["sku_result"], SkuGenerationResult)
+
+    def test_60_dry_run_calls_batch_sku_uniqueness_policy(self) -> None:
+        products = restore_product_records(reports()[0])
+        sizes = restore_size_records(reports()[1])
+        presented = restore_presented_product_options(reports()[2])
+        with patch(
+            "sync_worker.woocommerce_payload_dry_run.sku_policy.validate_sku_uniqueness",
+            wraps=validate_sku_uniqueness,
+        ) as validator:
+            build_woocommerce_payload_report(
+                products,
+                sizes,
+                presented,
+                product_input_file="p",
+                size_input_file="s",
+                presented_option_input_file="o",
+            )
+        validator.assert_called_once_with(products)
+
+    def test_61_collision_blocker_reaches_payload_candidate(self) -> None:
+        product_report = reports(
+            products=[
+                product_item("A/B", start_row=10),
+                product_item("A_B", start_row=30),
+            ]
+        )[0]
+        report = build(
+            product_report=product_report,
+            size_report=reports(sizes=[])[1],
+            presentation_report=reports(presentations=[])[2],
+        )
+        self.assertTrue(
+            all("sku_collision" in item["blocking_issues"] for item in report["candidates"])
+        )
+
+    def test_62_collision_does_not_repair_sku(self) -> None:
+        product_report = reports(
+            products=[
+                product_item("A/B", start_row=10),
+                product_item("A_B", start_row=30),
+            ]
+        )[0]
+        report = build(
+            product_report=product_report,
+            size_report=reports(sizes=[])[1],
+            presentation_report=reports(presentations=[])[2],
+        )
+        self.assertEqual(
+            [item["payload"]["sku"] for item in report["candidates"]],
+            ["CLM-ULTRA-A-B", "CLM-ULTRA-A-B"],
+        )
+
+    def test_63_payload_allowlist_includes_sku(self) -> None:
+        payload = candidate(build())["payload"]
+        self.assertIn("sku", WOO_CORE_PAYLOAD_ALLOWLIST)
+        self.assertFalse(set(payload) - WOO_CORE_PAYLOAD_ALLOWLIST)
+
+    def test_64_safe_sku_does_not_trigger_public_leak_scan(self) -> None:
+        report = build()
+        self.assertEqual(report["summary"]["unsafe_payloads"], 0)
+        self.assertNotIn(UNSAFE_PUBLIC_ISSUE, candidate(report)["blocking_issues"])
+
+    def test_65_sku_integrated_report_is_deterministic(self) -> None:
+        self.assertEqual(build(), build())
+
+    def test_66_sku_not_assigned_warning_is_absent(self) -> None:
+        self.assertNotIn("sku_not_assigned", candidate(build())["warnings"])
 
 
 if __name__ == "__main__":

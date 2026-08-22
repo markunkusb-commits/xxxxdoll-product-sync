@@ -6,6 +6,7 @@ import json
 import socket
 import sys
 import unittest
+from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
 from unittest.mock import patch
@@ -57,6 +58,11 @@ from sync_worker.size_list_parser import (  # noqa: E402
     SupplierFOBCost,
     UnitValue,
 )
+from sync_worker.sku_policy import (  # noqa: E402
+    SKU_POLICY_VERSION,
+    SkuGenerationResult,
+    generate_sku,
+)
 from sync_worker.woocommerce_product_mapper import (  # noqa: E402
     PUBLIC_SPECIFICATION_ALLOWLIST,
     WOO_CORE_PAYLOAD_ALLOWLIST,
@@ -86,6 +92,7 @@ def money(
 
 def product_record(
     *,
+    series: str = "ultra",
     model: str | None = "PW-L31",
     raw_model: str | None = None,
     base_amount: int | float | Decimal | None = Decimal("2100"),
@@ -108,9 +115,9 @@ def product_record(
         normalized = dict(specifications)
     return ProductRecord(
         identity=ProductIdentity(
-            series="ultra",
+            series=series,
             model=model,
-            raw_series_title="Ultra Series",
+            raw_series_title=f"{series} Series",
             raw_model=model if raw_model is None else raw_model,
         ),
         specifications=ProductSpecifications(normalized=normalized, raw=()),
@@ -300,14 +307,25 @@ def presented_option(
     )
 
 
+_DEFAULT_SKU_RESULT = object()
+
+
 def candidate(
     product: ProductRecord | None = None,
     *,
     size: ProductSizeMatchResult | None = None,
     options: tuple[PresentedUpgradeOption, ...] = (),
+    sku_result: SkuGenerationResult | None | object = _DEFAULT_SKU_RESULT,
 ):
+    active_product = product or product_record()
+    active_sku_result = (
+        generate_sku(active_product)
+        if sku_result is _DEFAULT_SKU_RESULT
+        else sku_result
+    )
     return build_woocommerce_product_payload(
-        product or product_record(),
+        active_product,
+        sku_result=active_sku_result,  # type: ignore[arg-type]
         size_enrichment=size,
         presented_options=options,
     )
@@ -320,6 +338,7 @@ class WooCommerceProductMapperTests(unittest.TestCase):
             result.payload,
             {
                 "name": "PW-L31",
+                "sku": "CLM-ULTRA-PW-L31",
                 "type": "simple",
                 "status": "draft",
                 "regular_price": "2100.00",
@@ -455,7 +474,7 @@ class WooCommerceProductMapperTests(unittest.TestCase):
 
     def test_23_payload_keys_are_from_explicit_allowlist(self) -> None:
         self.assertTrue(set(candidate().payload).issubset(WOO_CORE_PAYLOAD_ALLOWLIST))
-        self.assertNotIn("sku", candidate().payload)
+        self.assertEqual(candidate().payload["sku"], "CLM-ULTRA-PW-L31")
 
     def test_24_upper_chest_is_public_attribute(self) -> None:
         attributes = candidate().payload["attributes"]
@@ -731,7 +750,6 @@ class WooCommerceProductMapperTests(unittest.TestCase):
         self.assertEqual(
             candidate().warnings,
             (
-                "sku_not_assigned",
                 "category_mapping_not_configured",
                 "images_not_mapped",
                 "customer_description_not_generated",
@@ -783,6 +801,144 @@ class WooCommerceProductMapperTests(unittest.TestCase):
             "composite_option_was_split",
             validate_woocommerce_product_payload(raw),
         )
+
+    def test_66_mapper_accepts_external_sku_result(self) -> None:
+        product = product_record()
+        sku_result = generate_sku(product)
+        result = build_woocommerce_product_payload(product, sku_result=sku_result)
+        self.assertEqual(result.payload["sku"], sku_result.sku)
+
+    def test_67_sku_is_written_only_to_payload_and_audit(self) -> None:
+        result = candidate()
+        self.assertEqual(result.payload["sku"], "CLM-ULTRA-PW-L31")
+        self.assertEqual(result.audit["sku"]["value"], "CLM-ULTRA-PW-L31")
+
+    def test_68_sku_is_not_written_to_description(self) -> None:
+        result = candidate()
+        self.assertNotIn("description", result.payload)
+        self.assertNotIn(
+            result.payload["sku"],
+            str(result.payload.get("description", "")),
+        )
+
+    def test_69_sku_is_not_written_to_public_content(self) -> None:
+        result = candidate()
+        self.assertNotIn(result.payload["sku"], json.dumps(result.public_content))
+
+    def test_70_sku_is_not_written_to_storefront_options(self) -> None:
+        result = candidate(options=(presented_option("Gel Butt", "500"),))
+        self.assertNotIn(
+            result.payload["sku"],
+            json.dumps(result.storefront_options),
+        )
+
+    def test_71_fd160_meru_sku_is_injected(self) -> None:
+        product = product_record(series="pro", model="FD160cm-Meru")
+        self.assertEqual(candidate(product).payload["sku"], "CLM-PRO-FD160CM-MERU")
+
+    def test_72_siq157_miko_sku_is_injected(self) -> None:
+        product = product_record(model="SiQ157cm-Miko")
+        self.assertEqual(candidate(product).payload["sku"], "CLM-ULTRA-SIQ157CM-MIKO")
+
+    def test_73_siw160_imani_sku_is_injected(self) -> None:
+        product = product_record(model="SiW160cm-Imani")
+        self.assertEqual(candidate(product).payload["sku"], "CLM-ULTRA-SIW160CM-IMANI")
+
+    def test_74_sir161_vica_sku_is_injected(self) -> None:
+        product = product_record(model="SiR161-Vica")
+        self.assertEqual(candidate(product).payload["sku"], "CLM-ULTRA-SIR161-VICA")
+
+    def test_75_sit163_harriet_sku_is_injected(self) -> None:
+        product = product_record(model="SiT163-Harriet")
+        self.assertEqual(candidate(product).payload["sku"], "CLM-ULTRA-SIT163-HARRIET")
+
+    def test_76_fd177_zara_sku_is_injected(self) -> None:
+        product = product_record(series="pro", model="FD177-Zara")
+        self.assertEqual(candidate(product).payload["sku"], "CLM-PRO-FD177-ZARA")
+
+    def test_77_missing_sku_is_blocking(self) -> None:
+        result = candidate(sku_result=None)
+        self.assertNotIn("sku", result.payload)
+        self.assertIn("missing_sku", result.blocking_issues)
+
+    def test_78_invalid_sku_is_blocking_and_not_exposed(self) -> None:
+        invalid = replace(generate_sku(product_record()), sku="BAD_SKU")
+        result = candidate(sku_result=invalid)
+        self.assertNotIn("sku", result.payload)
+        self.assertIn("invalid_sku", result.blocking_issues)
+
+    def test_79_too_long_sku_is_blocking_and_not_exposed(self) -> None:
+        too_long = replace(
+            generate_sku(product_record()),
+            status="too_long",
+            sku="CLM-ULTRA-" + "A" * 65,
+            blocking_issues=("sku_too_long",),
+        )
+        result = candidate(sku_result=too_long)
+        self.assertNotIn("sku", result.payload)
+        self.assertIn("sku_too_long", result.blocking_issues)
+
+    def test_80_sensitive_sku_tokens_are_rejected(self) -> None:
+        baseline = generate_sku(product_record())
+        for token in ("FOB", "RMB", "USD", "SUPPLIER", "COST", "PRICE", "SOURCE", "ROW", "TIMESTAMP", "UUID"):
+            with self.subTest(token=token):
+                invalid = replace(baseline, sku=f"CLM-ULTRA-{token}")
+                result = candidate(sku_result=invalid)
+                self.assertNotIn("sku", result.payload)
+                self.assertIn("invalid_sku", result.blocking_issues)
+
+    def test_81_fob_does_not_enter_payload_after_sku_integration(self) -> None:
+        serialized = json.dumps(candidate().payload)
+        self.assertNotIn("FOB", serialized.upper())
+        self.assertNotIn("1500", serialized)
+
+    def test_82_supplier_cost_does_not_enter_payload_after_sku_integration(self) -> None:
+        serialized = json.dumps(candidate().payload).casefold()
+        self.assertNotIn("supplier", serialized)
+        self.assertNotIn("cost", serialized)
+
+    def test_83_audit_retains_sku_policy_version(self) -> None:
+        self.assertEqual(candidate().audit["sku"]["policy_version"], SKU_POLICY_VERSION)
+
+    def test_84_audit_retains_raw_and_normalized_sku_identity(self) -> None:
+        audit = candidate().audit["sku"]
+        self.assertEqual(audit["raw_identity"], "PW-L31")
+        self.assertEqual(audit["normalized_identity"], "PW-L31")
+
+    def test_85_payload_does_not_contain_sku_audit_structure(self) -> None:
+        payload = candidate().payload
+        self.assertNotIn("policy_version", payload)
+        self.assertNotIn("raw_identity", payload)
+        self.assertNotIn("normalized_identity", payload)
+
+    def test_86_sku_not_assigned_warning_is_removed(self) -> None:
+        self.assertNotIn("sku_not_assigned", candidate().warnings)
+
+    def test_87_sku_does_not_change_ready_for_write(self) -> None:
+        self.assertIs(candidate().ready_for_write, False)
+
+    def test_88_sku_result_is_not_mutated(self) -> None:
+        product = product_record()
+        sku_result = generate_sku(product)
+        before = sku_result.to_dict()
+        candidate(product, sku_result=sku_result)
+        self.assertEqual(sku_result.to_dict(), before)
+
+    def test_89_invalid_policy_version_is_blocking(self) -> None:
+        invalid = replace(generate_sku(product_record()), policy_version="future")
+        result = candidate(sku_result=invalid)
+        self.assertNotIn("sku", result.payload)
+        self.assertIn("invalid_sku_policy_version", result.blocking_issues)
+
+    def test_90_collision_issue_is_preserved_without_repair(self) -> None:
+        collision = replace(
+            generate_sku(product_record()),
+            status="collision",
+            blocking_issues=("sku_collision",),
+        )
+        result = candidate(sku_result=collision)
+        self.assertEqual(result.payload["sku"], "CLM-ULTRA-PW-L31")
+        self.assertIn("sku_collision", result.blocking_issues)
 
 
 if __name__ == "__main__":
