@@ -40,6 +40,12 @@ from .product_option_presentation_dry_run import (
     run_product_option_presentation_dry_run,
 )
 from .woocommerce_payload_dry_run import run_woocommerce_payload_dry_run
+from .woocommerce_category_discovery import (
+    load_woo_category_credentials,
+    normalize_woo_base_url,
+    redactor_for_woo_category_credentials,
+    run_woo_category_discovery,
+)
 from .report import (
     DoctorReportWriter,
     ReferenceProductReportWriter,
@@ -297,6 +303,13 @@ def _rmb_to_usd_argument(value: str) -> Decimal:
     try:
         return parse_rmb_to_usd_rate(value)
     except OptionPricingDryRunInputError as error:
+        raise argparse.ArgumentTypeError(str(error)) from None
+
+
+def _woo_base_url_argument(value: str) -> str:
+    try:
+        return normalize_woo_base_url(value)
+    except Exception as error:
         raise argparse.ArgumentTypeError(str(error)) from None
 
 
@@ -697,6 +710,51 @@ def _run_category_mapping_dry_run(
     return 0 if report.get("status") == "ok" else 1
 
 
+def _run_discover_woo_categories(
+    logger: logging.Logger,
+    base_url: str,
+) -> int:
+    redactor = Redactor()
+    try:
+        credentials = load_woo_category_credentials()
+        redactor = redactor_for_woo_category_credentials(credentials)
+        report, _ = run_woo_category_discovery(
+            base_url,
+            credentials,
+            project_root=PROJECT_ROOT,
+        )
+    except Exception as error:
+        logger.error(
+            json.dumps(
+                {
+                    "event": "woo_category_discovery_aborted",
+                    "error": redactor.exception(error),
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        )
+        return 2
+
+    logger.info(
+        json.dumps(
+            {
+                "event": "woo_category_discovery_report_written",
+                "path": "reports/woo-category-discovery.json",
+                "status": report.get("status"),
+                "summary": report.get("summary", {}),
+                "network_requests_performed": report.get(
+                    "network_requests_performed", 0
+                ),
+                "write_requests_performed": 0,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+    )
+    return 0 if report.get("status") == "ok" else 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="python -m sync_worker")
     subcommands = parser.add_subparsers(dest="command", required=True)
@@ -907,6 +965,17 @@ def build_parser() -> argparse.ArgumentParser:
         dest="product_input_path",
         help="Local CLM parser dry-run JSON file",
     )
+    discover_woo_categories = subcommands.add_parser(
+        "discover-woo-categories",
+        help="Discover WooCommerce product categories using read-only GETs",
+    )
+    discover_woo_categories.add_argument(
+        "--base-url",
+        required=True,
+        type=_woo_base_url_argument,
+        dest="base_url",
+        help="HTTPS WooCommerce site base URL",
+    )
     return parser
 
 
@@ -978,4 +1047,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             logger,
             arguments.product_input_path,
         )
+    if arguments.command == "discover-woo-categories":
+        return _run_discover_woo_categories(logger, arguments.base_url)
     raise AssertionError("Unhandled command")
