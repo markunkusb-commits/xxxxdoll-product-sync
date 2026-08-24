@@ -13,6 +13,7 @@ from dataclasses import asdict, dataclass
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Literal
 
+from .category_mapping import CategoryMappingResult
 from .product_model import MonetaryValue, ProductRecord
 from .product_option_pricing import PricedLinkedOption
 from .product_size_enricher import ProductSizeMatchResult
@@ -23,6 +24,10 @@ from .sku_policy import (
     MAX_SKU_LENGTH,
     SKU_POLICY_VERSION,
     SkuGenerationResult,
+)
+from .woo_category_binding import (
+    WooCategoryBindingResult,
+    WooCategoryBindingVerification,
 )
 
 
@@ -39,6 +44,7 @@ WOO_CORE_PAYLOAD_ALLOWLIST = frozenset(
         "description",
         "short_description",
         "attributes",
+        "categories",
     }
 )
 PUBLIC_SPECIFICATION_ALLOWLIST = (
@@ -112,6 +118,7 @@ _ATTRIBUTE_KEYS = frozenset(
     {"name", "position", "visible", "variation", "options"}
 )
 _STOREFRONT_OPTION_KEYS = frozenset({"name", "price_usd", "option_type"})
+_CATEGORY_PAYLOAD_KEYS = frozenset({"id"})
 
 
 class WooCommerceProductMapperError(ValueError):
@@ -173,6 +180,164 @@ def _contains_unsafe_text(value: object) -> bool:
 
 def _unique(values: Sequence[str]) -> tuple[str, ...]:
     return tuple(dict.fromkeys(values))
+
+
+def _category_projection(
+    product: ProductRecord,
+    category_mapping_result: CategoryMappingResult | None,
+    woo_category_binding_result: WooCategoryBindingResult | None,
+    category_binding_verification: WooCategoryBindingVerification | None,
+) -> tuple[
+    list[dict[str, int]] | None,
+    dict[str, object],
+    tuple[str, ...],
+    tuple[str, ...],
+]:
+    """Project one pre-verified binding without selecting profiles or IDs."""
+
+    if category_mapping_result is None and woo_category_binding_result is None and category_binding_verification is None:
+        return (
+            None,
+            {
+                "internal_registry_version": None,
+                "internal_category_key": None,
+                "binding_profile_version": None,
+                "environment": None,
+                "target_host": None,
+                "woo_category_id": None,
+                "verified_name": None,
+                "binding_status": "not_selected",
+                "host_verified": False,
+                "discovery_verified": False,
+            },
+            ("category_binding_not_selected",),
+            (),
+        )
+
+    if category_mapping_result is not None and not isinstance(
+        category_mapping_result, CategoryMappingResult
+    ):
+        raise TypeError("category_mapping_result must be CategoryMappingResult or None")
+    if woo_category_binding_result is not None and not isinstance(
+        woo_category_binding_result, WooCategoryBindingResult
+    ):
+        raise TypeError(
+            "woo_category_binding_result must be WooCategoryBindingResult or None"
+        )
+    if category_binding_verification is not None and not isinstance(
+        category_binding_verification, WooCategoryBindingVerification
+    ):
+        raise TypeError(
+            "category_binding_verification must be WooCategoryBindingVerification or None"
+        )
+
+    warnings: list[str] = []
+    blockers: list[str] = []
+    mapping = category_mapping_result
+    binding = woo_category_binding_result
+    verification = category_binding_verification
+
+    if mapping is None:
+        blockers.append("category_mapping_result_missing")
+    else:
+        blockers.extend(mapping.blocking_issues)
+    if verification is None:
+        blockers.append("category_binding_verification_missing")
+    else:
+        blockers.extend(verification.blocking_issues)
+
+    mapping_key = mapping.category_key if mapping is not None else None
+    product_series = (
+        product.identity.series.strip().casefold()
+        if isinstance(product.identity.series, str)
+        else ""
+    )
+    binding_status = (
+        binding.status
+        if binding is not None
+        else (
+            verification.blocking_issues[0]
+            if verification is not None and verification.blocking_issues
+            else "verification_missing"
+        )
+    )
+    host_verified = bool(
+        verification is not None
+        and verification.status == "verified"
+        and verification.hostname == verification.expected_host
+        and not verification.blocking_issues
+    )
+    discovery_verified = bool(
+        host_verified
+        and binding is not None
+        and binding.status == "bound_verified"
+        and binding.expected_name
+        and binding.expected_name == binding.discovered_name
+    )
+
+    if mapping is not None and verification is not None:
+        if mapping.registry_version != verification.registry_version:
+            blockers.append("category_binding_verification_mismatch")
+    if mapping is not None and (
+        mapping.series != product_series
+        or mapping.status == "mapped_woo"
+        or mapping.woo_category_id is not None
+    ):
+        blockers.append("category_binding_verification_mismatch")
+    if binding is not None and binding.internal_category_key != mapping_key:
+        blockers.append("category_binding_verification_mismatch")
+    if (
+        binding is not None
+        and verification is not None
+        and binding not in verification.results
+    ):
+        blockers.append("category_binding_verification_mismatch")
+
+    categories: list[dict[str, int]] | None = None
+    if binding is None:
+        if verification is not None and not verification.blocking_issues and mapping_key:
+            blockers.append("category_binding_verification_missing")
+    elif binding.status == "unbound_category":
+        warnings.append("category_unbound")
+    elif binding.status in {"binding_target_missing", "binding_target_changed"}:
+        blockers.extend(binding.blocking_issues or (binding.status,))
+    elif binding.status == "bound_verified":
+        category_id = binding.woo_category_id
+        if (
+            type(category_id) is int
+            and category_id > 0
+            and discovery_verified
+            and not blockers
+        ):
+            categories = [{"id": category_id}]
+        else:
+            blockers.append("category_binding_verification_mismatch")
+
+    audit = {
+        "internal_registry_version": (
+            mapping.registry_version if mapping is not None else None
+        ),
+        "internal_category_key": mapping_key,
+        "binding_profile_version": (
+            verification.profile_version if verification is not None else None
+        ),
+        "environment": (
+            verification.environment if verification is not None else None
+        ),
+        "target_host": (
+            verification.hostname if verification is not None else None
+        ),
+        "woo_category_id": (
+            binding.woo_category_id if binding is not None else None
+        ),
+        "verified_name": (
+            binding.discovered_name if discovery_verified and binding is not None else None
+        ),
+        "binding_status": binding_status,
+        "host_verified": host_verified,
+        "discovery_verified": discovery_verified,
+    }
+    return categories, audit, _unique(warnings), _unique(blockers)
 
 
 def _money_audit(value: MonetaryValue | None) -> dict[str, object] | None:
@@ -544,6 +709,36 @@ def validate_woocommerce_product_payload(
             ):
                 issues.append("unsafe_field_detected_in_payload")
 
+    categories = payload.get("categories")
+    if categories is not None:
+        category_audit = audit_category = None
+        root_audit = root.get("audit")
+        if isinstance(root_audit, Mapping):
+            audit_category = root_audit.get("category")
+        if isinstance(audit_category, Mapping):
+            category_audit = audit_category
+        if not isinstance(categories, list) or len(categories) != 1:
+            issues.append("invalid_category_binding_payload")
+        else:
+            category = categories[0]
+            if (
+                not isinstance(category, Mapping)
+                or set(category) != _CATEGORY_PAYLOAD_KEYS
+                or type(category.get("id")) is not int
+                or category.get("id", 0) <= 0
+            ):
+                issues.append("invalid_category_binding_payload")
+            elif (
+                category_audit is None
+                or category_audit.get("binding_status") != "bound_verified"
+                or category_audit.get("host_verified") is not True
+                or category_audit.get("discovery_verified") is not True
+                or category_audit.get("woo_category_id") != category.get("id")
+                or not isinstance(category_audit.get("verified_name"), str)
+                or not category_audit.get("verified_name")
+            ):
+                issues.append("invalid_category_binding_payload")
+
     storefront_value = root.get("storefront_options", [])
     storefront = storefront_value if isinstance(storefront_value, list) else []
     if not isinstance(storefront_value, list):
@@ -605,6 +800,9 @@ def build_woocommerce_product_payload_candidate(
     sku_result: SkuGenerationResult | None = None,
     size_enrichment: ProductSizeMatchResult | None = None,
     presented_options: Sequence[PresentedUpgradeOption] = (),
+    category_mapping_result: CategoryMappingResult | None = None,
+    woo_category_binding_result: WooCategoryBindingResult | None = None,
+    category_binding_verification: WooCategoryBindingVerification | None = None,
 ) -> WooCommerceProductPayloadCandidate:
     """Build one deterministic candidate without external access or writes."""
 
@@ -619,11 +817,7 @@ def build_woocommerce_product_payload_candidate(
     ):
         raise TypeError("presented_options must be a sequence")
 
-    warnings = [
-        "category_mapping_not_configured",
-        "images_not_mapped",
-        "customer_description_not_generated",
-    ]
+    warnings = ["images_not_mapped", "customer_description_not_generated"]
     blockers: list[str] = []
     name = _product_name(product)
     payload: dict[str, object] = {"type": "simple", "status": "draft"}
@@ -648,6 +842,19 @@ def build_woocommerce_product_payload_candidate(
     )
     if attributes:
         payload["attributes"] = attributes
+
+    categories, category_audit, category_warnings, category_blockers = (
+        _category_projection(
+            product,
+            category_mapping_result,
+            woo_category_binding_result,
+            category_binding_verification,
+        )
+    )
+    warnings = [*category_warnings, *warnings]
+    blockers.extend(category_blockers)
+    if categories is not None:
+        payload["categories"] = categories
 
     if size_enrichment is not None and size_enrichment.match.status != "matched":
         warnings.append("size_enrichment_unmatched")
@@ -740,6 +947,7 @@ def build_woocommerce_product_payload_candidate(
             ],
         },
         "pricing": option_audit,
+        "category": category_audit,
     }
     public_content = {
         "included_features": [
@@ -781,6 +989,9 @@ def build_woocommerce_product_payload(
     sku_result: SkuGenerationResult | None = None,
     size_enrichment: ProductSizeMatchResult | None = None,
     presented_options: Sequence[PresentedUpgradeOption] = (),
+    category_mapping_result: CategoryMappingResult | None = None,
+    woo_category_binding_result: WooCategoryBindingResult | None = None,
+    category_binding_verification: WooCategoryBindingVerification | None = None,
 ) -> WooCommerceProductPayloadCandidate:
     """Backward-friendly public name for the V1 candidate builder."""
 
@@ -789,4 +1000,7 @@ def build_woocommerce_product_payload(
         sku_result=sku_result,
         size_enrichment=size_enrichment,
         presented_options=presented_options,
+        category_mapping_result=category_mapping_result,
+        woo_category_binding_result=woo_category_binding_result,
+        category_binding_verification=category_binding_verification,
     )

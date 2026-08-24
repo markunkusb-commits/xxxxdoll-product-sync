@@ -14,8 +14,11 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from .additional_option_parser import AdditionalOptionPricing
+from . import category_mapping
+from .category_mapping import CategoryMappingResult
 from .option_pricing_policy import (
     OptionPricingMetadata,
     OptionRetailCandidate,
@@ -46,6 +49,19 @@ from .retail_price_presentation import (
 from .sanitization import REPORT_SECRET_SCAN_PATTERN, Redactor
 from . import sku_policy
 from . import woocommerce_product_mapper
+from .woo_category_binding import (
+    STAGING_BINDING_PROFILE_VERSION,
+    WooCategoryBindingResult,
+    WooCategoryBindingProfile,
+    WooCategoryBindingVerification,
+    staging_category_binding_profile,
+    verify_woo_category_bindings,
+)
+from .woocommerce_category_discovery import (
+    WooCategoryRecord,
+    WooCategorySource,
+    normalize_woo_base_url,
+)
 from .woocommerce_product_mapper import (
     PresentedUpgradeOption,
     WOO_CORE_PAYLOAD_ALLOWLIST,
@@ -92,6 +108,82 @@ class PresentedProductOptions:
     end_row: int
     options: tuple[PresentedUpgradeOption, ...]
     warnings: tuple[str, ...]
+
+
+def _optional_nonnegative_integer(value: object, *, label: str) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise WooCommercePayloadDryRunInputError(
+            f"{label} must be a non-negative integer or null"
+        )
+    return value
+
+
+def _optional_text(value: object, *, label: str) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise WooCommercePayloadDryRunInputError(f"{label} must be text or null")
+    return value
+
+
+def restore_woo_category_records(
+    report: Mapping[str, object],
+) -> list[WooCategoryRecord]:
+    """Restore only the fields required for local binding verification."""
+
+    values = _items(report.get("categories"), label="discovery categories")
+    records: list[WooCategoryRecord] = []
+    for index, value in enumerate(values):
+        label = f"discovery categories[{index}]"
+        payload = _mapping(value, label=label)
+        name = _text(payload.get("name"), label=f"{label} name")
+        slug = _text(payload.get("slug"), label=f"{label} slug")
+        category_path = _text(
+            payload.get("category_path", name),
+            label=f"{label} category path",
+        )
+        if name is None or slug is None or category_path is None:
+            raise AssertionError("Discovery category unexpectedly incomplete")
+        records.append(
+            WooCategoryRecord(
+                id=_integer(payload.get("id"), label=f"{label} id"),
+                name=name,
+                slug=slug,
+                parent=_optional_nonnegative_integer(
+                    payload.get("parent"), label=f"{label} parent"
+                ),
+                count=_optional_nonnegative_integer(
+                    payload.get("count"), label=f"{label} count"
+                ),
+                description=_optional_text(
+                    payload.get("description"), label=f"{label} description"
+                ),
+                display=_optional_text(
+                    payload.get("display"), label=f"{label} display"
+                ),
+                parent_name=_optional_text(
+                    payload.get("parent_name"), label=f"{label} parent name"
+                ),
+                category_path=category_path,
+                source=WooCategorySource(),
+                warnings=_text_tuple(
+                    payload.get("warnings", []), label=f"{label} warnings"
+                ),
+            )
+        )
+    return records
+
+
+def _binding_profile(version: str | None) -> WooCategoryBindingProfile | None:
+    if version is None:
+        return None
+    if version != STAGING_BINDING_PROFILE_VERSION:
+        raise WooCommercePayloadDryRunInputError(
+            "unknown_category_binding_profile"
+        )
+    return staging_category_binding_profile()
 
 
 def _mapping(value: object, *, label: str) -> Mapping[str, object]:
@@ -565,9 +657,48 @@ def build_woocommerce_payload_report(
     product_input_file: str,
     size_input_file: str,
     presented_option_input_file: str,
+    category_binding_profile_version: str | None = None,
+    woo_category_discovery_records: Sequence[WooCategoryRecord] | None = None,
+    woo_category_discovery_input_file: str | None = None,
+    target_base_url: str | None = None,
     redactor: Redactor | None = None,
 ) -> dict[str, object]:
     """Delegate to the existing enricher and mapper, then validate the report."""
+
+    profile = _binding_profile(category_binding_profile_version)
+    category_results: tuple[CategoryMappingResult, ...] = ()
+    binding_verification: WooCategoryBindingVerification | None = None
+    binding_by_key: dict[str, WooCategoryBindingResult] = {}
+    target_host: str | None = None
+    if profile is not None:
+        if woo_category_discovery_records is None:
+            raise WooCommercePayloadDryRunInputError(
+                "woo_category_discovery_required"
+            )
+        if target_base_url is None:
+            raise WooCommercePayloadDryRunInputError("target_base_url_required")
+        normalized_target = normalize_woo_base_url(target_base_url)
+        target_host = urlsplit(normalized_target).hostname
+        binding_verification = verify_woo_category_bindings(
+            profile,
+            environment=profile.environment,
+            host=normalized_target,
+            discovery_records=woo_category_discovery_records,
+        )
+        category_batch = category_mapping.map_categories(products)
+        category_results = category_batch.results
+        binding_by_key = {
+            result.internal_category_key: result
+            for result in binding_verification.results
+        }
+    elif (
+        woo_category_discovery_records is not None
+        or woo_category_discovery_input_file is not None
+        or target_base_url is not None
+    ):
+        raise WooCommercePayloadDryRunInputError(
+            "category_binding_profile_required"
+        )
 
     size_results = product_size_enricher.enrich_products_with_sizes(products, sizes)
     sku_batch = sku_policy.validate_sku_uniqueness(products)
@@ -591,7 +722,8 @@ def build_woocommerce_payload_report(
 
     candidates: list[dict[str, object]] = []
     unsafe_payloads = 0
-    for product in products:
+    for product_index, product in enumerate(products):
+        sku_result = sku_batch.results[product_index]
         key = _source_key(product)
         join_blockers: list[str] = []
         size_candidates = size_by_source.get(key, [])
@@ -613,6 +745,16 @@ def build_woocommerce_payload_report(
             sku_result=sku_result,
             size_enrichment=size_result,  # type: ignore[arg-type]
             presented_options=presented_options,
+            category_mapping_result=(
+                category_results[product_index] if category_results else None
+            ),
+            woo_category_binding_result=(
+                binding_by_key.get(category_results[product_index].category_key)
+                if category_results
+                and category_results[product_index].category_key is not None
+                else None
+            ),
+            category_binding_verification=binding_verification,
         )
         if join_blockers:
             mapped = replace(
@@ -631,6 +773,27 @@ def build_woocommerce_payload_report(
     def match_status(candidate: Mapping[str, object]) -> str:
         audit = candidate.get("audit")
         return str(audit.get("size_match_status")) if isinstance(audit, Mapping) else "not_provided"
+
+    def warnings(candidate: Mapping[str, object]) -> tuple[str, ...]:
+        raw = candidate.get("warnings", [])
+        return tuple(item for item in raw if isinstance(item, str)) if isinstance(raw, list) else ()
+
+    def has_bound_category(candidate: Mapping[str, object]) -> bool:
+        payload = candidate.get("payload")
+        return bool(
+            isinstance(payload, Mapping)
+            and isinstance(payload.get("categories"), list)
+            and payload.get("categories")
+        )
+
+    def category_status(candidate: Mapping[str, object]) -> str | None:
+        audit = candidate.get("audit")
+        category = audit.get("category") if isinstance(audit, Mapping) else None
+        return (
+            str(category.get("binding_status"))
+            if isinstance(category, Mapping)
+            else None
+        )
 
     summary = {
         "total_products": len(products),
@@ -672,6 +835,30 @@ def build_woocommerce_payload_report(
             for item in candidates
         ),
         "ready_for_write_count": 0,
+        "products_with_bound_category": sum(
+            has_bound_category(item) for item in candidates
+        ),
+        "products_without_bound_category": sum(
+            not has_bound_category(item) for item in candidates
+        ),
+        "category_binding_verified": sum(
+            category_status(item) == "bound_verified"
+            and has_bound_category(item)
+            for item in candidates
+        ),
+        "category_unbound": sum(
+            "category_unbound" in warnings(item) for item in candidates
+        ),
+        "category_binding_environment_mismatch": sum(
+            "category_binding_environment_mismatch" in blockers(item)
+            for item in candidates
+        ),
+        "category_binding_target_missing": sum(
+            "binding_target_missing" in blockers(item) for item in candidates
+        ),
+        "category_binding_target_changed": sum(
+            "binding_target_changed" in blockers(item) for item in candidates
+        ),
     }
     report: dict[str, object] = {
         "status": "ok",
@@ -679,6 +866,9 @@ def build_woocommerce_payload_report(
             "products": product_input_file,
             "sizes": size_input_file,
             "presented_options": presented_option_input_file,
+            "category_binding_profile": category_binding_profile_version,
+            "woo_category_discovery": woo_category_discovery_input_file,
+            "target_host": target_host,
         },
         "summary": summary,
         "network_requests_performed": 0,
@@ -697,9 +887,26 @@ def run_woocommerce_payload_dry_run(
     presented_option_input_path: Path,
     *,
     project_root: Path,
+    category_binding_profile_version: str | None = None,
+    woo_category_discovery_path: Path | None = None,
+    target_base_url: str | None = None,
     redactor: Redactor | None = None,
 ) -> tuple[dict[str, object], Path]:
     """Read three local reports and write one local candidate report."""
+
+    profile = _binding_profile(category_binding_profile_version)
+    if profile is not None and woo_category_discovery_path is None:
+        raise WooCommercePayloadDryRunInputError(
+            "woo_category_discovery_required"
+        )
+    if profile is not None and target_base_url is None:
+        raise WooCommercePayloadDryRunInputError("target_base_url_required")
+    if profile is None and (
+        woo_category_discovery_path is not None or target_base_url is not None
+    ):
+        raise WooCommercePayloadDryRunInputError(
+            "category_binding_profile_required"
+        )
 
     product_path = Path(product_input_path)
     size_path = Path(size_input_path)
@@ -708,6 +915,16 @@ def run_woocommerce_payload_dry_run(
     sizes = restore_size_records(load_local_json_report(size_path))
     presented = restore_presented_product_options(
         load_local_json_report(presented_path)
+    )
+    discovery_path = (
+        Path(woo_category_discovery_path)
+        if woo_category_discovery_path is not None
+        else None
+    )
+    discovery_records = (
+        restore_woo_category_records(load_local_json_report(discovery_path))
+        if discovery_path is not None
+        else None
     )
     active_redactor = redactor or Redactor()
     report = build_woocommerce_payload_report(
@@ -719,6 +936,14 @@ def run_woocommerce_payload_dry_run(
         presented_option_input_file=_safe_input_reference(
             presented_path, project_root
         ),
+        category_binding_profile_version=category_binding_profile_version,
+        woo_category_discovery_records=discovery_records,
+        woo_category_discovery_input_file=(
+            _safe_input_reference(discovery_path, project_root)
+            if discovery_path is not None
+            else None
+        ),
+        target_base_url=target_base_url,
         redactor=active_redactor,
     )
     output_path = project_root / "reports" / REPORT_FILENAME

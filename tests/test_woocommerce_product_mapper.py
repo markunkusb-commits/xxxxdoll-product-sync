@@ -536,7 +536,7 @@ class WooCommerceProductMapperTests(unittest.TestCase):
     def test_34_no_category_ids_are_guessed(self) -> None:
         result = candidate()
         self.assertNotIn("categories", result.payload)
-        self.assertIn("category_mapping_not_configured", result.warnings)
+        self.assertIn("category_binding_not_selected", result.warnings)
 
     def test_35_no_images_are_guessed(self) -> None:
         result = candidate()
@@ -750,7 +750,7 @@ class WooCommerceProductMapperTests(unittest.TestCase):
         self.assertEqual(
             candidate().warnings,
             (
-                "category_mapping_not_configured",
+                "category_binding_not_selected",
                 "images_not_mapped",
                 "customer_description_not_generated",
             ),

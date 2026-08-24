@@ -40,6 +40,7 @@ from .product_option_presentation_dry_run import (
     run_product_option_presentation_dry_run,
 )
 from .woocommerce_payload_dry_run import run_woocommerce_payload_dry_run
+from .woo_category_binding import STAGING_BINDING_PROFILE_VERSION
 from .woocommerce_category_discovery import (
     load_woo_category_credentials,
     normalize_woo_base_url,
@@ -311,6 +312,12 @@ def _woo_base_url_argument(value: str) -> str:
         return normalize_woo_base_url(value)
     except Exception as error:
         raise argparse.ArgumentTypeError(str(error)) from None
+
+
+def _category_binding_profile_argument(value: str) -> str:
+    if value != STAGING_BINDING_PROFILE_VERSION:
+        raise argparse.ArgumentTypeError("unknown_category_binding_profile")
+    return value
 
 
 def _run_inspect_sheet_layout(
@@ -621,6 +628,9 @@ def _run_build_woocommerce_payloads(
     product_input_path: Path,
     size_input_path: Path,
     presented_option_input_path: Path,
+    category_binding_profile_version: str | None = None,
+    woo_category_discovery_path: Path | None = None,
+    target_base_url: str | None = None,
 ) -> int:
     try:
         report, _ = run_woocommerce_payload_dry_run(
@@ -628,6 +638,9 @@ def _run_build_woocommerce_payloads(
             size_input_path,
             presented_option_input_path,
             project_root=PROJECT_ROOT,
+            category_binding_profile_version=category_binding_profile_version,
+            woo_category_discovery_path=woo_category_discovery_path,
+            target_base_url=target_base_url,
         )
     except Exception as error:
         _log_failure(logger, error, event="woocommerce_payload_dry_run_aborted")
@@ -943,6 +956,24 @@ def build_parser() -> argparse.ArgumentParser:
         dest="presented_option_input_path",
         help="Local Product Option Presentation dry-run JSON file",
     )
+    build_woocommerce_payloads.add_argument(
+        "--category-binding-profile",
+        type=_category_binding_profile_argument,
+        dest="category_binding_profile_version",
+        help="Explicit approved Woo category binding profile version",
+    )
+    build_woocommerce_payloads.add_argument(
+        "--woo-category-discovery",
+        type=Path,
+        dest="woo_category_discovery_path",
+        help="Local Woo Category Discovery JSON report",
+    )
+    build_woocommerce_payloads.add_argument(
+        "--target-base-url",
+        type=_woo_base_url_argument,
+        dest="target_base_url",
+        help="Explicit target WooCommerce base URL used for host validation",
+    )
     generate_sku_dry_run = subcommands.add_parser(
         "generate-sku-dry-run",
         help="Generate stable SKU candidates from a local CLM parser report",
@@ -1036,6 +1067,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             arguments.product_input_path,
             arguments.size_input_path,
             arguments.presented_option_input_path,
+            arguments.category_binding_profile_version,
+            arguments.woo_category_discovery_path,
+            arguments.target_base_url,
         )
     if arguments.command == "generate-sku-dry-run":
         return _run_generate_sku_dry_run(

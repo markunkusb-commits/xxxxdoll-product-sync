@@ -110,3 +110,19 @@ python -m sync_worker parse-clm-price-list `
 ```
 
 该命令不会加载 `.env`、服务账号或 Google API 客户端，也不会发起网络或外部写请求。输出固定写入 `reports/clm-parser-dry-run.json`；报告只保留允许的产品结构，供应商 URL 会在写入前脱敏。
+
+## WooCommerce Payload + Staging Category Binding Dry Run
+
+默认不选择任何 Woo category binding profile，因此不会向 payload 添加分类，并输出 `category_binding_not_selected`。如需使用已人工批准的测试站 Binding，必须同时显式提供 profile、本地 discovery 报告和目标站 URL：
+
+```powershell
+python -m sync_worker build-woocommerce-payloads `
+  --products reports/clm-parser-dry-run.json `
+  --sizes reports/size-list-dry-run.json `
+  --presented-options reports/product-option-presentation-dry-run.json `
+  --category-binding-profile xxxxdoll-staging-category-bind-v1 `
+  --woo-category-discovery reports/woo-category-discovery.json `
+  --target-base-url https://staging-1d07-owenau512-iqjhz.wpcomstaging.com
+```
+
+命令只读取本地 JSON。只有 internal category mapping、binding target 名称验证和 staging host 验证全部成功时，payload 才会包含 `categories: [{"id": ...}]`；Classic/ULW、正式站 host、缺失或改名的 discovery target 均不会 fallback。输出仍固定为 draft/simple、`ready_for_write=false`、网络请求计数 0 和外部/API 写请求计数 0。
