@@ -5,6 +5,7 @@ import socket
 import sys
 import tempfile
 import unittest
+from dataclasses import fields
 from pathlib import Path
 from unittest.mock import patch
 
@@ -24,6 +25,7 @@ from sync_worker.sku_dry_run import (  # noqa: E402
 )
 from sync_worker.sku_policy import (  # noqa: E402
     SKU_POLICY_VERSION,
+    SkuGenerationResult,
     generate_sku,
     validate_sku_uniqueness,
 )
@@ -211,11 +213,12 @@ class SkuDryRunTests(unittest.TestCase):
             all(result["status"] == "duplicate_input" for result in report["results"])
         )
 
-    def test_18_source_row_is_absent_from_result(self) -> None:
+    def test_18_product_source_is_output_without_entering_sku(self) -> None:
         result = built()["results"][0]
-        serialized = json.dumps(result)
-        self.assertNotIn("start_row", serialized)
-        self.assertNotIn("end_row", serialized)
+        self.assertEqual(
+            result["product_source"],
+            {"start_row": 480, "end_row": 490},
+        )
         self.assertNotIn("480", result["sku"])
 
     def test_19_price_is_absent_from_sku(self) -> None:
@@ -362,14 +365,52 @@ class SkuDryRunTests(unittest.TestCase):
             ["A/B", "A_B"],
         )
 
-    def test_39_report_does_not_include_source_or_prices(self) -> None:
+    def test_39_report_includes_only_allowlisted_source_provenance(self) -> None:
         for result in built()["results"]:
             keys = set(result)
+            self.assertIn("product_source", keys)
             self.assertFalse(
                 keys.intersection(
                     {"source", "start_row", "end_row", "price", "fob"}
                 )
             )
+
+    def test_40_product_source_start_row_is_preserved(self) -> None:
+        result = built({"products": [product_item("MODEL", start_row=478)]})[
+            "results"
+        ][0]
+        self.assertEqual(result["product_source"]["start_row"], 478)
+
+    def test_41_product_source_end_row_is_preserved(self) -> None:
+        result = built({"products": [product_item("MODEL", start_row=478)]})[
+            "results"
+        ][0]
+        self.assertEqual(result["product_source"]["end_row"], 488)
+
+    def test_42_source_provenance_comes_from_each_product_record(self) -> None:
+        report = built(
+            {
+                "products": [
+                    product_item("FIRST", start_row=900),
+                    product_item("SECOND", start_row=11),
+                ]
+            }
+        )
+        self.assertEqual(
+            [item["product_source"] for item in report["results"]],
+            [
+                {"start_row": 900, "end_row": 910},
+                {"start_row": 11, "end_row": 21},
+            ],
+        )
+
+    def test_43_sku_policy_result_has_no_source_provenance_field(self) -> None:
+        field_names = {item.name for item in fields(SkuGenerationResult)}
+        self.assertTrue(
+            field_names.isdisjoint(
+                {"source", "product_source", "start_row", "end_row"}
+            )
+        )
 
 
 if __name__ == "__main__":

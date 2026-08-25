@@ -59,7 +59,10 @@ def _unique(values: Sequence[str]) -> tuple[str, ...]:
     return tuple(dict.fromkeys(values))
 
 
-def _result_report(result: SkuGenerationResult) -> dict[str, object]:
+def _result_report(
+    result: SkuGenerationResult,
+    product: ProductRecord,
+) -> dict[str, object]:
     blocking_issues = result.blocking_issues
     status = result.status
     if result.sku is not None and not is_safe_sku(result.sku):
@@ -71,6 +74,10 @@ def _result_report(result: SkuGenerationResult) -> dict[str, object]:
         "raw_identity": result.raw_identity,
         "normalized_identity": result.normalized_identity,
         "sku": result.sku,
+        "product_source": {
+            "start_row": product.source.start_row,
+            "end_row": product.source.end_row,
+        },
         "status": status,
         "policy_version": result.policy_version,
         "warnings": list(result.warnings),
@@ -116,7 +123,10 @@ def build_sku_dry_run_report(
     individual = [sku_policy.generate_sku(product) for product in products]
     batch = sku_policy.validate_sku_uniqueness(products)
     _validate_policy_consistency(individual, batch.results)
-    results = [_result_report(result) for result in batch.results]
+    results = [
+        _result_report(result, product)
+        for result, product in zip(batch.results, products, strict=True)
+    ]
 
     def status_count(status: str) -> int:
         return sum(result["status"] == status for result in results)

@@ -22,6 +22,9 @@ from .inspect_product import (
     reference_product_report_filename,
 )
 from .image_mapping_dry_run import run_image_mapping_dry_run
+from .media_source_discovery_dry_run import (
+    run_media_source_discovery_dry_run,
+)
 from .option_pricing_dry_run import (
     OptionPricingDryRunInputError,
     parse_rmb_to_usd_rate,
@@ -560,6 +563,65 @@ def _run_map_product_images(
     return 0 if report.get("status") == "ok" else 1
 
 
+def _run_discover_mapped_media_sources(
+    logger: logging.Logger,
+    mapping_input_path: Path,
+    sheet_title: str,
+    sku_report_input_path: Path | None,
+) -> int:
+    try:
+        settings = load_google_config()
+    except Exception as error:
+        _log_failure(
+            logger,
+            error,
+            event="discover_mapped_media_sources_aborted",
+        )
+        return 2
+    redactor = google_redactor_for_settings(settings)
+    try:
+        report, _ = run_media_source_discovery_dry_run(
+            mapping_input_path,
+            sheet_title,
+            settings,
+            OfficialGoogleClientFactory(),
+            project_root=PROJECT_ROOT,
+            sku_report_input_path=sku_report_input_path,
+            redactor=redactor,
+        )
+    except Exception as error:
+        logger.error(
+            json.dumps(
+                {
+                    "event": "discover_mapped_media_sources_aborted",
+                    "error": redactor.exception(error),
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        )
+        return 2
+
+    logger.info(
+        json.dumps(
+            {
+                "event": "media_source_discovery_dry_run_report_written",
+                "path": "reports/media-source-discovery-dry-run.json",
+                "status": report.get("status"),
+                "summary": report.get("summary", {}),
+                "read_requests_performed": report.get(
+                    "read_requests_performed", 0
+                ),
+                "network_requests_performed": 0,
+                "write_requests_performed": 0,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+    )
+    return 0 if report.get("status") == "ok" else 1
+
+
 def _run_link_product_options(
     logger: logging.Logger,
     product_input_path: Path,
@@ -928,6 +990,30 @@ def build_parser() -> argparse.ArgumentParser:
         dest="layout_input_path",
         help="Corresponding local Sheet layout JSON file",
     )
+    discover_mapped_media_sources = subcommands.add_parser(
+        "discover-mapped-media-sources",
+        help="Securely classify exact mapped media reference cells",
+    )
+    discover_mapped_media_sources.add_argument(
+        "--mapping",
+        required=True,
+        type=Path,
+        dest="mapping_input_path",
+        help="Local Image Mapping dry-run JSON file",
+    )
+    discover_mapped_media_sources.add_argument(
+        "--sheet",
+        required=True,
+        type=_sheet_title_argument,
+        dest="sheet_title",
+        help="Exact Google Sheet title containing the mapped cells",
+    )
+    discover_mapped_media_sources.add_argument(
+        "--sku-report",
+        type=Path,
+        dest="sku_report_input_path",
+        help="Optional regenerated SKU dry-run JSON file",
+    )
     link_product_options = subcommands.add_parser(
         "link-product-options",
         help="Link local Product and Additional Option dry-run reports",
@@ -1099,6 +1185,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             logger,
             arguments.product_input_path,
             arguments.layout_input_path,
+        )
+    if arguments.command == "discover-mapped-media-sources":
+        return _run_discover_mapped_media_sources(
+            logger,
+            arguments.mapping_input_path,
+            arguments.sheet_title,
+            arguments.sku_report_input_path,
         )
     if arguments.command == "link-product-options":
         return _run_link_product_options(

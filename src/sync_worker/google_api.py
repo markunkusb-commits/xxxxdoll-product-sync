@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -33,14 +35,18 @@ _ALLOWED_GOOGLE_OPERATIONS = frozenset(
         "drive.files.list",
         "sheets.spreadsheets.get",
         "sheets.values.get",
+        "sheets.values.batchGet",
     }
 )
 _ALLOWED_GOOGLE_HTTP_METHODS = frozenset({"GET", "HEAD"})
+_SINGLE_CELL_A1_PATTERN = re.compile(r"^[A-Z]+[1-9][0-9]*$")
 
 
 def ensure_google_operation_allowed(operation: str) -> None:
     if operation not in _ALLOWED_GOOGLE_OPERATIONS:
-        raise GoogleOperationBlocked("Google operation is not in the read-only allowlist")
+        raise GoogleOperationBlocked(
+            "Google operation is not in the read-only allowlist"
+        )
 
 
 def ensure_google_http_method_allowed(method: object) -> None:
@@ -250,6 +256,44 @@ class ReadOnlyGoogleGateway:
             majorDimension="ROWS",
         )
         return self._execute("sheets.values.get", request)
+
+    def batch_get_sheet_cells(
+        self,
+        spreadsheet_id: str,
+        sheet_title: str,
+        coordinates: Sequence[str],
+    ) -> object:
+        """Read at most 100 already-validated single cells in one GET batch."""
+
+        if isinstance(coordinates, (str, bytes)) or not isinstance(
+            coordinates, Sequence
+        ):
+            raise ValueError("coordinates must be a sequence")
+        stable_coordinates = tuple(coordinates)
+        if not 1 <= len(stable_coordinates) <= 100:
+            raise ValueError("coordinates must contain from 1 to 100 cells")
+        if len(set(stable_coordinates)) != len(stable_coordinates):
+            raise ValueError("coordinates must be unique")
+        if any(
+            not isinstance(item, str)
+            or _SINGLE_CELL_A1_PATTERN.fullmatch(item) is None
+            for item in stable_coordinates
+        ):
+            raise ValueError("coordinates must be exact single-cell A1 values")
+        if not isinstance(sheet_title, str) or not sheet_title:
+            raise ValueError("sheet_title must be non-empty text")
+        escaped_title = sheet_title.replace("'", "''")
+        ranges = [
+            f"'{escaped_title}'!{coordinate}"
+            for coordinate in stable_coordinates
+        ]
+        request = self._sheets.spreadsheets().values().batchGet(
+            spreadsheetId=spreadsheet_id,
+            ranges=ranges,
+            majorDimension="ROWS",
+            valueRenderOption="FORMATTED_VALUE",
+        )
+        return self._execute("sheets.values.batchGet", request)
 
     def get_inventory_spreadsheet(self, spreadsheet_id: str) -> object:
         """Read only inventory-safe sheet metadata without requesting sheet IDs."""
