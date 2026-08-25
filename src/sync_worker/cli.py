@@ -21,6 +21,7 @@ from .inspect_product import (
     ReferenceProductInspector,
     reference_product_report_filename,
 )
+from .image_mapping_dry_run import run_image_mapping_dry_run
 from .option_pricing_dry_run import (
     OptionPricingDryRunInputError,
     parse_rmb_to_usd_rate,
@@ -527,6 +528,38 @@ def _run_enrich_product_size(
     return 0 if report.get("status") == "ok" else 1
 
 
+def _run_map_product_images(
+    logger: logging.Logger,
+    product_input_path: Path,
+    layout_input_path: Path,
+) -> int:
+    try:
+        report, _ = run_image_mapping_dry_run(
+            product_input_path,
+            layout_input_path,
+            project_root=PROJECT_ROOT,
+        )
+    except Exception as error:
+        _log_failure(logger, error, event="map_product_images_aborted")
+        return 2
+
+    logger.info(
+        json.dumps(
+            {
+                "event": "image_mapping_dry_run_report_written",
+                "path": "reports/image-mapping-dry-run.json",
+                "status": report.get("status"),
+                "summary": report.get("summary", {}),
+                "network_requests_performed": 0,
+                "write_requests_performed": 0,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+    )
+    return 0 if report.get("status") == "ok" else 1
+
+
 def _run_link_product_options(
     logger: logging.Logger,
     product_input_path: Path,
@@ -877,6 +910,24 @@ def build_parser() -> argparse.ArgumentParser:
         dest="size_input_path",
         help="Local Size List dry-run JSON file",
     )
+    map_product_images = subcommands.add_parser(
+        "map-product-images",
+        help="Map local Product records to local Sheet media provenance",
+    )
+    map_product_images.add_argument(
+        "--products",
+        required=True,
+        type=Path,
+        dest="product_input_path",
+        help="Local CLM parser dry-run JSON file",
+    )
+    map_product_images.add_argument(
+        "--layout",
+        required=True,
+        type=Path,
+        dest="layout_input_path",
+        help="Corresponding local Sheet layout JSON file",
+    )
     link_product_options = subcommands.add_parser(
         "link-product-options",
         help="Link local Product and Additional Option dry-run reports",
@@ -1042,6 +1093,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             logger,
             arguments.product_input_path,
             arguments.size_input_path,
+        )
+    if arguments.command == "map-product-images":
+        return _run_map_product_images(
+            logger,
+            arguments.product_input_path,
+            arguments.layout_input_path,
         )
     if arguments.command == "link-product-options":
         return _run_link_product_options(

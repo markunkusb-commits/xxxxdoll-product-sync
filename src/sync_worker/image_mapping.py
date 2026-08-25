@@ -264,11 +264,25 @@ def _coordinate(value: object) -> tuple[str, int] | None:
     return normalized, int(matched.group(2))
 
 
-def _normalize_marker(value: object) -> str | None:
+def normalize_media_marker(value: object) -> str | None:
+    """Normalize a media marker without broadening its accepted semantics."""
+
     if not isinstance(value, str):
         return None
     normalized = " ".join(value.split()).casefold()
     return normalized or None
+
+
+def is_photo_download_link_marker(value: object) -> bool:
+    """Return whether *value* is the one approved exact media marker."""
+
+    return normalize_media_marker(value) == PHOTO_DOWNLOAD_LINK_MARKER
+
+
+def _normalize_marker(value: object) -> str | None:
+    """Backward-compatible internal alias for the public normalization rule."""
+
+    return normalize_media_marker(value)
 
 
 def _reference_fingerprint(raw_reference: str, source_coordinate: str) -> str:
@@ -604,7 +618,10 @@ def map_product_media_sources(
         ):
             raise ImageMappingError("product source range is invalid")
     stable_sources = tuple(
-        sorted((_normalize_source(item) for item in media_sources), key=_source_sort_key)
+        sorted(
+            (_normalize_source(item) for item in media_sources),
+            key=_source_sort_key,
+        )
     )
 
     source_results: list[MediaSourceMappingResult] = []
