@@ -29,6 +29,9 @@ _DOUBLE_QUOTED_ESCAPE_PATTERN = re.compile(r'\\([\\"nrt])')
 DEFAULT_DOTENV_PATH = Path(__file__).resolve().parents[2] / ".env"
 PROJECT_ROOT = DEFAULT_DOTENV_PATH.parent
 GOOGLE_DRIVE_READONLY_SCOPE = "https://www.googleapis.com/auth/drive.readonly"
+GOOGLE_DRIVE_METADATA_READONLY_SCOPE = (
+    "https://www.googleapis.com/auth/drive.metadata.readonly"
+)
 GOOGLE_SHEETS_READONLY_SCOPE = (
     "https://www.googleapis.com/auth/spreadsheets.readonly"
 )
@@ -310,7 +313,7 @@ class GoogleSettings:
             "MD_DRIVE_FOLDER_ID": mask_identifier(self.md_drive_folder_id),
         }
 
-    def validate(self, *, project_root: Path = PROJECT_ROOT) -> None:
+    def _validate_proxy(self) -> None:
         if self.google_proxy_mode not in {"none", "socks5"}:
             raise ConfigError("GOOGLE_PROXY_MODE must be none or socks5")
         if not isinstance(self.google_proxy_rdns, bool):
@@ -329,6 +332,25 @@ class GoogleSettings:
                     "GOOGLE_PROXY_PORT must be an integer from 1 to 65535"
                 )
 
+    def _validate_service_account_file(
+        self, *, project_root: Path = PROJECT_ROOT
+    ) -> None:
+        if not self.service_account_file:
+            raise ConfigError(
+                "Missing Google configuration: GOOGLE_SERVICE_ACCOUNT_FILE"
+            )
+        credentials_path = self.resolved_service_account_file
+        resolved_project_root = project_root.resolve(strict=False)
+        if credentials_path.is_relative_to(resolved_project_root):
+            raise ConfigError("GOOGLE_SERVICE_ACCOUNT_FILE must be outside the project")
+        if credentials_path.suffix.lower() != ".json":
+            raise ConfigError("GOOGLE_SERVICE_ACCOUNT_FILE must use a .json extension")
+        if not credentials_path.is_file():
+            raise ConfigError("GOOGLE_SERVICE_ACCOUNT_FILE does not exist")
+
+    def validate(self, *, project_root: Path = PROJECT_ROOT) -> None:
+        self._validate_proxy()
+
         missing = [
             name
             for name, configured in self.configured_status().items()
@@ -344,18 +366,21 @@ class GoogleSettings:
             if not _GOOGLE_ID_PATTERN.fullmatch(value):
                 raise ConfigError(f"{name} has an invalid identifier format")
 
-        credentials_path = self.resolved_service_account_file
-        resolved_project_root = project_root.resolve(strict=False)
-        if credentials_path.is_relative_to(resolved_project_root):
-            raise ConfigError("GOOGLE_SERVICE_ACCOUNT_FILE must be outside the project")
-        if credentials_path.suffix.lower() != ".json":
-            raise ConfigError("GOOGLE_SERVICE_ACCOUNT_FILE must use a .json extension")
-        if not credentials_path.is_file():
-            raise ConfigError("GOOGLE_SERVICE_ACCOUNT_FILE does not exist")
+        self._validate_service_account_file(project_root=project_root)
         if self.drive_scope != GOOGLE_DRIVE_READONLY_SCOPE:
             raise ConfigError("GOOGLE_DRIVE_SCOPE must be the exact read-only scope")
         if self.sheets_scope != GOOGLE_SHEETS_READONLY_SCOPE:
             raise ConfigError("GOOGLE_SHEETS_SCOPE must be the exact read-only scope")
+
+    def validate_drive_metadata(
+        self, *, project_root: Path = PROJECT_ROOT
+    ) -> None:
+        """Validate only the configuration needed for metadata-only Drive reads."""
+
+        self._validate_proxy()
+        self._validate_service_account_file(project_root=project_root)
+        if self.drive_scope != GOOGLE_DRIVE_METADATA_READONLY_SCOPE:
+            raise ConfigError("drive_metadata_scope_unavailable")
 
 
 def _configuration_source(
@@ -406,10 +431,18 @@ def load_google_config(
 ) -> GoogleSettings:
     """Load and validate Google settings without reading credential JSON content."""
     source = _configuration_source(environ, dotenv_path)
+    settings = _google_settings_from_source(source)
+    settings.validate(project_root=project_root)
+    return settings
+
+
+def _google_settings_from_source(
+    source: Mapping[str, str],
+) -> GoogleSettings:
     proxy_mode = _read_text(source, "GOOGLE_PROXY_MODE", "none").lower()
     if not proxy_mode:
         proxy_mode = "none"
-    settings = GoogleSettings(
+    return GoogleSettings(
         service_account_file=_read_text(source, "GOOGLE_SERVICE_ACCOUNT_FILE"),
         clm_spreadsheet_id=_read_text(source, "CLM_SPREADSHEET_ID"),
         clm_drive_folder_id=_read_text(source, "CLM_DRIVE_FOLDER_ID"),
@@ -423,5 +456,17 @@ def load_google_config(
             source, "GOOGLE_PROXY_RDNS", True
         ),
     )
-    settings.validate(project_root=project_root)
+
+
+def load_google_drive_metadata_config(
+    environ: Mapping[str, str] | None = None,
+    *,
+    dotenv_path: str | Path | None = None,
+    project_root: Path = PROJECT_ROOT,
+) -> GoogleSettings:
+    """Load the shared Google/proxy config for metadata-only Drive access."""
+
+    source = _configuration_source(environ, dotenv_path)
+    settings = _google_settings_from_source(source)
+    settings.validate_drive_metadata(project_root=project_root)
     return settings

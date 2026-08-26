@@ -29,6 +29,10 @@ class GoogleClientFactory(Protocol):
     def create(self, settings: GoogleSettings) -> GoogleClients: ...
 
 
+class GoogleDriveMetadataClientFactory(Protocol):
+    def create_drive_metadata(self, settings: GoogleSettings) -> Any: ...
+
+
 _ALLOWED_GOOGLE_OPERATIONS = frozenset(
     {
         "drive.files.get",
@@ -40,6 +44,7 @@ _ALLOWED_GOOGLE_OPERATIONS = frozenset(
 )
 _ALLOWED_GOOGLE_HTTP_METHODS = frozenset({"GET", "HEAD"})
 _SINGLE_CELL_A1_PATTERN = re.compile(r"^[A-Z]+[1-9][0-9]*$")
+_DRIVE_RESOURCE_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
 
 
 def ensure_google_operation_allowed(operation: str) -> None:
@@ -95,15 +100,17 @@ def google_redactor_for_settings(settings: GoogleSettings) -> Redactor:
 class OfficialGoogleClientFactory:
     """Create authenticated Drive v3 and Sheets v4 clients after validation."""
 
-    def create(self, settings: GoogleSettings) -> GoogleClients:
-        settings.validate()
-        redactor = google_redactor_for_settings(settings)
-
+    def _create_authorized_http(
+        self,
+        settings: GoogleSettings,
+        scopes: Sequence[str],
+        redactor: Redactor,
+    ) -> Any:
         try:
             from google.oauth2 import service_account
             credentials = service_account.Credentials.from_service_account_file(
                 str(settings.resolved_service_account_file),
-                scopes=[settings.drive_scope, settings.sheets_scope],
+                scopes=list(scopes),
             )
         except Exception as error:
             raise _stage_error("credentials_create", error, redactor) from None
@@ -142,6 +149,16 @@ class OfficialGoogleClientFactory:
             protect_google_transport(authorized_http)
         except Exception as error:
             raise _stage_error("transport_authorize", error, redactor) from None
+        return authorized_http
+
+    def create(self, settings: GoogleSettings) -> GoogleClients:
+        settings.validate()
+        redactor = google_redactor_for_settings(settings)
+        authorized_http = self._create_authorized_http(
+            settings,
+            (settings.drive_scope, settings.sheets_scope),
+            redactor,
+        )
 
         try:
             from googleapiclient.discovery import build
@@ -166,6 +183,28 @@ class OfficialGoogleClientFactory:
             raise _stage_error("sheets_client_build", error, redactor) from None
 
         return GoogleClients(drive=drive, sheets=sheets)
+
+    def create_drive_metadata(self, settings: GoogleSettings) -> Any:
+        """Build only Drive v3 with the exact metadata-only OAuth scope."""
+
+        settings.validate_drive_metadata()
+        redactor = google_redactor_for_settings(settings)
+        authorized_http = self._create_authorized_http(
+            settings,
+            (settings.drive_scope,),
+            redactor,
+        )
+        try:
+            from googleapiclient.discovery import build
+
+            return build(
+                "drive",
+                "v3",
+                http=authorized_http,
+                cache_discovery=False,
+            )
+        except Exception as error:
+            raise _stage_error("drive_client_build", error, redactor) from None
 
 
 def _stage_error(
@@ -343,3 +382,46 @@ class ReadOnlyGoogleGateway:
             ),
         )
         return self._execute("sheets.spreadsheets.get", request)
+
+
+DRIVE_FOLDER_MANIFEST_FIELDS = (
+    "nextPageToken,"
+    "files(id,name,mimeType,size,modifiedTime,md5Checksum,"
+    "imageMediaMetadata(width,height,rotation))"
+)
+
+
+class GoogleDriveMetadataGateway:
+    """Expose only one metadata-only Drive children-list operation."""
+
+    def __init__(self, drive_client: Any) -> None:
+        self._drive = drive_client
+        self.counters = GoogleRequestCounters()
+
+    def list_folder_children(
+        self,
+        folder_id: str,
+        *,
+        page_token: str | None = None,
+        page_size: int = 100,
+    ) -> object:
+        if (
+            not isinstance(folder_id, str)
+            or _DRIVE_RESOURCE_ID_PATTERN.fullmatch(folder_id) is None
+        ):
+            raise GoogleOperationBlocked("Drive folder identifier is invalid")
+        if not 1 <= page_size <= 100:
+            raise ValueError("Drive manifest page_size must be from 1 to 100")
+        request_arguments: dict[str, object] = {
+            "q": f"'{folder_id}' in parents and trashed = false",
+            "pageSize": page_size,
+            "fields": DRIVE_FOLDER_MANIFEST_FIELDS,
+            "includeItemsFromAllDrives": True,
+            "supportsAllDrives": True,
+        }
+        if page_token is not None:
+            request_arguments["pageToken"] = page_token
+        request = self._drive.files().list(**request_arguments)
+        ensure_google_operation_allowed("drive.files.list")
+        self.counters.read_requests_performed += 1
+        return request.execute()

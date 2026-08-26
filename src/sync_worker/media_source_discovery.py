@@ -102,6 +102,8 @@ class MediaSourceDiscoveryResult:
     sku: str | None
     warnings: tuple[str, ...]
     blocking_issues: tuple[str, ...]
+    provider_resource_id: str | None = field(default=None, repr=False)
+    resource_key: str | None = field(default=None, repr=False)
 
     def to_dict(self) -> dict[str, object]:
         report = {
@@ -191,6 +193,7 @@ class _UrlClassification:
     requires_provider_api: bool
     requires_http_probe: bool
     warnings: tuple[str, ...] = ()
+    resource_key: str | None = field(default=None, repr=False)
 
 
 def _unique(values: Sequence[str]) -> tuple[str, ...]:
@@ -271,8 +274,14 @@ def _host_matches(host: str, domain: str) -> bool:
     return host == domain or host.endswith(f".{domain}")
 
 
+def _google_resource_key(query: str) -> str | None:
+    values = [value for value in parse_qs(query).get("resourcekey", []) if value]
+    return values[0] if len(values) == 1 else None
+
+
 def _classify_path(host: str, path: str, query: str) -> _UrlClassification:
     if host == "drive.google.com":
+        resource_key = _google_resource_key(query)
         if match := _GOOGLE_FOLDER_PATTERN.match(path):
             return _UrlClassification(
                 "google_drive",
@@ -281,6 +290,7 @@ def _classify_path(host: str, path: str, query: str) -> _UrlClassification:
                 match.group(1),
                 True,
                 False,
+                resource_key=resource_key,
             )
         if match := _GOOGLE_FILE_PATTERN.match(path):
             return _UrlClassification(
@@ -290,6 +300,7 @@ def _classify_path(host: str, path: str, query: str) -> _UrlClassification:
                 match.group(1),
                 True,
                 False,
+                resource_key=resource_key,
             )
         resource_id = None
         if path.rstrip("/").casefold() == "/open":
@@ -303,6 +314,7 @@ def _classify_path(host: str, path: str, query: str) -> _UrlClassification:
             resource_id,
             True,
             False,
+            resource_key=resource_key,
         )
     if host == "docs.google.com":
         match = _GOOGLE_WORKSPACE_PATTERN.match(path)
@@ -313,6 +325,7 @@ def _classify_path(host: str, path: str, query: str) -> _UrlClassification:
             match.group(1) if match else None,
             True,
             False,
+            resource_key=_google_resource_key(query),
         )
     if _host_matches(host, "dropbox.com"):
         if match := _DROPBOX_FOLDER_PATTERN.match(path):
@@ -556,6 +569,8 @@ def discover_media_source(
         sku=sku,
         warnings=_unique((*warnings, *classification.warnings)),
         blocking_issues=(),
+        provider_resource_id=classification.resource_id,
+        resource_key=classification.resource_key,
     )
     result.to_dict()
     return result
