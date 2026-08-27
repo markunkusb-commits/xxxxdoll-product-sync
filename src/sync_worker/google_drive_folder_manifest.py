@@ -116,6 +116,8 @@ class DriveManifestItem:
     image_height: int | None
     image_rotation: int | None
     warnings: tuple[str, ...] = ()
+    # Traversal provenance is memory-only; serialize through to_dict(), not asdict().
+    provider_file_id: str | None = field(default=None, repr=False, compare=False)
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -378,6 +380,7 @@ def _manifest_item(payload: object) -> DriveManifestItem:
         image_height=_optional_positive_int(metadata.get("height")),
         image_rotation=_optional_rotation(metadata.get("rotation")),
         warnings=_unique(warnings),
+        provider_file_id=raw_file_id if is_valid_drive_id(raw_file_id) else None,
     )
 
 
