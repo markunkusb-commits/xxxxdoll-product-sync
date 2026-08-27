@@ -1,6 +1,6 @@
 # xxxxdoll-product-sync
 
-Python 3.12 项目，用于搭建未来商品同步 worker 的安全基础。本阶段只包含项目结构、环境变量配置读取和安全检查，不包含任何 WordPress、WooCommerce 或 Google Drive 客户端，也不会执行网络请求。
+Python 3.12 项目，包含商品数据的本地解析、映射与 dry-run，以及显式运行的只读 WordPress/WooCommerce、Google 检查命令。只读检查会访问网络；单元测试使用 mock，不读取真实供应商数据或凭据，不执行外部写请求。
 
 ## 项目结构
 
@@ -64,7 +64,7 @@ Select-String `
 
 ## Google 只读权限检查
 
-项目依赖官方 `google-api-python-client`、`google-auth` 和 `google-auth-httplib2`。配置必须使用项目目录外的服务账号 JSON，并严格设置以下只读 scopes：
+项目依赖官方 `google-api-python-client`、`google-auth`、`google-auth-httplib2` 和 `PySocks`。配置必须使用项目目录外的服务账号 JSON。仅 legacy full workflow（`google-doctor` / `supplier-inventory`）要求同时提供两个 Drive folder ID，并严格设置以下 scopes：
 
 ```text
 https://www.googleapis.com/auth/drive.readonly
@@ -78,6 +78,21 @@ python -m sync_worker google-doctor
 ```
 
 该命令只检查两个指定根文件夹、最多 100 个一级子项、Spreadsheet 元数据，以及每个工作表的 `A1:Z5` 小样本。报告只保存文件元数据和单元格统计，不保存文件 ID、Spreadsheet ID、单元格内容、凭据内容或下载链接；所有 Google 写操作均不在代码允许列表中。
+
+### 按 workflow 隔离 scope
+
+以下 scope 后缀均以 `https://www.googleapis.com/auth/` 为前缀，配置必须精确匹配：
+
+| Workflow | Drive scope | Sheets scope | 客户端 |
+| --- | --- | --- | --- |
+| `google-doctor` / `supplier-inventory` | `drive.readonly` | `spreadsheets.readonly` | Drive + Sheets |
+| `inspect-sheet-layout` / `discover-mapped-media-sources` | 不校验、不申请 | `spreadsheets.readonly` | 仅 Sheets v4 |
+| Drive metadata Core | `drive.metadata.readonly` | 不校验、不申请 | 仅 Drive v3 |
+| `build-drive-folder-manifests` | `drive.metadata.readonly` | `spreadsheets.readonly` | Drive metadata + Sheets |
+
+所有路径都先检查 proxy 和项目目录外的服务账号文件。Sheets-only 还检查 Spreadsheet ID，但不要求 Drive folder IDs；纯 Drive metadata Core 不要求 Spreadsheet ID。Manifest 命令因为需要 fresh Sheets reference，会同时检查 Sheets scope 和 Spreadsheet ID。
+
+`GOOGLE_DRIVE_SCOPE` 是共享配置项，单个值不能同时满足 legacy full 与 metadata-only workflow。`.env.example` 保留 legacy 示例值；运行 Manifest 时必须显式配置为 `drive.metadata.readonly`，不能为了兼容 legacy 扩大 Manifest 权限。已使用 metadata scope 的配置无需为两个 Sheets-only 命令切换 scope。需要运行 legacy 命令时，请为该次运行明确选择对应配置；不要拼接两个 Drive scopes，也不要新增可写 scope。
 
 ## 供应商结构清单
 
@@ -97,6 +112,28 @@ python -m sync_worker inspect-sheet-layout `
 ```
 
 该命令只读检查一个明确限制的 Sheet 区域（最多 100 行、52 列和 5200 个单元格），保留格式化显示值、真实 A1 坐标以及 merged ranges。报告不会保存公式原文，也不会执行任何写请求；输出文件为 `reports/sheet-layout-<safe-sheet-name>.json`，并由现有 `reports/*.json` Git ignore 规则保护。
+
+## Media / Drive 正式主链
+
+以下命令会执行受限的真实只读请求，仅在人工确认配置与当前 snapshot 后运行；它们不是离线 parser：
+
+```powershell
+python -m sync_worker discover-mapped-media-sources `
+  --mapping reports/image-mapping-dry-run.json `
+  --sheet "RMB Price List" `
+  --sku-report reports/sku-dry-run.json
+
+python -m sync_worker build-drive-folder-manifests `
+  --mapping reports/image-mapping-dry-run.json `
+  --sheet "RMB Price List" `
+  --sku-report reports/sku-dry-run.json
+```
+
+使用同一份当前 product snapshot 生成的 mapping 和 SKU 报告，按精确 source row range 关联，不使用 stale 报告中的脱敏 URL 作为来源。Secure Media Reader 将 mapping 批准的 exact cells 合并为一次 Sheets GET；依次保留 hyperlink、rich-text link、cell-level link、Smart Chip、静态 `HYPERLINK` 公式及 direct URL fallback 的兼容读取，多链接歧义仍阻断。URI 仅保留在内存，不执行额外探测请求。
+
+Manifest 链路为 Secure Reference Read → SKU exact-range join → fresh in-memory Media Discovery → `SecureGoogleDriveFolderHandle` → metadata-only `files.list`。只列一级子项（有界分页），不递归 nested folders、不跟随 shortcuts，不使用 `get_media` / `alt=media` / export，不下载。报告 `reports/google-drive-folder-manifest-dry-run.json` 只保留业务字段、ID fingerprints、安全状态及 Sheets/Drive/network/download/write 计数，不保留 raw URL、原始 ID、resource key 或临时 diagnostic 探针；下载和外部写计数始终为 0。
+
+临时命令 `diagnose-media-cell-shapes` 和 `diagnose-media-reference-parity` 已移除。
 
 ## CLM RMB Price List Parser V1
 

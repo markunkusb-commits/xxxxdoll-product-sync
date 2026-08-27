@@ -33,6 +33,16 @@ class GoogleDriveMetadataClientFactory(Protocol):
     def create_drive_metadata(self, settings: GoogleSettings) -> Any: ...
 
 
+class GoogleDriveMetadataAndSheetsClientFactory(Protocol):
+    def create_drive_metadata_clients(
+        self, settings: GoogleSettings
+    ) -> GoogleClients: ...
+
+
+class GoogleSheetsReadonlyClientFactory(Protocol):
+    def create_sheets_readonly(self, settings: GoogleSettings) -> Any: ...
+
+
 _ALLOWED_GOOGLE_OPERATIONS = frozenset(
     {
         "drive.files.get",
@@ -45,6 +55,13 @@ _ALLOWED_GOOGLE_OPERATIONS = frozenset(
 _ALLOWED_GOOGLE_HTTP_METHODS = frozenset({"GET", "HEAD"})
 _SINGLE_CELL_A1_PATTERN = re.compile(r"^[A-Z]+[1-9][0-9]*$")
 _DRIVE_RESOURCE_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
+SHEETS_LINK_CELL_FIELDS = (
+    "sheets(data(startRow,startColumn,rowData(values("
+    "formattedValue,hyperlink,textFormatRuns(format(link(uri))),"
+    "userEnteredFormat(textFormat(link(uri))),"
+    "chipRuns(startIndex,chip(richLinkProperties(uri,mimeType))),"
+    "userEnteredValue(formulaValue)))))"
+)
 
 
 def ensure_google_operation_allowed(operation: str) -> None:
@@ -206,6 +223,62 @@ class OfficialGoogleClientFactory:
         except Exception as error:
             raise _stage_error("drive_client_build", error, redactor) from None
 
+    def create_sheets_readonly(self, settings: GoogleSettings) -> Any:
+        """Build only Sheets v4 with the exact read-only Sheets scope."""
+
+        settings.validate_sheets_readonly()
+        redactor = google_redactor_for_settings(settings)
+        authorized_http = self._create_authorized_http(
+            settings,
+            (settings.sheets_scope,),
+            redactor,
+        )
+        try:
+            from googleapiclient.discovery import build
+
+            return build(
+                "sheets",
+                "v4",
+                http=authorized_http,
+                cache_discovery=False,
+            )
+        except Exception as error:
+            raise _stage_error("sheets_client_build", error, redactor) from None
+
+    def create_drive_metadata_clients(
+        self, settings: GoogleSettings
+    ) -> GoogleClients:
+        """Build Drive metadata and Sheets clients on one guarded transport."""
+
+        settings.validate_drive_metadata_with_sheets()
+        redactor = google_redactor_for_settings(settings)
+        authorized_http = self._create_authorized_http(
+            settings,
+            (settings.drive_scope, settings.sheets_scope),
+            redactor,
+        )
+        try:
+            from googleapiclient.discovery import build
+
+            drive = build(
+                "drive",
+                "v3",
+                http=authorized_http,
+                cache_discovery=False,
+            )
+        except Exception as error:
+            raise _stage_error("drive_client_build", error, redactor) from None
+        try:
+            sheets = build(
+                "sheets",
+                "v4",
+                http=authorized_http,
+                cache_discovery=False,
+            )
+        except Exception as error:
+            raise _stage_error("sheets_client_build", error, redactor) from None
+        return GoogleClients(drive=drive, sheets=sheets)
+
 
 def _stage_error(
     stage: str, error: BaseException, redactor: Redactor
@@ -227,13 +300,87 @@ class GoogleRequestCounters:
         return 0
 
 
-class ReadOnlyGoogleGateway:
-    """Expose only the four read operations required by google-doctor."""
+class ReadOnlySheetsGateway:
+    """Expose only Sheets grid reads for layout and secure media workflows."""
+
+    def __init__(self, sheets_client: Any) -> None:
+        self._sheets = sheets_client
+        self.counters = GoogleRequestCounters()
+
+    def _execute(self, operation: str, request: Any) -> object:
+        if operation != "sheets.spreadsheets.get":
+            raise GoogleOperationBlocked("Sheets gateway allows only grid reads")
+        ensure_google_operation_allowed(operation)
+        self.counters.read_requests_performed += 1
+        return request.execute()
+
+    def batch_get_sheet_link_cells(
+        self,
+        spreadsheet_id: str,
+        sheet_title: str,
+        coordinates: Sequence[str],
+    ) -> object:
+        """Read hyperlink metadata for approved exact cells in one GET."""
+
+        if isinstance(coordinates, (str, bytes)) or not isinstance(
+            coordinates, Sequence
+        ):
+            raise ValueError("coordinates must be a sequence")
+        stable_coordinates = tuple(coordinates)
+        if not 1 <= len(stable_coordinates) <= 100:
+            raise ValueError("coordinates must contain from 1 to 100 cells")
+        if len(set(stable_coordinates)) != len(stable_coordinates):
+            raise ValueError("coordinates must be unique")
+        if any(
+            not isinstance(item, str)
+            or _SINGLE_CELL_A1_PATTERN.fullmatch(item) is None
+            for item in stable_coordinates
+        ):
+            raise ValueError("coordinates must be exact single-cell A1 values")
+        if not isinstance(sheet_title, str) or not sheet_title:
+            raise ValueError("sheet_title must be non-empty text")
+        escaped_title = sheet_title.replace("'", "''")
+        ranges = [
+            f"'{escaped_title}'!{coordinate}"
+            for coordinate in stable_coordinates
+        ]
+        request = self._sheets.spreadsheets().get(
+            spreadsheetId=spreadsheet_id,
+            ranges=ranges,
+            includeGridData=True,
+            fields=SHEETS_LINK_CELL_FIELDS,
+        )
+        return self._execute("sheets.spreadsheets.get", request)
+
+    def inspect_sheet_layout(
+        self,
+        spreadsheet_id: str,
+        sheet_title: str,
+        a1_range: str,
+    ) -> object:
+        """Read one bounded grid region with display values and merge metadata."""
+        escaped_title = sheet_title.replace("'", "''")
+        request = self._sheets.spreadsheets().get(
+            spreadsheetId=spreadsheet_id,
+            includeGridData=True,
+            ranges=[f"'{escaped_title}'!{a1_range}"],
+            fields=(
+                "properties(title),"
+                "sheets(properties(title),"
+                "merges(startRowIndex,endRowIndex,startColumnIndex,"
+                "endColumnIndex),"
+                "data(startRow,startColumn,rowData(values(formattedValue))))"
+            ),
+        )
+        return self._execute("sheets.spreadsheets.get", request)
+
+
+class ReadOnlyGoogleGateway(ReadOnlySheetsGateway):
+    """Retain the read operations used by legacy full Google workflows."""
 
     def __init__(self, clients: GoogleClients) -> None:
+        super().__init__(clients.sheets)
         self._drive = clients.drive
-        self._sheets = clients.sheets
-        self.counters = GoogleRequestCounters()
 
     def _execute(self, operation: str, request: Any) -> object:
         ensure_google_operation_allowed(operation)
@@ -360,28 +507,6 @@ class ReadOnlyGoogleGateway:
             valueRenderOption="FORMULA",
         )
         return self._execute("sheets.values.get", request)
-
-    def inspect_sheet_layout(
-        self,
-        spreadsheet_id: str,
-        sheet_title: str,
-        a1_range: str,
-    ) -> object:
-        """Read one bounded grid region with display values and merge metadata."""
-        escaped_title = sheet_title.replace("'", "''")
-        request = self._sheets.spreadsheets().get(
-            spreadsheetId=spreadsheet_id,
-            includeGridData=True,
-            ranges=[f"'{escaped_title}'!{a1_range}"],
-            fields=(
-                "properties(title),"
-                "sheets(properties(title),"
-                "merges(startRowIndex,endRowIndex,startColumnIndex,"
-                "endColumnIndex),"
-                "data(startRow,startColumn,rowData(values(formattedValue))))"
-            ),
-        )
-        return self._execute("sheets.spreadsheets.get", request)
 
 
 DRIVE_FOLDER_MANIFEST_FIELDS = (

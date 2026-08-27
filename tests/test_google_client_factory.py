@@ -14,6 +14,7 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from sync_worker.config import (  # noqa: E402
     ConfigError,
+    GOOGLE_DRIVE_METADATA_READONLY_SCOPE,
     GOOGLE_DRIVE_READONLY_SCOPE,
     GOOGLE_SHEETS_READONLY_SCOPE,
     load_google_config,
@@ -125,6 +126,26 @@ class OfficialGoogleClientFactoryTests(unittest.TestCase):
     def _create(self, settings=None):
         with patch.dict(sys.modules, self.modules):
             return OfficialGoogleClientFactory().create(settings or self.settings)
+
+    def _create_metadata_clients(self, settings=None):
+        active = settings or replace(
+            self.settings,
+            drive_scope=GOOGLE_DRIVE_METADATA_READONLY_SCOPE,
+        )
+        with patch.dict(sys.modules, self.modules):
+            return OfficialGoogleClientFactory().create_drive_metadata_clients(
+                active
+            )
+
+    def _create_sheets_only(self, settings=None):
+        active = settings or replace(
+            self.settings,
+            drive_scope=GOOGLE_DRIVE_METADATA_READONLY_SCOPE,
+        )
+        self.build.side_effect = None
+        self.build.return_value = self.sheets_client
+        with patch.dict(sys.modules, self.modules):
+            return OfficialGoogleClientFactory().create_sheets_readonly(active)
 
     def _sensitive_error_text(self) -> str:
         return (
@@ -321,6 +342,70 @@ class OfficialGoogleClientFactoryTests(unittest.TestCase):
             self.assertNotIn(forbidden, serialized)
         self.drive_client.files.assert_not_called()
         self.sheets_client.spreadsheets.assert_not_called()
+
+    def test_metadata_and_sheets_clients_share_one_authorized_transport(self) -> None:
+        clients = self._create_metadata_clients()
+
+        self.from_service_account_file.assert_called_once_with(
+            str(self.settings.resolved_service_account_file),
+            scopes=[
+                GOOGLE_DRIVE_METADATA_READONLY_SCOPE,
+                GOOGLE_SHEETS_READONLY_SCOPE,
+            ],
+        )
+        self.assertEqual(
+            self.build.call_args_list,
+            [
+                call(
+                    "drive",
+                    "v3",
+                    http=self.authorized_http,
+                    cache_discovery=False,
+                ),
+                call(
+                    "sheets",
+                    "v4",
+                    http=self.authorized_http,
+                    cache_discovery=False,
+                ),
+            ],
+        )
+        self.assertIs(clients.drive, self.drive_client)
+        self.assertIs(clients.sheets, self.sheets_client)
+
+    def test_metadata_and_sheets_factory_rejects_overbroad_drive_scope(self) -> None:
+        with self.assertRaisesRegex(ConfigError, "drive_metadata_scope_unavailable"):
+            self._create_metadata_clients(self.settings)
+        self.from_service_account_file.assert_not_called()
+        self.build.assert_not_called()
+
+    def test_sheets_only_factory_uses_only_sheets_scope_and_service(self) -> None:
+        sheets = self._create_sheets_only()
+
+        self.from_service_account_file.assert_called_once_with(
+            str(self.settings.resolved_service_account_file),
+            scopes=[GOOGLE_SHEETS_READONLY_SCOPE],
+        )
+        self.build.assert_called_once_with(
+            "sheets",
+            "v4",
+            http=self.authorized_http,
+            cache_discovery=False,
+        )
+        self.assertNotIn("drive", str(self.build.call_args_list).lower())
+        self.assertIs(sheets, self.sheets_client)
+
+    def test_sheets_only_factory_rejects_invalid_sheets_scope_before_auth(self) -> None:
+        settings = replace(
+            self.settings,
+            drive_scope=GOOGLE_DRIVE_METADATA_READONLY_SCOPE,
+            sheets_scope="https://www.googleapis.com/auth/spreadsheets",
+        )
+
+        with self.assertRaisesRegex(ConfigError, "GOOGLE_SHEETS_SCOPE"):
+            self._create_sheets_only(settings)
+        self.from_service_account_file.assert_not_called()
+        self.build.assert_not_called()
 
 
 if __name__ == "__main__":

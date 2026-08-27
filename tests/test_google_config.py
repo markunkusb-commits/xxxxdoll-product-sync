@@ -11,9 +11,11 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from sync_worker.config import (  # noqa: E402
     ConfigError,
+    GOOGLE_DRIVE_METADATA_READONLY_SCOPE,
     GOOGLE_DRIVE_READONLY_SCOPE,
     GOOGLE_SHEETS_READONLY_SCOPE,
     load_google_config,
+    load_google_sheets_readonly_config,
 )
 
 
@@ -158,6 +160,52 @@ class GoogleConfigTests(unittest.TestCase):
                     load_google_config(
                         {**self.valid, "GOOGLE_PROXY_RDNS": value}
                     )
+
+    def test_sheets_only_accepts_drive_metadata_scope(self) -> None:
+        settings = load_google_sheets_readonly_config(
+            {
+                **self.valid,
+                "GOOGLE_DRIVE_SCOPE": GOOGLE_DRIVE_METADATA_READONLY_SCOPE,
+            }
+        )
+        self.assertEqual(
+            settings.drive_scope, GOOGLE_DRIVE_METADATA_READONLY_SCOPE
+        )
+        self.assertEqual(settings.sheets_scope, GOOGLE_SHEETS_READONLY_SCOPE)
+
+    def test_sheets_only_does_not_require_drive_scope_or_folder_ids(self) -> None:
+        settings = load_google_sheets_readonly_config(
+            {
+                **self.valid,
+                "GOOGLE_DRIVE_SCOPE": "",
+                "CLM_DRIVE_FOLDER_ID": "",
+                "MD_DRIVE_FOLDER_ID": "",
+            }
+        )
+        self.assertEqual(settings.drive_scope, "")
+        self.assertEqual(settings.clm_drive_folder_id, "")
+        self.assertEqual(settings.md_drive_folder_id, "")
+
+    def test_sheets_only_rejects_invalid_sheets_scope(self) -> None:
+        with self.assertRaisesRegex(ConfigError, "GOOGLE_SHEETS_SCOPE"):
+            load_google_sheets_readonly_config(
+                {
+                    **self.valid,
+                    "GOOGLE_DRIVE_SCOPE": GOOGLE_DRIVE_METADATA_READONLY_SCOPE,
+                    "GOOGLE_SHEETS_SCOPE": (
+                        "https://www.googleapis.com/auth/spreadsheets"
+                    ),
+                }
+            )
+
+    def test_full_validation_still_rejects_metadata_drive_scope(self) -> None:
+        with self.assertRaisesRegex(ConfigError, "GOOGLE_DRIVE_SCOPE"):
+            load_google_config(
+                {
+                    **self.valid,
+                    "GOOGLE_DRIVE_SCOPE": GOOGLE_DRIVE_METADATA_READONLY_SCOPE,
+                }
+            )
 
 
 if __name__ == "__main__":

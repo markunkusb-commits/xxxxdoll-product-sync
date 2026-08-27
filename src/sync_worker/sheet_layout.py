@@ -10,8 +10,8 @@ from dataclasses import dataclass
 
 from .config import GoogleSettings
 from .google_api import (
-    GoogleClientFactory,
-    ReadOnlyGoogleGateway,
+    GoogleSheetsReadonlyClientFactory,
+    ReadOnlySheetsGateway,
     google_redactor_for_settings,
 )
 from .sanitization import REPORT_SECRET_SCAN_PATTERN, Redactor
@@ -237,7 +237,7 @@ class SheetLayoutInspector:
     def __init__(
         self,
         settings: GoogleSettings,
-        factory: GoogleClientFactory,
+        factory: GoogleSheetsReadonlyClientFactory,
         *,
         sheet_title: str,
         a1_range: str,
@@ -281,6 +281,8 @@ class SheetLayoutInspector:
             "merged_ranges": [],
             "row_summary": [],
             "read_requests_performed": 0,
+            "drive_requests_performed": 0,
+            "download_requests_performed": 0,
             "write_requests_performed": 0,
             "warnings": self._warnings,
             "errors": self._errors,
@@ -418,12 +420,14 @@ class SheetLayoutInspector:
     def _finalize(
         self,
         report: dict[str, object],
-        gateway: ReadOnlyGoogleGateway | None,
+        gateway: ReadOnlySheetsGateway | None,
     ) -> dict[str, object]:
         report["read_requests_performed"] = (
             gateway.counters.read_requests_performed if gateway is not None else 0
         )
         report["write_requests_performed"] = 0
+        report["drive_requests_performed"] = 0
+        report["download_requests_performed"] = 0
         report["warnings"] = self._warnings
         report["errors"] = self._errors
         report["status"] = "error" if self._errors else "ok"
@@ -439,16 +443,16 @@ class SheetLayoutInspector:
         return sanitized
 
     def run(self) -> dict[str, object]:
-        self._settings.validate()
+        self._settings.validate_sheets_readonly()
         report = self._base_report()
         self._log("sheet_layout_started")
         try:
-            clients = self._factory.create(self._settings)
+            sheets = self._factory.create_sheets_readonly(self._settings)
         except Exception as error:
             self._record_error("google_client_creation", error)
             return self._finalize(report, None)
 
-        gateway = ReadOnlyGoogleGateway(clients)
+        gateway = ReadOnlySheetsGateway(sheets)
         try:
             payload = gateway.inspect_sheet_layout(
                 self._settings.clm_spreadsheet_id,

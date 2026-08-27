@@ -6,9 +6,14 @@ import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Literal
+from urllib.parse import urlsplit
 
 from .config import GoogleSettings
-from .google_api import GoogleClientFactory, ReadOnlyGoogleGateway
+from .google_api import (
+    GoogleClients,
+    GoogleSheetsReadonlyClientFactory,
+    ReadOnlySheetsGateway,
+)
 from .image_mapping import (
     PHOTO_DOWNLOAD_LINK_MARKER,
     ProductSourceRange,
@@ -38,7 +43,13 @@ ReferenceReadStatus = Literal[
     "media_reference_cell_missing",
     "empty_media_reference",
     "invalid_media_reference_cell",
+    "ambiguous_media_hyperlink",
+    "ambiguous_media_smart_chip",
+    "dynamic_hyperlink_formula_unsupported",
+    "unsupported_hyperlink_formula",
+    "media_reference_link_missing",
 ]
+FormulaFunction = Literal["HYPERLINK", "IMAGE", "OTHER", "NONE"]
 ReferenceVerification = Literal[
     "verified_unchanged",
     "reference_changed_since_mapping",
@@ -74,6 +85,13 @@ class SecureMediaReferenceReadResult:
     reference_verification: ReferenceVerification
     fresh_reference_fingerprint: str | None
     raw_reference: str | None = field(repr=False)
+    cell_level_link_present: bool = False
+    formula_present: bool = False
+    formula_function: FormulaFunction = "NONE"
+    formula_is_hyperlink: bool = False
+    smart_chip_present: bool = False
+    smart_chip_rich_link_count: int = 0
+    smart_chip_unique_uri: bool = False
     warnings: tuple[str, ...] = ()
     blocking_issues: tuple[str, ...] = ()
 
@@ -269,94 +287,417 @@ def validate_mapping_report(
     )
 
 
-def _returned_coordinate(value: object, sheet_title: str) -> str | None:
-    if not isinstance(value, str) or value.count("!") != 1:
+def _column_name(zero_based_column: int) -> str:
+    value = zero_based_column + 1
+    characters: list[str] = []
+    while value:
+        value, remainder = divmod(value - 1, 26)
+        characters.append(chr(ord("A") + remainder))
+    return "".join(reversed(characters))
+
+
+def _grid_coordinate(grid: Mapping[str, object]) -> str | None:
+    raw_row = grid.get("startRow", 0)
+    raw_column = grid.get("startColumn", 0)
+    if (
+        type(raw_row) is not int
+        or raw_row < 0
+        or type(raw_column) is not int
+        or raw_column < 0
+    ):
         return None
-    returned_sheet, coordinate = value.split("!", 1)
-    if returned_sheet.startswith("'") and returned_sheet.endswith("'"):
-        returned_sheet = returned_sheet[1:-1].replace("''", "'")
-    if returned_sheet != sheet_title:
-        return None
-    try:
-        return validate_single_cell_coordinate(coordinate)
-    except SecureMediaReferenceInputError:
-        return None
+    return f"{_column_name(raw_column)}{raw_row + 1}"
+
+
+def _grid_cell_data(grid: Mapping[str, object]) -> Mapping[str, object]:
+    row_data = grid.get("rowData", [])
+    if not isinstance(row_data, list) or len(row_data) > 1:
+        raise SecureMediaReferenceResponseError(
+            "invalid_media_reference_grid_response"
+        )
+    if not row_data:
+        return {}
+    row = row_data[0]
+    if not isinstance(row, Mapping):
+        raise SecureMediaReferenceResponseError(
+            "invalid_media_reference_grid_response"
+        )
+    values = row.get("values", [])
+    if not isinstance(values, list) or len(values) > 1:
+        raise SecureMediaReferenceResponseError(
+            "invalid_media_reference_grid_response"
+        )
+    if not values:
+        return {}
+    cell = values[0]
+    if not isinstance(cell, Mapping):
+        raise SecureMediaReferenceResponseError(
+            "invalid_media_reference_grid_response"
+        )
+    return cell
 
 
 def _response_by_coordinate(
     response: object,
     *,
-    sheet_title: str,
     requested: frozenset[str],
 ) -> Mapping[str, Mapping[str, object]]:
     if not isinstance(response, Mapping):
         raise SecureMediaReferenceResponseError(
             "invalid_media_reference_batch_response"
         )
-    raw_ranges = response.get("valueRanges")
-    if not isinstance(raw_ranges, list):
+    raw_sheets = response.get("sheets")
+    if not isinstance(raw_sheets, list):
         raise SecureMediaReferenceResponseError(
             "invalid_media_reference_batch_response"
         )
     indexed: dict[str, Mapping[str, object]] = {}
-    for raw_range in raw_ranges:
-        if not isinstance(raw_range, Mapping):
+    for raw_sheet in raw_sheets:
+        if not isinstance(raw_sheet, Mapping):
             raise SecureMediaReferenceResponseError(
                 "invalid_media_reference_batch_response"
             )
-        coordinate = _returned_coordinate(raw_range.get("range"), sheet_title)
-        if coordinate is None or coordinate not in requested:
+        raw_grids = raw_sheet.get("data", [])
+        if not isinstance(raw_grids, list):
             raise SecureMediaReferenceResponseError(
-                "unexpected_media_reference_batch_range"
+                "invalid_media_reference_batch_response"
             )
-        if coordinate in indexed:
-            raise SecureMediaReferenceResponseError(
-                "duplicate_media_reference_batch_range"
-            )
-        indexed[coordinate] = raw_range
+        for raw_grid in raw_grids:
+            if not isinstance(raw_grid, Mapping):
+                raise SecureMediaReferenceResponseError(
+                    "invalid_media_reference_batch_response"
+                )
+            coordinate = _grid_coordinate(raw_grid)
+            if coordinate is None or coordinate not in requested:
+                raise SecureMediaReferenceResponseError(
+                    "unexpected_media_reference_batch_range"
+                )
+            if coordinate in indexed:
+                raise SecureMediaReferenceResponseError(
+                    "duplicate_media_reference_batch_range"
+                )
+            indexed[coordinate] = _grid_cell_data(raw_grid)
     return indexed
 
 
-def _cell_value(
-    response_range: Mapping[str, object],
-) -> tuple[ReferenceReadStatus, str | None, tuple[str, ...]]:
-    if "values" not in response_range:
-        return (
-            "media_reference_cell_missing",
-            None,
-            ("media_reference_cell_missing",),
-        )
-    values = response_range.get("values")
-    if not isinstance(values, list) or not values:
-        return (
-            "media_reference_cell_missing",
-            None,
-            ("media_reference_cell_missing",),
-        )
-    if (
-        len(values) != 1
-        or not isinstance(values[0], list)
-        or len(values[0]) != 1
-    ):
-        return (
-            "invalid_media_reference_cell",
-            None,
-            ("invalid_media_reference_cell",),
-        )
-    value = values[0][0]
+def _valid_link_uri(value: object) -> str | None:
     if not isinstance(value, str):
+        return None
+    normalized = value.strip()
+    if not normalized or any(character.isspace() for character in normalized):
+        return None
+    if any(ord(character) < 32 for character in normalized):
+        return None
+    try:
+        parsed = urlsplit(normalized)
+    except ValueError:
+        return None
+    return normalized if parsed.scheme else None
+
+
+def _rich_text_links(cell: Mapping[str, object]) -> tuple[str, ...]:
+    raw_runs = cell.get("textFormatRuns", [])
+    if not isinstance(raw_runs, list):
+        return ()
+    links: list[str] = []
+    for raw_run in raw_runs:
+        if not isinstance(raw_run, Mapping):
+            continue
+        raw_format = raw_run.get("format")
+        if not isinstance(raw_format, Mapping):
+            continue
+        raw_link = raw_format.get("link")
+        if not isinstance(raw_link, Mapping):
+            continue
+        uri = _valid_link_uri(raw_link.get("uri"))
+        if uri is not None and uri not in links:
+            links.append(uri)
+    return tuple(links)
+
+
+def _cell_level_link(cell: Mapping[str, object]) -> str | None:
+    raw_format = cell.get("userEnteredFormat")
+    if not isinstance(raw_format, Mapping):
+        return None
+    text_format = raw_format.get("textFormat")
+    if not isinstance(text_format, Mapping):
+        return None
+    raw_link = text_format.get("link")
+    if not isinstance(raw_link, Mapping):
+        return None
+    return _valid_link_uri(raw_link.get("uri"))
+
+
+def _formula_diagnostic(cell: Mapping[str, object]) -> tuple[bool, FormulaFunction]:
+    raw_value = cell.get("userEnteredValue")
+    if not isinstance(raw_value, Mapping):
+        return False, "NONE"
+    formula = raw_value.get("formulaValue")
+    if not isinstance(formula, str) or not formula.strip():
+        return False, "NONE"
+    function_match = re.match(r"^\s*=\s*([A-Za-z][A-Za-z0-9._]*)", formula)
+    if function_match is None:
+        return True, "OTHER"
+    function_name = function_match.group(1).upper()
+    if function_name == "HYPERLINK":
+        return True, "HYPERLINK"
+    if function_name == "IMAGE":
+        return True, "IMAGE"
+    return True, "OTHER"
+
+
+def _parse_formula_string_literal(
+    formula: str, start: int
+) -> tuple[str, int] | None:
+    if start >= len(formula) or formula[start] != '"':
+        return None
+    characters: list[str] = []
+    index = start + 1
+    while index < len(formula):
+        character = formula[index]
+        if character != '"':
+            characters.append(character)
+            index += 1
+            continue
+        if index + 1 < len(formula) and formula[index + 1] == '"':
+            characters.append('"')
+            index += 2
+            continue
+        return "".join(characters), index + 1
+    return None
+
+
+def _valid_optional_formula_argument(formula: str, start: int) -> bool:
+    """Validate one opaque second argument without evaluating or retaining it."""
+
+    index = start
+    while index < len(formula) and formula[index].isspace():
+        index += 1
+    if index >= len(formula) or formula[index] == ")":
+        return False
+    depth = 0
+    in_string = False
+    has_content = False
+    while index < len(formula):
+        character = formula[index]
+        if in_string:
+            if character == '"':
+                if index + 1 < len(formula) and formula[index + 1] == '"':
+                    index += 2
+                    has_content = True
+                    continue
+                in_string = False
+            index += 1
+            has_content = True
+            continue
+        if character == '"':
+            in_string = True
+            has_content = True
+            index += 1
+            continue
+        if character == "(":
+            depth += 1
+            has_content = True
+            index += 1
+            continue
+        if character == ")":
+            if depth:
+                depth -= 1
+                has_content = True
+                index += 1
+                continue
+            return has_content and not formula[index + 1 :].strip()
+        if character == "," and depth == 0:
+            return False
+        if not character.isspace():
+            has_content = True
+        index += 1
+    return False
+
+
+def _literal_hyperlink_formula(
+    formula: str,
+) -> tuple[Literal["literal", "dynamic", "unsupported"], str | None]:
+    opening = re.match(r"^\s*=\s*HYPERLINK\s*\(", formula, re.IGNORECASE)
+    if opening is None:
+        return "unsupported", None
+    index = opening.end()
+    while index < len(formula) and formula[index].isspace():
+        index += 1
+    if index >= len(formula) or formula[index] in ",)":
+        return "unsupported", None
+    if formula[index] != '"':
+        return "dynamic", None
+    parsed_literal = _parse_formula_string_literal(formula, index)
+    if parsed_literal is None:
+        return "unsupported", None
+    raw_uri, index = parsed_literal
+    uri = _valid_link_uri(raw_uri)
+    if uri is None:
+        return "unsupported", None
+    while index < len(formula) and formula[index].isspace():
+        index += 1
+    if index >= len(formula):
+        return "unsupported", None
+    if formula[index] == ")":
+        if formula[index + 1 :].strip():
+            return "unsupported", None
+        return "literal", uri
+    if formula[index] != ",":
+        return "unsupported", None
+    if not _valid_optional_formula_argument(formula, index + 1):
+        return "unsupported", None
+    return "literal", uri
+
+
+def _smart_chip_links(
+    cell: Mapping[str, object],
+) -> tuple[bool, int, tuple[str, ...]]:
+    raw_runs = cell.get("chipRuns", [])
+    if not isinstance(raw_runs, list):
+        return False, 0, ()
+    present = bool(raw_runs)
+    link_count = 0
+    links: list[str] = []
+    for raw_run in raw_runs:
+        if not isinstance(raw_run, Mapping):
+            continue
+        raw_chip = raw_run.get("chip")
+        if not isinstance(raw_chip, Mapping):
+            continue
+        rich_link = raw_chip.get("richLinkProperties")
+        if not isinstance(rich_link, Mapping):
+            continue
+        uri = _valid_link_uri(rich_link.get("uri"))
+        if uri is None:
+            continue
+        link_count += 1
+        if uri not in links:
+            links.append(uri)
+    return present, link_count, tuple(links)
+
+
+def _cell_value(
+    cell: Mapping[str, object],
+) -> tuple[
+    ReferenceReadStatus,
+    str | None,
+    tuple[str, ...],
+    bool,
+    int,
+    bool,
+    bool,
+    bool,
+    FormulaFunction,
+]:
+    def result(
+        status: ReferenceReadStatus,
+        raw_reference: str | None,
+        warnings: tuple[str, ...],
+    ) -> tuple[
+        ReferenceReadStatus,
+        str | None,
+        tuple[str, ...],
+        bool,
+        int,
+        bool,
+        bool,
+        bool,
+        FormulaFunction,
+    ]:
         return (
-            "invalid_media_reference_cell",
-            None,
-            ("invalid_media_reference_cell",),
+            status,
+            raw_reference,
+            warnings,
+            chip_present,
+            chip_link_count,
+            chip_unique,
+            cell_link is not None,
+            formula_present,
+            formula_function,
         )
-    if not value.strip():
-        return (
+
+    chip_present, chip_link_count, chip_links = _smart_chip_links(cell)
+    chip_unique = len(chip_links) == 1
+    cell_link = _cell_level_link(cell)
+    formula_present, formula_function = _formula_diagnostic(cell)
+    if not cell:
+        return result(
+            "media_reference_cell_missing",
+            None,
+            ("media_reference_cell_missing",),
+        )
+    direct_hyperlink = _valid_link_uri(cell.get("hyperlink"))
+    if direct_hyperlink is not None:
+        return result("read", direct_hyperlink, ())
+    rich_links = _rich_text_links(cell)
+    if len(rich_links) > 1:
+        return result(
+            "ambiguous_media_hyperlink",
+            None,
+            ("ambiguous_media_hyperlink",),
+        )
+    if len(rich_links) == 1:
+        return result("read", rich_links[0], ())
+    if cell_link is not None:
+        return result("read", cell_link, ())
+    if len(chip_links) > 1:
+        return result(
+            "ambiguous_media_smart_chip",
+            None,
+            ("ambiguous_media_smart_chip",),
+        )
+    if len(chip_links) == 1:
+        return result("read", chip_links[0], ())
+    if formula_function == "HYPERLINK":
+        raw_formula = cell.get("userEnteredValue")
+        formula = (
+            raw_formula.get("formulaValue")
+            if isinstance(raw_formula, Mapping)
+            else None
+        )
+        if isinstance(formula, str):
+            formula_status, formula_uri = _literal_hyperlink_formula(formula)
+            if formula_status == "literal" and formula_uri is not None:
+                return result("read", formula_uri, ())
+            if formula_status == "dynamic":
+                return result(
+                    "dynamic_hyperlink_formula_unsupported",
+                    None,
+                    ("dynamic_hyperlink_formula_unsupported",),
+                )
+        return result(
+            "unsupported_hyperlink_formula",
+            None,
+            ("unsupported_hyperlink_formula",),
+        )
+    formatted_value = cell.get("formattedValue")
+    if formatted_value is None or formatted_value == "":
+        return result(
             "empty_media_reference",
             None,
             ("empty_media_reference",),
         )
-    return "read", value, ()
+    if not isinstance(formatted_value, str):
+        return result(
+            "invalid_media_reference_cell",
+            None,
+            ("invalid_media_reference_cell",),
+        )
+    normalized = formatted_value.strip()
+    if not normalized:
+        return result(
+            "empty_media_reference",
+            None,
+            ("empty_media_reference",),
+        )
+    if normalized.startswith("https://") or normalized.startswith("http://"):
+        return result("read", normalized, ())
+    return result(
+        "media_reference_link_missing",
+        None,
+        ("media_reference_link_missing",),
+    )
 
 
 def _read_result(
@@ -373,7 +714,17 @@ def _read_result(
             warnings=("media_reference_response_missing",),
             blocking_issues=("media_reference_response_missing",),
         )
-    read_status, raw_reference, read_warnings = _cell_value(response_range)
+    (
+        read_status,
+        raw_reference,
+        read_warnings,
+        smart_chip_present,
+        smart_chip_rich_link_count,
+        smart_chip_unique_uri,
+        cell_level_link_present,
+        formula_present,
+        formula_function,
+    ) = _cell_value(response_range)
     if read_status != "read" or raw_reference is None:
         return SecureMediaReferenceReadResult(
             mapped_source=mapped,
@@ -381,6 +732,13 @@ def _read_result(
             reference_verification="not_read",
             fresh_reference_fingerprint=None,
             raw_reference=None,
+            cell_level_link_present=cell_level_link_present,
+            formula_present=formula_present,
+            formula_function=formula_function,
+            formula_is_hyperlink=formula_function == "HYPERLINK",
+            smart_chip_present=smart_chip_present,
+            smart_chip_rich_link_count=smart_chip_rich_link_count,
+            smart_chip_unique_uri=smart_chip_unique_uri,
             warnings=read_warnings,
             blocking_issues=read_warnings,
         )
@@ -414,21 +772,31 @@ def _read_result(
         reference_verification=verification,
         fresh_reference_fingerprint=fresh_fingerprint,
         raw_reference=raw_reference,
+        cell_level_link_present=cell_level_link_present,
+        formula_present=formula_present,
+        formula_function=formula_function,
+        formula_is_hyperlink=formula_function == "HYPERLINK",
+        smart_chip_present=smart_chip_present,
+        smart_chip_rich_link_count=smart_chip_rich_link_count,
+        smart_chip_unique_uri=smart_chip_unique_uri,
         warnings=warnings,
         blocking_issues=blockers,
     )
 
 
 class SecureMediaReferenceReader:
-    """Read approved cells with one Sheets batchGet and no write surface."""
+    """Read approved hyperlink cells with one Sheets metadata GET."""
 
     def __init__(
         self,
         settings: GoogleSettings,
-        client_factory: GoogleClientFactory,
+        client_factory: GoogleSheetsReadonlyClientFactory | None,
+        *,
+        clients: GoogleClients | None = None,
     ) -> None:
         self._settings = settings
         self._client_factory = client_factory
+        self._clients = clients
 
     def run(
         self,
@@ -445,20 +813,25 @@ class SecureMediaReferenceReader:
                 read_requests_performed=0,
                 write_requests_performed=0,
             )
-        self._settings.validate()
-        clients = self._client_factory.create(self._settings)
-        gateway = ReadOnlyGoogleGateway(clients)
+        clients = self._clients
+        if clients is None:
+            self._settings.validate_sheets_readonly()
+            if self._client_factory is None:
+                raise TypeError("client_factory is required when clients are not supplied")
+            sheets = self._client_factory.create_sheets_readonly(self._settings)
+        else:
+            sheets = clients.sheets
+        gateway = ReadOnlySheetsGateway(sheets)
         coordinates = tuple(
             item.reference_coordinate for item in mapped_sources
         )
-        response = gateway.batch_get_sheet_cells(
+        response = gateway.batch_get_sheet_link_cells(
             self._settings.clm_spreadsheet_id,
             validated_sheet,
             coordinates,
         )
         response_by_coordinate = _response_by_coordinate(
             response,
-            sheet_title=validated_sheet,
             requested=frozenset(coordinates),
         )
         results = tuple(

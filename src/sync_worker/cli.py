@@ -11,12 +11,20 @@ from pathlib import Path
 
 from .additional_option_dry_run import run_additional_option_dry_run
 from .category_mapping_dry_run import run_category_mapping_dry_run
-from .config import load_config, load_google_config
+from .config import (
+    load_config,
+    load_google_config,
+    load_google_drive_metadata_config,
+    load_google_sheets_readonly_config,
+)
 from .clm_price_dry_run import run_clm_parser_dry_run
 from .doctor import DoctorRunner
 from .http_client import ReadOnlyHttpClient
 from .google_api import OfficialGoogleClientFactory, google_redactor_for_settings
 from .google_doctor import GoogleDoctorRunner
+from .google_drive_folder_manifest_dry_run import (
+    run_drive_folder_manifest_dry_run,
+)
 from .inspect_product import (
     ReferenceProductInspector,
     reference_product_report_filename,
@@ -332,7 +340,7 @@ def _run_inspect_sheet_layout(
     try:
         validated_sheet = validate_sheet_title(sheet_title)
         validated_range = parse_a1_range(a1_range).a1
-        settings = load_google_config()
+        settings = load_google_sheets_readonly_config()
     except Exception as error:
         _log_failure(logger, error, event="inspect_sheet_layout_aborted")
         return 2
@@ -570,7 +578,7 @@ def _run_discover_mapped_media_sources(
     sku_report_input_path: Path | None,
 ) -> int:
     try:
-        settings = load_google_config()
+        settings = load_google_sheets_readonly_config()
     except Exception as error:
         _log_failure(
             logger,
@@ -613,6 +621,60 @@ def _run_discover_mapped_media_sources(
                     "read_requests_performed", 0
                 ),
                 "network_requests_performed": 0,
+                "write_requests_performed": 0,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+    )
+    return 0 if report.get("status") == "ok" else 1
+
+
+def _run_build_drive_folder_manifests(
+    logger: logging.Logger,
+    mapping_input_path: Path,
+    sheet_title: str,
+    sku_report_input_path: Path,
+) -> int:
+    try:
+        settings = load_google_drive_metadata_config()
+    except Exception as error:
+        _log_failure(
+            logger, error, event="drive_folder_manifest_dry_run_aborted"
+        )
+        return 2
+    redactor = google_redactor_for_settings(settings)
+    try:
+        report, _ = run_drive_folder_manifest_dry_run(
+            mapping_input_path,
+            sheet_title,
+            sku_report_input_path,
+            settings,
+            OfficialGoogleClientFactory(),
+            project_root=PROJECT_ROOT,
+            redactor=redactor,
+        )
+    except Exception as error:
+        logger.error(
+            json.dumps(
+                {
+                    "event": "drive_folder_manifest_dry_run_aborted",
+                    "error": redactor.exception(error),
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        )
+        return 2
+    summary = report.get("summary", {})
+    logger.info(
+        json.dumps(
+            {
+                "event": "drive_folder_manifest_dry_run_report_written",
+                "path": "reports/google-drive-folder-manifest-dry-run.json",
+                "status": report.get("status"),
+                "summary": summary,
+                "download_requests_performed": 0,
                 "write_requests_performed": 0,
             },
             ensure_ascii=False,
@@ -1014,6 +1076,31 @@ def build_parser() -> argparse.ArgumentParser:
         dest="sku_report_input_path",
         help="Optional regenerated SKU dry-run JSON file",
     )
+    build_drive_folder_manifests = subcommands.add_parser(
+        "build-drive-folder-manifests",
+        help="Build metadata-only manifests for exact mapped Drive folders",
+    )
+    build_drive_folder_manifests.add_argument(
+        "--mapping",
+        required=True,
+        type=Path,
+        dest="mapping_input_path",
+        help="Local Image Mapping dry-run JSON file",
+    )
+    build_drive_folder_manifests.add_argument(
+        "--sheet",
+        required=True,
+        type=_sheet_title_argument,
+        dest="sheet_title",
+        help="Exact Google Sheet title containing mapped reference cells",
+    )
+    build_drive_folder_manifests.add_argument(
+        "--sku-report",
+        required=True,
+        type=Path,
+        dest="sku_report_input_path",
+        help="Local verified SKU dry-run JSON file",
+    )
     link_product_options = subcommands.add_parser(
         "link-product-options",
         help="Link local Product and Additional Option dry-run reports",
@@ -1188,6 +1275,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     if arguments.command == "discover-mapped-media-sources":
         return _run_discover_mapped_media_sources(
+            logger,
+            arguments.mapping_input_path,
+            arguments.sheet_title,
+            arguments.sku_report_input_path,
+        )
+    if arguments.command == "build-drive-folder-manifests":
+        return _run_build_drive_folder_manifests(
             logger,
             arguments.mapping_input_path,
             arguments.sheet_title,

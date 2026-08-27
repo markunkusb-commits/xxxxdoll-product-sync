@@ -139,6 +139,7 @@ class ConfigTests(unittest.TestCase):
             for line in (PROJECT_ROOT / ".env.example").read_text(
                 encoding="utf-8"
             ).splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
         )
 
         self.assertEqual(

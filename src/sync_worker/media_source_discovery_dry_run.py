@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
 from .config import GoogleSettings
-from .google_api import GoogleClientFactory
+from .google_api import GoogleSheetsReadonlyClientFactory
 from .media_source_discovery import (
     MediaSourceDiscoveryResult,
     discover_media_source,
@@ -278,6 +278,29 @@ def _unique(values: Sequence[str]) -> tuple[str, ...]:
     return tuple(dict.fromkeys(values))
 
 
+def discover_from_secure_read_result(
+    read_result: SecureMediaReferenceReadResult,
+    sku_result: SkuGenerationResult | None,
+) -> MediaSourceDiscoveryResult | None:
+    """Classify only the fresh, in-memory supplier reference from Sheets.
+
+    Report projections and ``MediaSourceMappingResult`` values are deliberately
+    outside this helper's input type so their redacted reference cannot become a
+    provider-classification input.
+    """
+
+    if not isinstance(read_result, SecureMediaReferenceReadResult):
+        raise TypeError("read_result must be a SecureMediaReferenceReadResult")
+    source = read_result.to_supplier_reference()
+    if source is None:
+        return None
+    if source.raw_reference != read_result.raw_reference:
+        raise MediaSourceDiscoveryDryRunInputError(
+            "fresh_media_reference_handoff_failed"
+        )
+    return discover_media_source(source, sku_result=sku_result)
+
+
 def _result_report(
     read_result: SecureMediaReferenceReadResult,
     sku_entries: Sequence[VerifiedSkuEntry],
@@ -290,11 +313,9 @@ def _result_report(
         sku_entries,
         sku_report_provided=sku_report_provided,
     )
-    source = read_result.to_supplier_reference()
-    discovery = (
-        discover_media_source(source, sku_result=sku_result)
-        if source is not None
-        else None
+    discovery = discover_from_secure_read_result(
+        read_result,
+        sku_result,
     )
     warnings = list(read_result.warnings)
     warnings.extend(sku_warnings)
@@ -481,7 +502,7 @@ def run_media_source_discovery_dry_run(
     mapping_input_path: Path,
     sheet_title: str,
     settings: GoogleSettings,
-    client_factory: GoogleClientFactory,
+    client_factory: GoogleSheetsReadonlyClientFactory,
     *,
     project_root: Path,
     sku_report_input_path: Path | None = None,

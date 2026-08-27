@@ -6,21 +6,24 @@ import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
-from sync_worker.cli import build_parser  # noqa: E402
+from sync_worker.cli import build_parser, main  # noqa: E402
 from sync_worker.config import (  # noqa: E402
     ConfigError,
-    GOOGLE_DRIVE_READONLY_SCOPE,
+    GOOGLE_DRIVE_METADATA_READONLY_SCOPE,
     GOOGLE_SHEETS_READONLY_SCOPE,
-    load_google_config,
+    load_google_sheets_readonly_config,
 )
 from sync_worker.google_api import (  # noqa: E402
     GoogleClients,
     GoogleOperationBlocked,
+    ReadOnlyGoogleGateway,
+    ReadOnlySheetsGateway,
     ensure_google_http_method_allowed,
     ensure_google_operation_allowed,
     google_redactor_for_settings,
@@ -70,13 +73,20 @@ class FakeSheets:
 
 
 class FakeFactory:
-    def __init__(self, clients: GoogleClients) -> None:
-        self.clients = clients
+    def __init__(self, sheets: FakeSheets) -> None:
+        self.sheets = sheets
         self.calls = 0
+        self.full_create_calls = 0
+        self.drive_client_created = False
 
-    def create(self, settings: object) -> GoogleClients:
+    def create_sheets_readonly(self, settings: object) -> object:
         self.calls += 1
-        return self.clients
+        settings.validate_sheets_readonly()
+        return self.sheets
+
+    def create(self, settings: object) -> object:
+        self.full_create_calls += 1
+        raise AssertionError("full Google client factory must not be used")
 
 
 def _row_values(length: int, entries: dict[int, dict[str, object]]) -> list[object]:
@@ -94,16 +104,16 @@ class SheetLayoutTests(unittest.TestCase):
         self.values = {
             "GOOGLE_SERVICE_ACCOUNT_FILE": str(credentials_path),
             "CLM_SPREADSHEET_ID": "spreadsheet_secret_ID_1234567890",
-            "CLM_DRIVE_FOLDER_ID": "clm_folder_ID_1234567890",
-            "MD_DRIVE_FOLDER_ID": "md_folder_ID_1234567890",
-            "GOOGLE_DRIVE_SCOPE": GOOGLE_DRIVE_READONLY_SCOPE,
+            "CLM_DRIVE_FOLDER_ID": "",
+            "MD_DRIVE_FOLDER_ID": "",
+            "GOOGLE_DRIVE_SCOPE": GOOGLE_DRIVE_METADATA_READONLY_SCOPE,
             "GOOGLE_SHEETS_SCOPE": GOOGLE_SHEETS_READONLY_SCOPE,
             "GOOGLE_PROXY_MODE": "socks5",
             "GOOGLE_PROXY_HOST": "127.0.0.1",
             "GOOGLE_PROXY_PORT": "26001",
             "GOOGLE_PROXY_RDNS": "true",
         }
-        self.settings = load_google_config(self.values)
+        self.settings = load_google_sheets_readonly_config(self.values)
         row_8 = _row_values(
             32,
             {
@@ -201,9 +211,7 @@ class SheetLayoutTests(unittest.TestCase):
             ],
         }
         self.spreadsheets = FakeSpreadsheets(self.response)
-        self.factory = FakeFactory(
-            GoogleClients(drive=object(), sheets=FakeSheets(self.spreadsheets))
-        )
+        self.factory = FakeFactory(FakeSheets(self.spreadsheets))
 
     def tearDown(self) -> None:
         self.temporary_directory.cleanup()
@@ -221,6 +229,62 @@ class SheetLayoutTests(unittest.TestCase):
             a1_range=a1_range,
             redactor=google_redactor_for_settings(self.settings),
         ).run()
+
+    def test_inspector_uses_sheets_gateway_without_dummy_drive(self) -> None:
+        with patch(
+            "sync_worker.sheet_layout.ReadOnlySheetsGateway",
+            wraps=ReadOnlySheetsGateway,
+        ) as gateway:
+            report = self._run()
+        gateway.assert_called_once_with(self.factory.sheets)
+        self.assertEqual(report["read_requests_performed"], 1)
+        self.assertEqual(report["drive_requests_performed"], 0)
+        self.assertEqual(report["download_requests_performed"], 0)
+        self.assertEqual(report["write_requests_performed"], 0)
+
+    def test_sheets_gateway_blocks_cross_service_and_write_execution(self) -> None:
+        gateway = ReadOnlySheetsGateway(self.factory.sheets)
+        request = MagicMock()
+        for operation in (
+            "drive.files.get", "drive.files.list", "drive.files.create",
+            "drive.files.update", "drive.files.delete", "drive.files.get_media",
+            "drive.files.export", "sheets.spreadsheets.batchUpdate",
+            "sheets.values.update", "sheets.values.append",
+        ):
+            with self.subTest(operation=operation):
+                with self.assertRaises(GoogleOperationBlocked):
+                    gateway._execute(operation, request)
+        request.execute.assert_not_called()
+        self.assertEqual(gateway.counters.read_requests_performed, 0)
+        self.assertEqual(gateway.counters.write_requests_performed, 0)
+
+    def test_temporary_diagnostic_queries_are_removed_from_gateways(self) -> None:
+        for gateway_type in (ReadOnlySheetsGateway, ReadOnlyGoogleGateway):
+            for method in (
+                "batch_get_sheet_cell_shapes",
+                "batch_get_sheet_values_for_parity",
+                "batch_get_sheet_grid_strings_for_parity",
+            ):
+                with self.subTest(gateway=gateway_type.__name__, method=method):
+                    self.assertFalse(hasattr(gateway_type, method))
+
+    def test_legacy_gateway_retains_exact_values_batch_read(self) -> None:
+        drive = MagicMock()
+        sheets = MagicMock()
+        values = sheets.spreadsheets.return_value.values.return_value
+        values.batchGet.return_value.execute.return_value = {"valueRanges": []}
+        gateway = ReadOnlyGoogleGateway(GoogleClients(drive=drive, sheets=sheets))
+        response = gateway.batch_get_sheet_cells("mock-id", "Mock Sheet", ["I12"])
+        self.assertEqual(response, {"valueRanges": []})
+        values.batchGet.assert_called_once_with(
+            spreadsheetId="mock-id",
+            ranges=["'Mock Sheet'!I12"],
+            majorDimension="ROWS",
+            valueRenderOption="FORMATTED_VALUE",
+        )
+        drive.files.assert_not_called()
+        self.assertEqual(gateway.counters.read_requests_performed, 1)
+        self.assertEqual(gateway.counters.write_requests_performed, 0)
 
     def test_cli_parses_required_sheet_and_range(self) -> None:
         arguments = build_parser().parse_args(
@@ -328,6 +392,8 @@ class SheetLayoutTests(unittest.TestCase):
         ):
             self.assertNotIn(forbidden, fields)
         self.assertEqual(report["read_requests_performed"], 1)
+        self.assertEqual(report["drive_requests_performed"], 0)
+        self.assertEqual(report["download_requests_performed"], 0)
         self.assertEqual(report["write_requests_performed"], 0)
 
     def test_formatted_values_and_absolute_coordinates_are_preserved(self) -> None:
@@ -564,7 +630,7 @@ class SheetLayoutTests(unittest.TestCase):
     def test_google_safety_failure_prevents_client_creation(self) -> None:
         unsafe = replace(
             self.settings,
-            drive_scope="https://www.googleapis.com/auth/drive",
+            sheets_scope="https://www.googleapis.com/auth/spreadsheets",
         )
         inspector = SheetLayoutInspector(
             unsafe,
@@ -573,11 +639,77 @@ class SheetLayoutTests(unittest.TestCase):
             a1_range="A1:B2",
         )
 
-        with self.assertRaisesRegex(ConfigError, "GOOGLE_DRIVE_SCOPE"):
+        with self.assertRaisesRegex(ConfigError, "GOOGLE_SHEETS_SCOPE"):
             inspector.run()
 
         self.assertEqual(self.factory.calls, 0)
         self.assertEqual(self.spreadsheets.get_calls, [])
+
+    def test_sheets_only_accepts_metadata_scope_without_drive_folder_ids(self) -> None:
+        report = self._run(a1_range="A1:B2")
+
+        self.assertEqual(
+            self.settings.drive_scope, GOOGLE_DRIVE_METADATA_READONLY_SCOPE
+        )
+        self.assertEqual(self.settings.clm_drive_folder_id, "")
+        self.assertEqual(self.settings.md_drive_folder_id, "")
+        self.assertEqual(report["status"], "ok")
+
+    def test_inspector_does_not_validate_drive_scope(self) -> None:
+        sheets_only = replace(self.settings, drive_scope="not-used-by-sheets")
+        report = SheetLayoutInspector(
+            sheets_only,
+            self.factory,
+            sheet_title="RMB Price List",
+            a1_range="A1:B2",
+            redactor=google_redactor_for_settings(sheets_only),
+        ).run()
+
+        self.assertEqual(report["status"], "ok")
+        self.assertEqual(report["drive_requests_performed"], 0)
+
+    def test_inspector_uses_only_sheets_factory(self) -> None:
+        report = self._run(a1_range="A1:B2")
+
+        self.assertEqual(self.factory.calls, 1)
+        self.assertEqual(self.factory.full_create_calls, 0)
+        self.assertFalse(self.factory.drive_client_created)
+        self.assertEqual(report["read_requests_performed"], 1)
+        self.assertEqual(report["drive_requests_performed"], 0)
+        self.assertEqual(report["write_requests_performed"], 0)
+
+    def test_cli_uses_sheets_only_configuration_loader(self) -> None:
+        safe_report = {
+            "status": "ok",
+            "read_requests_performed": 1,
+            "drive_requests_performed": 0,
+            "write_requests_performed": 0,
+        }
+        with (
+            patch(
+                "sync_worker.cli.load_google_sheets_readonly_config",
+                return_value=self.settings,
+            ) as sheets_loader,
+            patch(
+                "sync_worker.cli.load_google_config",
+                side_effect=AssertionError("full config loader must not be used"),
+            ) as full_loader,
+            patch("sync_worker.cli.SheetLayoutInspector") as inspector_class,
+            patch("sync_worker.cli.SafeJsonReportWriter"),
+        ):
+            inspector_class.return_value.run.return_value = safe_report
+            result = main(
+                [
+                    "inspect-sheet-layout",
+                    "--sheet",
+                    "RMB Price List",
+                    "--range",
+                    "A1:B2",
+                ]
+            )
+        self.assertEqual(result, 0)
+        sheets_loader.assert_called_once_with()
+        full_loader.assert_not_called()
 
 
 if __name__ == "__main__":

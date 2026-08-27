@@ -382,6 +382,31 @@ class GoogleSettings:
         if self.drive_scope != GOOGLE_DRIVE_METADATA_READONLY_SCOPE:
             raise ConfigError("drive_metadata_scope_unavailable")
 
+    def validate_drive_metadata_with_sheets(
+        self, *, project_root: Path = PROJECT_ROOT
+    ) -> None:
+        """Validate the exact scopes needed by the manifest reality check."""
+
+        self.validate_drive_metadata(project_root=project_root)
+        if self.sheets_scope != GOOGLE_SHEETS_READONLY_SCOPE:
+            raise ConfigError("drive_metadata_scope_unavailable")
+        if not _GOOGLE_ID_PATTERN.fullmatch(self.clm_spreadsheet_id):
+            raise ConfigError("CLM_SPREADSHEET_ID has an invalid identifier format")
+
+    def validate_sheets_readonly(
+        self, *, project_root: Path = PROJECT_ROOT
+    ) -> None:
+        """Validate only configuration required for read-only Sheets access."""
+
+        self._validate_proxy()
+        self._validate_service_account_file(project_root=project_root)
+        if not self.clm_spreadsheet_id:
+            raise ConfigError("Missing Google configuration: CLM_SPREADSHEET_ID")
+        if not _GOOGLE_ID_PATTERN.fullmatch(self.clm_spreadsheet_id):
+            raise ConfigError("CLM_SPREADSHEET_ID has an invalid identifier format")
+        if self.sheets_scope != GOOGLE_SHEETS_READONLY_SCOPE:
+            raise ConfigError("GOOGLE_SHEETS_SCOPE must be the exact read-only scope")
+
 
 def _configuration_source(
     environ: Mapping[str, str] | None,
@@ -469,4 +494,18 @@ def load_google_drive_metadata_config(
     source = _configuration_source(environ, dotenv_path)
     settings = _google_settings_from_source(source)
     settings.validate_drive_metadata(project_root=project_root)
+    return settings
+
+
+def load_google_sheets_readonly_config(
+    environ: Mapping[str, str] | None = None,
+    *,
+    dotenv_path: str | Path | None = None,
+    project_root: Path = PROJECT_ROOT,
+) -> GoogleSettings:
+    """Load only the shared proxy and read-only Sheets configuration."""
+
+    source = _configuration_source(environ, dotenv_path)
+    settings = _google_settings_from_source(source)
+    settings.validate_sheets_readonly(project_root=project_root)
     return settings

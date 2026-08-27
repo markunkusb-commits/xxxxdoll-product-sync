@@ -46,6 +46,7 @@ from tests.test_secure_media_reference_read import (  # noqa: E402
     SHEET,
     mapping_report,
     media_item,
+    metadata_response,
     product_result,
     value_range,
 )
@@ -512,7 +513,9 @@ class MediaSourceDiscoveryDryRunTests(unittest.TestCase):
             mapping_path.write_text(json.dumps(mapping_payload), encoding="utf-8")
             settings = FakeSettings()
             factory = FakeFactory(
-                {"valueRanges": [value_range("I16", "https://example.test/a.jpg")]}
+                metadata_response(
+                    value_range("I16", "https://example.test/a.jpg")
+                )
             )
             report, output = run_media_source_discovery_dry_run(
                 mapping_path,
@@ -536,7 +539,13 @@ class MediaSourceDiscoveryDryRunTests(unittest.TestCase):
             "network_requests_performed": 0,
             "write_requests_performed": 0,
         }
-        with patch("sync_worker.cli.load_google_config", return_value=object()), patch(
+        with patch(
+            "sync_worker.cli.load_google_sheets_readonly_config",
+            return_value=object(),
+        ) as sheets_loader, patch(
+            "sync_worker.cli.load_google_config",
+            side_effect=AssertionError("full config loader must not be used"),
+        ) as full_loader, patch(
             "sync_worker.cli.google_redactor_for_settings",
             return_value=Redactor(),
         ), patch(
@@ -554,6 +563,8 @@ class MediaSourceDiscoveryDryRunTests(unittest.TestCase):
             )
         self.assertEqual(exit_code, 0)
         runner.assert_called_once()
+        sheets_loader.assert_called_once_with()
+        full_loader.assert_not_called()
 
     def test_43_regenerated_sku_source_bindings_are_restored(self) -> None:
         item = sku_item("CLM-ULTRA-VICA")
@@ -572,13 +583,13 @@ class MediaSourceDiscoveryDryRunTests(unittest.TestCase):
         self.assertEqual(entries[0].product_start_row, 10)
         self.assertEqual(entries[0].result.sku, "CLM-ULTRA-VICA")
 
-    def test_44_exact_range_478_488_joins(self) -> None:
-        batch = read_batch(start_row=478, end_row=488, model="SI70CM-AR")
+    def test_44_exact_range_479_489_joins(self) -> None:
+        batch = read_batch(start_row=479, end_row=489, model="SI70CM-AR")
         skus = sku_report(
             sku_item(
                 "CLM-CLASSIC-SI70CM-AR",
-                start_row=478,
-                end_row=488,
+                start_row=479,
+                end_row=489,
                 series="classic",
                 identity="SI70CM-AR",
             )
@@ -589,13 +600,13 @@ class MediaSourceDiscoveryDryRunTests(unittest.TestCase):
             "CLM-CLASSIC-SI70CM-AR",
         )
 
-    def test_45_exact_range_489_499_joins(self) -> None:
-        batch = read_batch(start_row=489, end_row=499, model="FD160CM-MERU")
+    def test_45_exact_range_490_500_joins(self) -> None:
+        batch = read_batch(start_row=490, end_row=500, model="FD160CM-MERU")
         skus = sku_report(
             sku_item(
                 "CLM-PRO-FD160CM-MERU",
-                start_row=489,
-                end_row=499,
+                start_row=490,
+                end_row=500,
                 series="pro",
                 identity="FD160CM-MERU",
             )
@@ -608,29 +619,29 @@ class MediaSourceDiscoveryDryRunTests(unittest.TestCase):
 
     def test_46_source_order_is_irrelevant_for_multiple_ranges(self) -> None:
         first = read_batch(
-            coordinate="I480",
-            start_row=478,
-            end_row=488,
+            coordinate="I488",
+            start_row=479,
+            end_row=489,
             model="FIRST",
         ).results[0]
         second = read_batch(
-            coordinate="I491",
-            start_row=489,
-            end_row=499,
+            coordinate="I499",
+            start_row=490,
+            end_row=500,
             model="SECOND",
         ).results[0]
         batch = SecureMediaReferenceReadBatch((second, first), 2, 1, 0)
         skus = sku_report(
             sku_item(
                 "CLM-ULTRA-FIRST",
-                start_row=478,
-                end_row=488,
+                start_row=479,
+                end_row=489,
                 identity="FIRST",
             ),
             sku_item(
                 "CLM-ULTRA-SECOND",
-                start_row=489,
-                end_row=499,
+                start_row=490,
+                end_row=500,
                 identity="SECOND",
             ),
         )
@@ -772,7 +783,7 @@ class MediaSourceDiscoveryDryRunTests(unittest.TestCase):
                 encoding="utf-8",
             )
             sku_path.write_text(json.dumps(skus), encoding="utf-8")
-            factory = FakeFactory({"valueRanges": []})
+            factory = FakeFactory(metadata_response())
             with self.assertRaisesRegex(
                 MediaSourceDiscoveryDryRunInputError,
                 "sku_snapshot_mismatch",
@@ -786,6 +797,49 @@ class MediaSourceDiscoveryDryRunTests(unittest.TestCase):
                     sku_report_input_path=sku_path,
                 )
         self.assertEqual(factory.calls, 0)
+
+    def test_60_current_eight_source_ranges_join_exactly(self) -> None:
+        current_ranges = (
+            (479, 489, "I488", "MODEL-1"),
+            (490, 500, "I499", "MODEL-2"),
+            (501, 511, "I510", "MODEL-3"),
+            (512, 522, "I521", "MODEL-4"),
+            (523, 533, "I532", "MODEL-5"),
+            (534, 544, "I543", "MODEL-6"),
+            (545, 555, "I554", "MODEL-7"),
+            (556, 565, "I565", "MODEL-8"),
+        )
+        read_results = tuple(
+            read_batch(
+                coordinate=coordinate,
+                start_row=start_row,
+                end_row=end_row,
+                model=identity,
+            ).results[0]
+            for start_row, end_row, coordinate, identity in current_ranges
+        )
+        batch = SecureMediaReferenceReadBatch(read_results, 8, 1, 0)
+        skus = sku_report(
+            *(
+                sku_item(
+                    f"CLM-ULTRA-{identity}",
+                    start_row=start_row,
+                    end_row=end_row,
+                    identity=identity,
+                )
+                for start_row, end_row, _, identity in current_ranges
+            )
+        )
+        report = built_report(batch, skus=skus)
+
+        self.assertEqual(report["summary"]["sku_joined"], 8)
+        self.assertEqual(
+            [item["product_source"] for item in report["results"]],
+            [
+                {"start_row": start_row, "end_row": end_row}
+                for start_row, end_row, _, _ in current_ranges
+            ],
+        )
 
 
 if __name__ == "__main__":
