@@ -25,6 +25,9 @@ from .google_doctor import GoogleDoctorRunner
 from .google_drive_folder_manifest_dry_run import (
     run_drive_folder_manifest_dry_run,
 )
+from .google_drive_nested_folder_manifest_dry_run import (
+    run_nested_drive_folder_manifest_dry_run,
+)
 from .inspect_product import (
     ReferenceProductInspector,
     reference_product_report_filename,
@@ -684,6 +687,41 @@ def _run_build_drive_folder_manifests(
     return 0 if report.get("status") == "ok" else 1
 
 
+def _run_build_nested_drive_folder_manifests(
+    logger: logging.Logger,
+    mapping_input_path: Path,
+    sheet_title: str,
+    sku_report_input_path: Path,
+) -> int:
+    try:
+        settings = load_google_drive_metadata_config()
+    except Exception as error:
+        _log_failure(logger, error, event="nested_drive_folder_manifest_dry_run_aborted")
+        return 2
+    redactor = google_redactor_for_settings(settings)
+    try:
+        report, _ = run_nested_drive_folder_manifest_dry_run(
+            mapping_input_path, sheet_title, sku_report_input_path,
+            settings, OfficialGoogleClientFactory(),
+            project_root=PROJECT_ROOT, redactor=redactor,
+        )
+    except Exception as error:
+        logger.error(json.dumps({
+            "event": "nested_drive_folder_manifest_dry_run_aborted",
+            "error": redactor.exception(error),
+        }, ensure_ascii=False, sort_keys=True))
+        return 2
+    logger.info(json.dumps({
+        "event": "nested_drive_folder_manifest_dry_run_report_written",
+        "path": "reports/google-drive-nested-folder-manifest-dry-run.json",
+        "status": report.get("status"),
+        "summary": report.get("summary", {}),
+        "download_requests_performed": 0,
+        "write_requests_performed": 0,
+    }, ensure_ascii=False, sort_keys=True))
+    return 0 if report.get("status") == "ok" else 1
+
+
 def _run_link_product_options(
     logger: logging.Logger,
     product_input_path: Path,
@@ -1101,6 +1139,22 @@ def build_parser() -> argparse.ArgumentParser:
         dest="sku_report_input_path",
         help="Local verified SKU dry-run JSON file",
     )
+    build_nested_drive_folder_manifests = subcommands.add_parser(
+        "build-nested-drive-folder-manifests",
+        help="Read fresh Root and depth-one Nested Drive metadata manifests",
+    )
+    build_nested_drive_folder_manifests.add_argument(
+        "--mapping", required=True, type=Path, dest="mapping_input_path",
+        help="Local Image Mapping dry-run JSON file (not a Root manifest report)",
+    )
+    build_nested_drive_folder_manifests.add_argument(
+        "--sheet", required=True, type=_sheet_title_argument, dest="sheet_title",
+        help="Exact Google Sheet title containing mapped reference cells",
+    )
+    build_nested_drive_folder_manifests.add_argument(
+        "--sku-report", required=True, type=Path, dest="sku_report_input_path",
+        help="Local verified SKU dry-run JSON file from the same product snapshot",
+    )
     link_product_options = subcommands.add_parser(
         "link-product-options",
         help="Link local Product and Additional Option dry-run reports",
@@ -1282,6 +1336,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     if arguments.command == "build-drive-folder-manifests":
         return _run_build_drive_folder_manifests(
+            logger,
+            arguments.mapping_input_path,
+            arguments.sheet_title,
+            arguments.sku_report_input_path,
+        )
+    if arguments.command == "build-nested-drive-folder-manifests":
+        return _run_build_nested_drive_folder_manifests(
             logger,
             arguments.mapping_input_path,
             arguments.sheet_title,

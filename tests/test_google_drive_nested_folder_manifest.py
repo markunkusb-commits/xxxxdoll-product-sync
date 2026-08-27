@@ -625,9 +625,10 @@ class GoogleDriveNestedFolderManifestTests(unittest.TestCase):
             self.assertNotIn(f'"{key}"', output)
         self.assertEqual(result.summary.image_candidates, 2)
 
-    def test_81_no_nested_cli_is_registered(self):
-        from sync_worker.cli import build_parser
-        self.assertNotIn("build-nested-drive-folder-manifests", build_parser().format_help())
+    def test_81_core_keeps_cli_orchestration_outside_its_api(self):
+        from sync_worker import google_drive_nested_folder_manifest as nested_core
+        self.assertFalse(hasattr(nested_core, "main"))
+        self.assertFalse(hasattr(nested_core, "build_parser"))
 
     def test_82_provider_id_field_is_explicitly_repr_false(self):
         self.assertFalse(root_core.DriveManifestItem.__dataclass_fields__["provider_file_id"].repr)

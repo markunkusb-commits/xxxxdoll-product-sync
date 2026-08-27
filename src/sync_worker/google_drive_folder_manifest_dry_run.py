@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from .config import (
@@ -62,6 +63,19 @@ _SAFE_HANDLE_ERROR_CODES = frozenset(
 
 class GoogleDriveFolderManifestDryRunError(ValueError):
     """Safe orchestration/report error without provider identifiers."""
+
+
+@dataclass(frozen=True, slots=True)
+class RootDriveManifestRead:
+    """Fresh Root domain results; never use a serialized report for traversal."""
+
+    core_batch: GoogleDriveFolderManifestBatchResult
+    blocked_results: tuple[dict[str, object], ...]
+    sku_joined: int
+    sku_join_not_found: int
+    sku_join_ambiguous: int
+    drive_read_requests_performed: int
+    forbidden_values: tuple[str, ...] = field(repr=False)
 
 
 def validate_drive_manifest_scopes(settings: GoogleSettings) -> None:
@@ -217,18 +231,13 @@ def _empty_core_batch(gateway: GoogleDriveMetadataGateway) -> GoogleDriveFolderM
     return build_drive_folder_manifests_with_gateway((), gateway)
 
 
-def build_drive_folder_manifest_report(
+def read_root_drive_manifest_batch(
     read_results: Sequence[SecureMediaReferenceReadResult],
     sku_report: Mapping[str, object],
     *,
-    mapping_input_file: str,
-    sheet_title: str,
-    sku_report_input_file: str,
-    sheets_read_requests_performed: int,
     gateway: GoogleDriveMetadataGateway,
-    redactor: Redactor | None = None,
-) -> dict[str, object]:
-    """Join, discover, create handles, invoke Core, and allowlist its output."""
+) -> RootDriveManifestRead:
+    """Join, discover, create handles, and retain the fresh Root Core objects."""
 
     sku_entries = restore_verified_sku_entries(sku_report)
     handles = []
@@ -240,6 +249,8 @@ def build_drive_folder_manifest_report(
 
     for read_result in read_results:
         mapped = read_result.mapped_source
+        if isinstance(read_result.raw_reference, str) and read_result.raw_reference:
+            forbidden_values.append(read_result.raw_reference)
         sku_result, sku_warnings = join_verified_sku(
             mapped, sku_entries, sku_report_provided=True
         )
@@ -291,14 +302,47 @@ def build_drive_folder_manifest_report(
             )
         )
 
+    reads_before = gateway.counters.read_requests_performed
     core_batch = (
         build_drive_folder_manifests_with_gateway(handles, gateway)
         if handles
         else _empty_core_batch(gateway)
     )
+    forbidden_values.extend(
+        item.provider_file_id
+        for manifest in core_batch.manifests
+        for item in manifest.items
+        if item.provider_file_id
+    )
+    return RootDriveManifestRead(
+        core_batch=core_batch,
+        blocked_results=tuple(blocked_results),
+        sku_joined=sku_joined,
+        sku_join_not_found=sku_join_not_found,
+        sku_join_ambiguous=sku_join_ambiguous,
+        drive_read_requests_performed=gateway.counters.read_requests_performed - reads_before,
+        forbidden_values=tuple(forbidden_values),
+    )
+
+
+def build_drive_folder_manifest_report(
+    read_results: Sequence[SecureMediaReferenceReadResult],
+    sku_report: Mapping[str, object],
+    *,
+    mapping_input_file: str,
+    sheet_title: str,
+    sku_report_input_file: str,
+    sheets_read_requests_performed: int,
+    gateway: GoogleDriveMetadataGateway,
+    redactor: Redactor | None = None,
+) -> dict[str, object]:
+    """Project the shared in-memory Root read without changing the Root report."""
+
+    root_read = read_root_drive_manifest_batch(read_results, sku_report, gateway=gateway)
+    core_batch = root_read.core_batch
     results = [
         *(_manifest_report(item) for item in core_batch.manifests),
-        *blocked_results,
+        *root_read.blocked_results,
     ]
     results.sort(
         key=lambda item: (
@@ -308,12 +352,12 @@ def build_drive_folder_manifest_report(
         )
     )
     core_summary = core_batch.summary.to_dict()
-    drive_reads = core_batch.summary.drive_read_requests_performed
+    drive_reads = root_read.drive_read_requests_performed
     summary = {
         **core_summary,
-        "sku_joined": sku_joined,
-        "sku_join_not_found": sku_join_not_found,
-        "sku_join_ambiguous": sku_join_ambiguous,
+        "sku_joined": root_read.sku_joined,
+        "sku_join_not_found": root_read.sku_join_not_found,
+        "sku_join_ambiguous": root_read.sku_join_ambiguous,
         "sheets_read_requests_performed": sheets_read_requests_performed,
         "drive_read_requests_performed": drive_reads,
         "network_requests_performed": sheets_read_requests_performed + drive_reads,
@@ -330,11 +374,11 @@ def build_drive_folder_manifest_report(
         "summary": summary,
         "results": results,
     }
-    _assert_report_safe(report, forbidden_values=forbidden_values)
+    _assert_report_safe(report, forbidden_values=root_read.forbidden_values)
     sanitized = sanitize_report_data(report, redactor or Redactor())
     if not isinstance(sanitized, dict):
         raise TypeError("Drive folder manifest report must be an object")
-    _assert_report_safe(sanitized, forbidden_values=forbidden_values)
+    _assert_report_safe(sanitized, forbidden_values=root_read.forbidden_values)
     return sanitized
 
 
