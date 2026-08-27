@@ -88,7 +88,7 @@ python -m sync_worker google-doctor
 | `google-doctor` / `supplier-inventory` | `drive.readonly` | `spreadsheets.readonly` | Drive + Sheets |
 | `inspect-sheet-layout` / `discover-mapped-media-sources` | 不校验、不申请 | `spreadsheets.readonly` | 仅 Sheets v4 |
 | Drive metadata Core | `drive.metadata.readonly` | 不校验、不申请 | 仅 Drive v3 |
-| `build-drive-folder-manifests` / `build-nested-drive-folder-manifests` | `drive.metadata.readonly` | `spreadsheets.readonly` | Drive metadata + Sheets |
+| `build-drive-folder-manifests` / `build-nested-drive-folder-manifests` / `build-depth2-drive-folder-manifests` | `drive.metadata.readonly` | `spreadsheets.readonly` | Drive metadata + Sheets |
 
 所有路径都先检查 proxy 和项目目录外的服务账号文件。Sheets-only 还检查 Spreadsheet ID，但不要求 Drive folder IDs；纯 Drive metadata Core 不要求 Spreadsheet ID。Manifest 命令因为需要 fresh Sheets reference，会同时检查 Sheets scope 和 Spreadsheet ID。
 
@@ -151,6 +151,25 @@ python -m sync_worker build-nested-drive-folder-manifests `
 只遍历 depth 0 → 1，最多 100 个 Nested folders，复用 Core 的有界分页和重试。所有一级目录均读取，不按 Photos / Factory Photos / Videos / Banner 名称过滤。Root 和 Nested shortcuts 均不跟随；depth 2 文件夹仅记录 `nested_folder` 与 `max_traversal_depth_reached`，不再请求。共享 Nested folder 保留各产品独立 manifest，并标记 `shared_nested_folder_candidate`；不选择主图或生成图库。
 
 输出 `reports/google-drive-nested-folder-manifest-dry-run.json`，包含 `summary`、安全的 Nested `results`、失败/阻断 Root 的 `root_issues`、warnings 和 blocking issues。Summary 分别统计 Root/Nested 页数及 Sheets、Root Drive、Nested Drive 调用次数（含重试），总读取为三者之和；下载和外部写请求始终为 0。完整单页 mock 场景的 8 Root + 24 Nested 为 33 次读取，这不是固定上限。Root 读取不完整时不继续遍历该 Root；有阻断的报告标记 `partial`，CLI 返回 1；配置或批次上限等错误返回 2，不写出新的成功报告。
+
+### Depth-2 Folder Manifest Dry Run
+
+以下命令会执行受限的真实只读 metadata 请求，不是离线 parser；本阶段开发只用 mock 验证，真实运行须由人工确认：
+
+```powershell
+python -m sync_worker build-depth2-drive-folder-manifests `
+  --mapping reports/image-mapping-dry-run.json `
+  --sheet "RMB Price List" `
+  --sku-report reports/sku-dry-run.json
+```
+
+同一进程重新建立 Sheets exact-cell read → SKU exact source-range join / Media Discovery → Root → depth-1 → depth-2 domain-object 链。只加载 mapping 和 SKU 两份当前本地输入，不读取旧 Root/Nested Manifest 报告，不从 fingerprint、SKU 或文件名推断 Drive ID。各层原始 ID 仅在内存传递；输出前执行白名单投影、脱敏和已知 ID 泄漏检查。
+
+Depth-2 仅消费成功 depth-1 manifest 中 `item_kind=nested_folder` 且带 `max_traversal_depth_reached` 的实际 item，由现有 Core 验证内存 `provider_file_id`。缺失 ID 会报告阻断，不猜测；目标数量随新读取结果变化，不固定为 8。超过 50 个目标，在任何 depth-2 请求前以 `depth2_folder_batch_limit_exceeded` 停止。现有 Root/Nested 命令的深度边界不变。
+
+最大 traversal depth 为 2，depth-2 返回的更深 folder 仅记录并标记 `max_traversal_depth_reached`，绝不再次读取；所有层级 shortcuts 均不跟随。不按 Photos、Factory、Videos、Banner、Eye Options、Promo 或 Skin Tone 名称过滤，不生成 folder role 或选择主图/图库。图片候选保持 MIME 判断，包括 PSD 的现有行为；不下载、不导出、不探测媒体内容。
+
+输出为 `reports/google-drive-depth2-folder-manifest-dry-run.json`，含安全的 `results`、`summary`、上游 `root_issues` / `depth1_issues`、warnings 和 blocking issues。逐层统计 Root/Nested/Depth-2 页数和 Sheets/Root/Nested/Depth-2 API 读取次数（含分页、重试），总读取为四者之和：单页 mock 的 1 + 8 + 24 + 8 = 41 不是硬编码值。下载和外部写请求固定为 0。存在读取失败或阻断时报告 `partial`、CLI 返回 1；配置、批次上限或安全扫描失败返回 2，不覆盖已有报告。只有成功生成的新报告才能作为本次 Reality Check 依据。
 
 ## CLM RMB Price List Parser V1
 

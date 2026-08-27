@@ -7,6 +7,7 @@ objects and provider identifiers stay in memory; no Root report is reopened.
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from .config import GoogleSettings
@@ -26,6 +27,7 @@ from .google_drive_nested_folder_manifest import (
     MAX_NESTED_FOLDERS_PER_RUN,
     MAX_TRAVERSAL_DEPTH,
     GoogleDriveNestedFolderManifest,
+    GoogleDriveNestedFolderManifestBatchResult,
     GoogleDriveNestedFolderManifestError,
     build_nested_drive_folder_manifests_with_gateway,
     create_secure_google_drive_nested_folder_handle,
@@ -43,6 +45,16 @@ REPORT_FILENAME = "google-drive-nested-folder-manifest-dry-run.json"
 
 class GoogleDriveNestedFolderManifestDryRunError(GoogleDriveFolderManifestDryRunError):
     """A fixed, provider-data-free orchestration error."""
+
+
+@dataclass(frozen=True, slots=True)
+class NestedDriveManifestRead:
+    """Fresh depth-one domain results; provider identifiers remain memory-only."""
+
+    root_read: RootDriveManifestRead
+    core_batch: GoogleDriveNestedFolderManifestBatchResult
+    root_issues: tuple[dict[str, object], ...]
+    forbidden_values: tuple[str, ...] = field(repr=False)
 
 
 def _nested_manifest_report(manifest: GoogleDriveNestedFolderManifest) -> dict[str, object]:
@@ -83,17 +95,12 @@ def _root_issue(result: Mapping[str, object]) -> dict[str, object]:
     }
 
 
-def build_nested_drive_folder_manifest_report(
+def read_nested_drive_manifest_batch(
     root_read: RootDriveManifestRead,
     *,
-    mapping_input_file: str,
-    sheet_title: str,
-    sku_report_input_file: str,
-    sheets_read_requests_performed: int,
     gateway: GoogleDriveMetadataGateway,
-    redactor: Redactor | None = None,
-) -> dict[str, object]:
-    """Hand actual Root items to Nested Core, then project safe metadata only."""
+) -> NestedDriveManifestRead:
+    """Hand actual Root items to Nested Core without serializing a manifest."""
 
     if not isinstance(root_read, RootDriveManifestRead):
         raise GoogleDriveNestedFolderManifestDryRunError("fresh_root_manifest_read_required")
@@ -129,6 +136,40 @@ def build_nested_drive_folder_manifest_report(
     # One bounded call, never a loop over the returned depth-two children.
     nested_batch = build_nested_drive_folder_manifests_with_gateway(handles, gateway)
     manifests = (*nested_batch.manifests, *invalid_manifests)
+    summary = replace(
+        nested_batch.summary,
+        total_nested_folders=nested_batch.summary.total_nested_folders + len(invalid_manifests),
+        invalid_nested_folder_handles=nested_batch.summary.invalid_nested_folder_handles + len(invalid_manifests),
+    )
+    forbidden_values = (*root_read.forbidden_values, *(
+        item.provider_file_id for manifest in manifests for item in manifest.items
+        if item.provider_file_id
+    ))
+    return NestedDriveManifestRead(
+        root_read=root_read,
+        core_batch=GoogleDriveNestedFolderManifestBatchResult(manifests, summary),
+        root_issues=tuple(root_issues),
+        forbidden_values=forbidden_values,
+    )
+
+
+def build_nested_drive_folder_manifest_report(
+    root_read: RootDriveManifestRead,
+    *,
+    mapping_input_file: str,
+    sheet_title: str,
+    sku_report_input_file: str,
+    sheets_read_requests_performed: int,
+    gateway: GoogleDriveMetadataGateway,
+    redactor: Redactor | None = None,
+) -> dict[str, object]:
+    """Project the shared depth-one read without changing the existing report."""
+
+    nested_read = read_nested_drive_manifest_batch(root_read, gateway=gateway)
+    nested_batch = nested_read.core_batch
+    manifests = nested_batch.manifests
+    roots = root_read.core_batch.manifests
+    root_issues = list(nested_read.root_issues)
     results = [_nested_manifest_report(item) for item in manifests]
     results.sort(key=lambda item: (
         item["sku"], item["safe_folder_name"].casefold(),
@@ -144,8 +185,6 @@ def build_nested_drive_folder_manifest_report(
     nested_pages = counts.pop("pages_read")
     nested_reads = counts.pop("drive_read_requests_performed")
     root_reads = root_read.drive_read_requests_performed
-    counts["total_nested_folders"] += len(invalid_manifests)
-    counts["invalid_nested_folder_handles"] += len(invalid_manifests)
     summary = {
         "root_folders_processed": root_read.core_batch.summary.total_folders,
         "root_folders_listed": root_read.core_batch.summary.folders_listed,
@@ -177,10 +216,7 @@ def build_nested_drive_folder_manifest_report(
         "blocking_issues": list(blocking_issues),
         "write_requests_performed": 0,
     }
-    forbidden_values = (*root_read.forbidden_values, *(
-        item.provider_file_id for manifest in manifests for item in manifest.items
-        if item.provider_file_id
-    ))
+    forbidden_values = nested_read.forbidden_values
     _assert_report_safe(report, forbidden_values=forbidden_values)
     sanitized = sanitize_report_data(report, redactor or Redactor())
     if not isinstance(sanitized, dict):
