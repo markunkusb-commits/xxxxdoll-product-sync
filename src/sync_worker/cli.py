@@ -38,6 +38,10 @@ from .inspect_product import (
 )
 from .image_mapping_dry_run import run_image_mapping_dry_run
 from .image_asset_type_dry_run import run_image_asset_type_dry_run
+from .webp_output_policy_dry_run import (
+    WebPOutputPolicyDryRunInputError,
+    run_webp_output_policy_dry_run,
+)
 from .media_source_discovery_dry_run import (
     run_media_source_discovery_dry_run,
 )
@@ -806,6 +810,28 @@ def _run_classify_image_asset_types(
     return 0 if report.get("status") == "ok" else 1
 
 
+def _run_plan_webp_output(logger: logging.Logger, asset_report_path: Path) -> int:
+    try:
+        report, _ = run_webp_output_policy_dry_run(
+            asset_report_path, project_root=PROJECT_ROOT,
+        )
+    except WebPOutputPolicyDryRunInputError as error:
+        _log_failure(logger, error, event="webp_output_policy_dry_run_aborted")
+        return 2
+    except Exception:
+        # Never expose unexpected exceptions, input paths, requests or values.
+        _log_failure(
+            logger, ValueError("webp_output_policy_dry_run_failed"),
+            event="webp_output_policy_dry_run_aborted",
+        )
+        return 2
+    logger.info(json.dumps({
+        "event": "webp_output_policy_dry_run_report_written",
+        "status": report["status"], "summary": report["summary"],
+    }, ensure_ascii=False, sort_keys=True))
+    return 0 if report["status"] == "ok" else 1
+
+
 def _run_link_product_options(
     logger: logging.Logger,
     product_input_path: Path,
@@ -1280,6 +1306,14 @@ def build_parser() -> argparse.ArgumentParser:
             flag, required=True, type=Path, dest=dest,
             help="Local safe manifest dry-run JSON with status=ok",
         )
+    plan_webp_output = subcommands.add_parser(
+        "plan-webp-output",
+        help="Plan WebP processing from a safe local asset-type report; no media I/O",
+    )
+    plan_webp_output.add_argument(
+        "--asset-report", required=True, type=Path, dest="asset_report_path",
+        help="Local Image Asset Type dry-run JSON with status=ok",
+    )
     link_product_options = subcommands.add_parser(
         "link-product-options",
         help="Link local Product and Additional Option dry-run reports",
@@ -1489,6 +1523,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             logger, arguments.root_manifest_path,
             arguments.nested_manifest_path, arguments.depth2_manifest_path,
         )
+    if arguments.command == "plan-webp-output":
+        return _run_plan_webp_output(logger, arguments.asset_report_path)
     if arguments.command == "link-product-options":
         return _run_link_product_options(
             logger,

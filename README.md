@@ -210,6 +210,24 @@ Policy 为 `xxxxdoll-image-asset-type-v1`。JPEG/PNG/WebP 的 MIME 决定类型�
 
 结果按 SKU、depth、安全目录名、文件名、normalized MIME 排序，安全审计字段用于同名排序，不删除重复文件、不生成图库顺序、不选择主图。输入错误返回 2，不覆盖旧输出；旧报告不能当作本次成功结果。开发仅运行 mock，真实 local manifests 留待人工 Reality Check。
 
+### WebP Output Policy Dry Run（纯本地）
+
+只消费一份 `status=ok`、policy version 为 `xxxxdoll-image-asset-type-v1` 的安全 Image Asset Type 报告：
+
+```powershell
+python -m sync_worker plan-webp-output --asset-report reports/image-asset-type-dry-run.json
+```
+
+`--asset-report` 必填。命令验证报告结构、版本、字段、层级与类型，恢复 `ImageAssetTypeResult` 后逐条调用现有 WebP Output Policy Core，不重新分类 MIME 或扩展名。不读取 Drive manifest、Folder Role 报告、`.env`、credentials 或媒体文件；拒绝 URL/UNC、链接/目录联接、已知凭据路径、原始 ID、URL、路径或凭据字段。不读取配置，不创建任何 API 客户端。
+
+输出固定为 `reports/webp-output-policy-dry-run.json`，policy version 为 `xxxxdoll-webp-output-v1`。每项保留 SKU、source manifest kind/depth、安全当前/parent 目录名、文件名、product source rows，以及 Core 的 source class/MIME、source eligibility、pipeline flag、action、target、上传门禁、warnings/blockers。报告不保存输入路径、原始 ID、下载链接或媒体内容，保持上游顺序及重复条目。
+
+JPEG/PNG 仅允许作为 `convert_to_webp` 的源；已有 WebP 仍需 `validate_existing_webp`。两者都必须经过未来的处理/验证流程，不是上传授权。PSD、视频、unsupported/unknown/other media、上游不合格的 GIF/AVIF、extension fallback 或 blocker 均不能进入处理链。JPEG 位于 Banner 目录不影响本阶段 source eligibility；图库选择和 Folder Role 合并不在本命令范围内。
+
+Summary 从实际逐项结果计算 total、source eligible/ineligible、pipeline、三种 action、upload ready、JPEG/PNG/WebP 和五种非 web-image class 的源数量，以及 warnings/blocking assets；不使用上游 summary 预设数量，不硬编码 248/206/42。独立硬门禁确保 `wordpress_upload_ready=false`，目标固定为 `image/webp` / `.webp`。如果 Core 违反上传或 target contract，输出安全的 blocked 记录，保留 `wordpress_upload_ready_contract_violation` / `invalid_webp_target_contract`，CLI 返回 1，不能当作成功计划。
+
+报告顶层及 summary 的 network/download/conversion/WordPress upload/external-write counters 均为 0；唯一写入是本地 JSON 审计报告。不使用 Pillow/ImageMagick/cwebp/ffmpeg，不转换、不下载、不上传、不生成媒体文件。正常报告返回 0；存在 blocker 返回 1；输入/运行错误返回 2 且不覆盖旧报告，旧文件不能当作本次成功结果。开发只用 mock fixture，真实输入留待人工 Reality Check。
+
 ## CLM RMB Price List Parser V1
 
 `sync_worker.clm_price_parser` 是纯本地、无网络和无写入的中间模型解析器。它接收已经生成的 sheet-layout 结构，依据每个动态系列标题划分产品 Block，并提取规格、included features、upgrade options、价格、notice 与图片链接占位符。未知规格和商业字段会连同坐标保留，不会被静默丢弃；`Height(Model)` 保持为独立原始规格并附加 warning，不会猜测拆分。
