@@ -171,6 +171,24 @@ Depth-2 仅消费成功 depth-1 manifest 中 `item_kind=nested_folder` 且带 `m
 
 输出为 `reports/google-drive-depth2-folder-manifest-dry-run.json`，含安全的 `results`、`summary`、上游 `root_issues` / `depth1_issues`、warnings 和 blocking issues。逐层统计 Root/Nested/Depth-2 页数和 Sheets/Root/Nested/Depth-2 API 读取次数（含分页、重试），总读取为四者之和：单页 mock 的 1 + 8 + 24 + 8 = 41 不是硬编码值。下载和外部写请求固定为 0。存在读取失败或阻断时报告 `partial`、CLI 返回 1；配置、批次上限或安全扫描失败返回 2，不覆盖已有报告。只有成功生成的新报告才能作为本次 Reality Check 依据。
 
+### Folder Role Classification Dry Run（纯本地）
+
+此命令只读取人工确认的两份安全 manifest JSON，不调用 Google/Drive，不读取 `.env` 或服务账号，不下载，也不执行外部写请求：
+
+```powershell
+python -m sync_worker classify-folder-roles `
+  --nested-manifest reports/google-drive-nested-folder-manifest-dry-run.json `
+  --depth2-manifest reports/google-drive-depth2-folder-manifest-dry-run.json
+```
+
+两个参数均必填，两份输入的 `status` 必须为 `ok`。拒绝远程 URL/UNC 路径及符号链接/目录联接，也拒绝 raw Drive/file IDs、resource key、URL 和凭据字段；只接受安全报告，不恢复 ID。输入校验失败返回 2，不覆盖已有输出，旧报告不能视为本次成功结果。
+
+Depth-1 使用 `safe_folder_name`；Depth-2 使用 `depth2_safe_folder_name`，将 `depth1_safe_folder_name` 仅保留为 parent 审计信息。两者均直接调用 `folder_role_policy.classify_folder_role()`，policy version 为 `xxxxdoll-folder-role-v1`，不复制规则，不从 parent、SKU、fingerprint 或图片数量推断角色。`requires_deeper_inventory` 只来自 `nested_folder_at_depth_limit_count > 0`，既不由 role 自动设置，也不触发后续遍历。未知名称保留为 `unknown` 并带 warning；不会为降低 unknown 数量增加模糊匹配，也不选择主图或图库。
+
+输出 `reports/folder-role-dry-run.json`：包含 `status`、`policy_version`、`summary`、`results` 和三项固定为 0 的 network/download/write counters。每条结果保留 SKU、product source、depth、当前/parent 安全目录名、role、normalized name、matched rule、gallery eligibility、deeper flag、warnings、blocking issues 及 `source_manifest_kind`（`nested` / `depth2`）；不保存 fingerprint、原始 ID、URL 或文件明细。上游逐目录 warnings/blockers 保留为审计注记；存在 blocker 则输出 `partial`、返回 1，只有 unknown warning 不影响 `ok`。
+
+Summary 动态统计 total、depth1/depth2、各 role、gallery eligible、requires deeper inventory、有 warnings / blocking issues 的目录数量，以及 network/download/write=0；不硬编码 24/8/32。结果按 SKU、depth、normalized name、安全目录名排序，使用 parent/source 等安全字段消除同名排序歧义。开发测试只使用 mock fixture，真实输入留待人工 Reality Check。
+
 ## CLM RMB Price List Parser V1
 
 `sync_worker.clm_price_parser` 是纯本地、无网络和无写入的中间模型解析器。它接收已经生成的 sheet-layout 结构，依据每个动态系列标题划分产品 Block，并提取规格、included features、upgrade options、价格、notice 与图片链接占位符。未知规格和商业字段会连同坐标保留，不会被静默丢弃；`Height(Model)` 保持为独立原始规格并附加 warning，不会猜测拆分。

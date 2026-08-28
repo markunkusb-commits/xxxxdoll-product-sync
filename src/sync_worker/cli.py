@@ -19,6 +19,7 @@ from .config import (
 )
 from .clm_price_dry_run import run_clm_parser_dry_run
 from .doctor import DoctorRunner
+from .folder_role_dry_run import run_folder_role_dry_run
 from .http_client import ReadOnlyHttpClient
 from .google_api import OfficialGoogleClientFactory, google_redactor_for_settings
 from .google_doctor import GoogleDoctorRunner
@@ -758,6 +759,28 @@ def _run_build_depth2_drive_folder_manifests(
     return 0 if report.get("status") == "ok" else 1
 
 
+def _run_classify_folder_roles(
+    logger: logging.Logger,
+    nested_manifest_path: Path,
+    depth2_manifest_path: Path,
+) -> int:
+    try:
+        report, _ = run_folder_role_dry_run(
+            nested_manifest_path, depth2_manifest_path, project_root=PROJECT_ROOT,
+        )
+    except Exception as error:
+        _log_failure(logger, error, event="folder_role_dry_run_aborted")
+        return 2
+    logger.info(json.dumps({
+        "event": "folder_role_dry_run_report_written",
+        "path": "reports/folder-role-dry-run.json",
+        "status": report.get("status"), "summary": report.get("summary", {}),
+        "network_requests_performed": 0,
+        "download_requests_performed": 0, "write_requests_performed": 0,
+    }, ensure_ascii=False, sort_keys=True))
+    return 0 if report.get("status") == "ok" else 1
+
+
 def _run_link_product_options(
     logger: logging.Logger,
     product_input_path: Path,
@@ -1207,6 +1230,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--sku-report", required=True, type=Path, dest="sku_report_input_path",
         help="Local verified SKU dry-run JSON file from the same product snapshot",
     )
+    classify_folder_roles = subcommands.add_parser(
+        "classify-folder-roles",
+        help="Classify safe local depth-one/two folder manifests without network access",
+    )
+    classify_folder_roles.add_argument(
+        "--nested-manifest", required=True, type=Path, dest="nested_manifest_path",
+        help="Local safe Nested Folder Manifest dry-run JSON with status=ok",
+    )
+    classify_folder_roles.add_argument(
+        "--depth2-manifest", required=True, type=Path, dest="depth2_manifest_path",
+        help="Local safe Depth-2 Folder Manifest dry-run JSON with status=ok",
+    )
     link_product_options = subcommands.add_parser(
         "link-product-options",
         help="Link local Product and Additional Option dry-run reports",
@@ -1406,6 +1441,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             arguments.mapping_input_path,
             arguments.sheet_title,
             arguments.sku_report_input_path,
+        )
+    if arguments.command == "classify-folder-roles":
+        return _run_classify_folder_roles(
+            logger, arguments.nested_manifest_path, arguments.depth2_manifest_path,
         )
     if arguments.command == "link-product-options":
         return _run_link_product_options(
