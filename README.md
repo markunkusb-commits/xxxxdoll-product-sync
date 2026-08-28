@@ -189,6 +189,27 @@ Depth-1 使用 `safe_folder_name`；Depth-2 使用 `depth2_safe_folder_name`，�
 
 Summary 动态统计 total、depth1/depth2、各 role、gallery eligible、requires deeper inventory、有 warnings / blocking issues 的目录数量，以及 network/download/write=0；不硬编码 24/8/32。结果按 SKU、depth、normalized name、安全目录名排序，使用 parent/source 等安全字段消除同名排序歧义。开发测试只使用 mock fixture，真实输入留待人工 Reality Check。
 
+### Image Asset Type Dry Run（纯本地）
+
+仅消费三份安全 metadata 报告，不读取 Folder Role 报告、`.env`、credentials 或媒体文件，不调用 Google/Drive、HTTP HEAD，不下载：
+
+```powershell
+python -m sync_worker classify-image-asset-types `
+  --root-manifest reports/google-drive-folder-manifest-dry-run.json `
+  --nested-manifest reports/google-drive-nested-folder-manifest-dry-run.json `
+  --depth2-manifest reports/google-drive-depth2-folder-manifest-dry-run.json
+```
+
+三个参数均必填，各报告 `status` 必须为 `ok`。路径只允许本地 JSON，拒绝 URL/UNC、符号链接和目录联接；raw IDs、URL、resource key 或凭据字段会触发安全错误。仅 `image_candidate`、`other_file`、`google_workspace_file` 调用现有 `classify_image_asset_type()`；`nested_folder` 和 `shortcut` 只计数，不分类、不跟随。未知 item kind 阻断，不根据名称猜测。
+
+Root / Nested / Depth2 分别保留 depth 0 / 1 / 2。现有 Root report 不含目录名或 depth：使用 depth=0、`safe_folder_name=null`，不反查或制造名称；Nested 使用 `safe_folder_name`，Depth2 使用 `depth2_safe_folder_name` 并保留 `depth1_safe_folder_name` 为 parent。SKU、source row range、目录名称和尺寸只用于审计，不加入 Folder Role 或 Image Quality 判断。
+
+Policy 为 `xxxxdoll-image-asset-type-v1`。JPEG/PNG/WebP 的 MIME 决定类型级 storefront eligibility；PSD 是不可直接上架的 design source，即使 discovery 将它标为 image candidate。视频不可用于本阶段图库；GIF/AVIF 需平台核验。扩展名冲突只 warning，MIME 优先；generic/missing MIME 的扩展名候选不获批。JPEG 位于 Banner 目录仍保持类型级资格，但这不是最终图库资格或内容验证。
+
+输出 `reports/image-asset-type-dry-run.json`，包含 `status`、`policy_version`、`summary`、安全 `results` 及 network/download/write=0。Summary 动态统计 seen/classified、skipped folders/shortcuts、六类 asset、eligible/ineligible、MIME/fallback/mismatch、warnings/blockers 和三层 asset 数量；不硬编码 206 JPEG、2 PSD 或总数。逐项保留 Core 结果及安全 hierarchy，不输出 folder role、fingerprint、原始 ID 或链接。上游 issues 仅保留为审计注记；有 blocking assets 则为 `partial`、CLI 返回 1。
+
+结果按 SKU、depth、安全目录名、文件名、normalized MIME 排序，安全审计字段用于同名排序，不删除重复文件、不生成图库顺序、不选择主图。输入错误返回 2，不覆盖旧输出；旧报告不能当作本次成功结果。开发仅运行 mock，真实 local manifests 留待人工 Reality Check。
+
 ## CLM RMB Price List Parser V1
 
 `sync_worker.clm_price_parser` 是纯本地、无网络和无写入的中间模型解析器。它接收已经生成的 sheet-layout 结构，依据每个动态系列标题划分产品 Block，并提取规格、included features、upgrade options、价格、notice 与图片链接占位符。未知规格和商业字段会连同坐标保留，不会被静默丢弃；`Height(Model)` 保持为独立原始规格并附加 warning，不会猜测拆分。

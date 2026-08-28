@@ -37,6 +37,7 @@ from .inspect_product import (
     reference_product_report_filename,
 )
 from .image_mapping_dry_run import run_image_mapping_dry_run
+from .image_asset_type_dry_run import run_image_asset_type_dry_run
 from .media_source_discovery_dry_run import (
     run_media_source_discovery_dry_run,
 )
@@ -781,6 +782,30 @@ def _run_classify_folder_roles(
     return 0 if report.get("status") == "ok" else 1
 
 
+def _run_classify_image_asset_types(
+    logger: logging.Logger,
+    root_manifest_path: Path,
+    nested_manifest_path: Path,
+    depth2_manifest_path: Path,
+) -> int:
+    try:
+        report, _ = run_image_asset_type_dry_run(
+            root_manifest_path, nested_manifest_path, depth2_manifest_path,
+            project_root=PROJECT_ROOT,
+        )
+    except Exception as error:
+        _log_failure(logger, error, event="image_asset_type_dry_run_aborted")
+        return 2
+    logger.info(json.dumps({
+        "event": "image_asset_type_dry_run_report_written",
+        "path": "reports/image-asset-type-dry-run.json",
+        "status": report.get("status"), "summary": report.get("summary", {}),
+        "network_requests_performed": 0,
+        "download_requests_performed": 0, "write_requests_performed": 0,
+    }, ensure_ascii=False, sort_keys=True))
+    return 0 if report.get("status") == "ok" else 1
+
+
 def _run_link_product_options(
     logger: logging.Logger,
     product_input_path: Path,
@@ -1242,6 +1267,19 @@ def build_parser() -> argparse.ArgumentParser:
         "--depth2-manifest", required=True, type=Path, dest="depth2_manifest_path",
         help="Local safe Depth-2 Folder Manifest dry-run JSON with status=ok",
     )
+    classify_image_asset_types = subcommands.add_parser(
+        "classify-image-asset-types",
+        help="Classify file metadata from three safe local manifests without network access",
+    )
+    for flag, dest in (
+        ("--root-manifest", "root_manifest_path"),
+        ("--nested-manifest", "nested_manifest_path"),
+        ("--depth2-manifest", "depth2_manifest_path"),
+    ):
+        classify_image_asset_types.add_argument(
+            flag, required=True, type=Path, dest=dest,
+            help="Local safe manifest dry-run JSON with status=ok",
+        )
     link_product_options = subcommands.add_parser(
         "link-product-options",
         help="Link local Product and Additional Option dry-run reports",
@@ -1445,6 +1483,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     if arguments.command == "classify-folder-roles":
         return _run_classify_folder_roles(
             logger, arguments.nested_manifest_path, arguments.depth2_manifest_path,
+        )
+    if arguments.command == "classify-image-asset-types":
+        return _run_classify_image_asset_types(
+            logger, arguments.root_manifest_path,
+            arguments.nested_manifest_path, arguments.depth2_manifest_path,
         )
     if arguments.command == "link-product-options":
         return _run_link_product_options(
