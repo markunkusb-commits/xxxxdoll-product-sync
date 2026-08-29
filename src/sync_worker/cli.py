@@ -50,6 +50,10 @@ from .image_quality_dry_run import (
     ImageQualityDryRunInputError,
     run_image_quality_dry_run,
 )
+from .image_selection_dry_run import (
+    ImageSelectionDryRunInputError,
+    run_image_selection_dry_run,
+)
 from .media_source_discovery_dry_run import (
     run_media_source_discovery_dry_run,
 )
@@ -890,6 +894,30 @@ def _run_evaluate_image_quality(
     return 0 if report["status"] == "ok" else 1
 
 
+def _run_select_product_images(
+    logger: logging.Logger,
+    quality_report_path: Path,
+) -> int:
+    try:
+        report, _ = run_image_selection_dry_run(
+            quality_report_path, project_root=PROJECT_ROOT,
+        )
+    except ImageSelectionDryRunInputError as error:
+        _log_failure(logger, error, event="image_selection_dry_run_aborted")
+        return 2
+    except Exception:
+        _log_failure(
+            logger, ValueError("image_selection_dry_run_failed"),
+            event="image_selection_dry_run_aborted",
+        )
+        return 2
+    logger.info(json.dumps({
+        "event": "image_selection_dry_run_report_written",
+        "status": report["status"], "summary": report["summary"],
+    }, ensure_ascii=False, sort_keys=True))
+    return 0 if report["status"] == "ok" else 1
+
+
 def _run_link_product_options(
     logger: logging.Logger,
     product_input_path: Path,
@@ -1397,6 +1425,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--asset-report", required=True, type=Path, dest="asset_report_path",
         help="Local Image Asset Type dry-run JSON with status=ok",
     )
+    select_product_images = subcommands.add_parser(
+        "select-product-images",
+        help="Build a deterministic image plan from a local Quality report",
+    )
+    select_product_images.add_argument(
+        "--quality-report", required=True, type=Path, dest="quality_report_path",
+        help="Local Image Quality dry-run JSON with status=ok",
+    )
     link_product_options = subcommands.add_parser(
         "link-product-options",
         help="Link local Product and Additional Option dry-run reports",
@@ -1616,6 +1652,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_evaluate_image_quality(
             logger, arguments.unified_report_path, arguments.asset_report_path,
         )
+    if arguments.command == "select-product-images":
+        return _run_select_product_images(logger, arguments.quality_report_path)
     if arguments.command == "link-product-options":
         return _run_link_product_options(
             logger,

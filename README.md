@@ -264,6 +264,21 @@ Metadata join 使用 SKU、product source 起止行、manifest kind、depth、�
 
 报告保持 Unified 输入顺序，不选主图、不排序、不排名、不取 Top N、不去重、不触发更深遍历。它不读取 `.env`、credentials、Drive manifests、Folder Role/WebP 报告或媒体文件，不下载、不转换、不上传。五项请求计数固定为 0；唯一写入是本地 JSON 审计。无 blocker 返回 0，join/metadata/输入 contract blocker 返回 1，输入或运行错误返回 2 且不覆盖旧报告。
 
+### Image Selection Dry Run（纯本地）
+
+只消费成功、已脱敏的 Image Quality Dry Run 本地报告：
+
+```powershell
+python -m sync_worker select-product-images `
+  --quality-report reports/image-quality-dry-run.json
+```
+
+命令恢复正式 `ImageQualityPolicyResult` 与 `ImageSelectionCandidate`，再统一调用 `xxxxdoll-image-selection-v1` Core。每个 SKU 最多选择 12 张（含 1 张 primary）；Storefront 优先，只有不足时才由 Factory 补齐。Primary、Factory fallback、natural filename 顺序和限制均由 Core 决定，Dry Run 不复制这些规则，也不按 provider 顺序、modified time、文件大小、分辨率、MP、方向或文件名语义重排。
+
+输出固定为 `reports/image-selection-dry-run.json`，保留每个 SKU 的候选/选择统计、primary/gallery 计划、quality audit、安全 hierarchy、source rows、warnings/blockers 及契约检查结果。`selected=true` 只代表未来 Secure Download Plan 的候选，不代表已下载、已转换或有 WordPress 上传权限。
+
+输入必须 `status=ok`、Quality Policy 版本准确，并且 network/download/conversion/WordPress upload/external-write counters 全部为 0。本命令不读取 Unified/Asset/Drive/Folder Role 报告、`.env`、credentials 或媒体文件，不创建 API 客户端，不遍历、不下载、不转换、不上传；唯一文件写入是这份本地 JSON 审计报告。
+
 ## CLM RMB Price List Parser V1
 
 `sync_worker.clm_price_parser` 是纯本地、无网络和无写入的中间模型解析器。它接收已经生成的 sheet-layout 结构，依据每个动态系列标题划分产品 Block，并提取规格、included features、upgrade options、价格、notice 与图片链接占位符。未知规格和商业字段会连同坐标保留，不会被静默丢弃；`Height(Model)` 保持为独立原始规格并附加 warning，不会猜测拆分。
