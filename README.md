@@ -246,6 +246,24 @@ python -m sync_worker evaluate-image-eligibility `
 
 正常无 blocker 报告返回 0；缺失/歧义 join、无效上游 contract 或其他 blocker 生成 `blocked` 报告并返回 1；输入/运行错误返回 2 且不覆盖旧输出。报告及 summary 的五项请求计数固定为 0，唯一文件写入是这份本地 JSON 审计报告。
 
+### Image Quality Dry Run（纯本地）
+
+只消费成功、已脱敏的 Unified Image Eligibility 与 Image Asset Type 本地报告：
+
+```powershell
+python -m sync_worker evaluate-image-quality `
+  --unified-report reports/unified-image-eligibility-dry-run.json `
+  --asset-report reports/image-asset-type-dry-run.json
+```
+
+两个参数均必填。命令先完整验证 `xxxxdoll-unified-image-eligibility-v1` 和 `xxxxdoll-image-asset-type-v1` 报告，再仅处理 `unified_image_eligible=true` 的候选；其余项目只计入 `skipped_upstream_ineligible`，不会由 Quality 层重新批准。
+
+Metadata join 使用 SKU、product source 起止行、manifest kind、depth、当前/parent 安全目录名和文件名的大小写敏感完整相等键。不做 SKU-only、filename-only、substring、casefold、fuzzy、first-match 或去重。唯一匹配才把 `image_width`、`image_height`、`size_bytes` 传入现有 Image Quality Core；0/多匹配分别保留为 `quality_metadata_join_missing` / `quality_metadata_join_ambiguous` 阻断记录。
+
+输出固定为 `reports/image-quality-dry-run.json`。每项保留安全 hierarchy、Folder Role、Unified eligibility、尺寸、short/long edge、pixel count、MP、source bytes、orientation、门槛、Quality 结果、warnings/blockers 与 join status。V1 门槛仍只由 Core 定义：short edge 至少 1600px 且至少 3MP；source bytes 只做 metadata 完整性审计，portrait/landscape/square 和 `requires_deeper_inventory` 不影响资格。
+
+报告保持 Unified 输入顺序，不选主图、不排序、不排名、不取 Top N、不去重、不触发更深遍历。它不读取 `.env`、credentials、Drive manifests、Folder Role/WebP 报告或媒体文件，不下载、不转换、不上传。五项请求计数固定为 0；唯一写入是本地 JSON 审计。无 blocker 返回 0，join/metadata/输入 contract blocker 返回 1，输入或运行错误返回 2 且不覆盖旧报告。
+
 ## CLM RMB Price List Parser V1
 
 `sync_worker.clm_price_parser` 是纯本地、无网络和无写入的中间模型解析器。它接收已经生成的 sheet-layout 结构，依据每个动态系列标题划分产品 Block，并提取规格、included features、upgrade options、价格、notice 与图片链接占位符。未知规格和商业字段会连同坐标保留，不会被静默丢弃；`Height(Model)` 保持为独立原始规格并附加 warning，不会猜测拆分。

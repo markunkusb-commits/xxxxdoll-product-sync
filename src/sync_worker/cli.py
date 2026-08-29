@@ -46,6 +46,10 @@ from .unified_image_eligibility_dry_run import (
     UnifiedImageEligibilityDryRunInputError,
     run_unified_image_eligibility_dry_run,
 )
+from .image_quality_dry_run import (
+    ImageQualityDryRunInputError,
+    run_image_quality_dry_run,
+)
 from .media_source_discovery_dry_run import (
     run_media_source_discovery_dry_run,
 )
@@ -861,6 +865,31 @@ def _run_evaluate_image_eligibility(
     return 0 if report["status"] == "ok" else 1
 
 
+def _run_evaluate_image_quality(
+    logger: logging.Logger,
+    unified_report_path: Path,
+    asset_report_path: Path,
+) -> int:
+    try:
+        report, _ = run_image_quality_dry_run(
+            unified_report_path, asset_report_path, project_root=PROJECT_ROOT,
+        )
+    except ImageQualityDryRunInputError as error:
+        _log_failure(logger, error, event="image_quality_dry_run_aborted")
+        return 2
+    except Exception:
+        _log_failure(
+            logger, ValueError("image_quality_dry_run_failed"),
+            event="image_quality_dry_run_aborted",
+        )
+        return 2
+    logger.info(json.dumps({
+        "event": "image_quality_dry_run_report_written",
+        "status": report["status"], "summary": report["summary"],
+    }, ensure_ascii=False, sort_keys=True))
+    return 0 if report["status"] == "ok" else 1
+
+
 def _run_link_product_options(
     logger: logging.Logger,
     product_input_path: Path,
@@ -1356,6 +1385,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--webp-report", required=True, type=Path, dest="webp_report_path",
         help="Local WebP Output Policy dry-run JSON with status=ok",
     )
+    evaluate_image_quality = subcommands.add_parser(
+        "evaluate-image-quality",
+        help="Exact-join local Unified and Asset Type reports through Quality Core",
+    )
+    evaluate_image_quality.add_argument(
+        "--unified-report", required=True, type=Path, dest="unified_report_path",
+        help="Local Unified Image Eligibility dry-run JSON with status=ok",
+    )
+    evaluate_image_quality.add_argument(
+        "--asset-report", required=True, type=Path, dest="asset_report_path",
+        help="Local Image Asset Type dry-run JSON with status=ok",
+    )
     link_product_options = subcommands.add_parser(
         "link-product-options",
         help="Link local Product and Additional Option dry-run reports",
@@ -1570,6 +1611,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     if arguments.command == "evaluate-image-eligibility":
         return _run_evaluate_image_eligibility(
             logger, arguments.folder_role_report_path, arguments.webp_report_path,
+        )
+    if arguments.command == "evaluate-image-quality":
+        return _run_evaluate_image_quality(
+            logger, arguments.unified_report_path, arguments.asset_report_path,
         )
     if arguments.command == "link-product-options":
         return _run_link_product_options(
