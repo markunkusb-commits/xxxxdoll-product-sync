@@ -42,6 +42,10 @@ from .webp_output_policy_dry_run import (
     WebPOutputPolicyDryRunInputError,
     run_webp_output_policy_dry_run,
 )
+from .unified_image_eligibility_dry_run import (
+    UnifiedImageEligibilityDryRunInputError,
+    run_unified_image_eligibility_dry_run,
+)
 from .media_source_discovery_dry_run import (
     run_media_source_discovery_dry_run,
 )
@@ -832,6 +836,31 @@ def _run_plan_webp_output(logger: logging.Logger, asset_report_path: Path) -> in
     return 0 if report["status"] == "ok" else 1
 
 
+def _run_evaluate_image_eligibility(
+    logger: logging.Logger,
+    folder_role_report_path: Path,
+    webp_report_path: Path,
+) -> int:
+    try:
+        report, _ = run_unified_image_eligibility_dry_run(
+            folder_role_report_path, webp_report_path, project_root=PROJECT_ROOT,
+        )
+    except UnifiedImageEligibilityDryRunInputError as error:
+        _log_failure(logger, error, event="unified_image_eligibility_dry_run_aborted")
+        return 2
+    except Exception:
+        _log_failure(
+            logger, ValueError("unified_image_eligibility_dry_run_failed"),
+            event="unified_image_eligibility_dry_run_aborted",
+        )
+        return 2
+    logger.info(json.dumps({
+        "event": "unified_image_eligibility_dry_run_report_written",
+        "status": report["status"], "summary": report["summary"],
+    }, ensure_ascii=False, sort_keys=True))
+    return 0 if report["status"] == "ok" else 1
+
+
 def _run_link_product_options(
     logger: logging.Logger,
     product_input_path: Path,
@@ -1314,6 +1343,19 @@ def build_parser() -> argparse.ArgumentParser:
         "--asset-report", required=True, type=Path, dest="asset_report_path",
         help="Local Image Asset Type dry-run JSON with status=ok",
     )
+    evaluate_image_eligibility = subcommands.add_parser(
+        "evaluate-image-eligibility",
+        help="Exact-join local Folder Role and WebP reports through Unified Core",
+    )
+    evaluate_image_eligibility.add_argument(
+        "--folder-role-report", required=True, type=Path,
+        dest="folder_role_report_path",
+        help="Local Folder Role dry-run JSON with status=ok",
+    )
+    evaluate_image_eligibility.add_argument(
+        "--webp-report", required=True, type=Path, dest="webp_report_path",
+        help="Local WebP Output Policy dry-run JSON with status=ok",
+    )
     link_product_options = subcommands.add_parser(
         "link-product-options",
         help="Link local Product and Additional Option dry-run reports",
@@ -1525,6 +1567,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     if arguments.command == "plan-webp-output":
         return _run_plan_webp_output(logger, arguments.asset_report_path)
+    if arguments.command == "evaluate-image-eligibility":
+        return _run_evaluate_image_eligibility(
+            logger, arguments.folder_role_report_path, arguments.webp_report_path,
+        )
     if arguments.command == "link-product-options":
         return _run_link_product_options(
             logger,

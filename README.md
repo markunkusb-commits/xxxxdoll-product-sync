@@ -228,6 +228,24 @@ Summary 从实际逐项结果计算 total、source eligible/ineligible、pipelin
 
 报告顶层及 summary 的 network/download/conversion/WordPress upload/external-write counters 均为 0；唯一写入是本地 JSON 审计报告。不使用 Pillow/ImageMagick/cwebp/ffmpeg，不转换、不下载、不上传、不生成媒体文件。正常报告返回 0；存在 blocker 返回 1；输入/运行错误返回 2 且不覆盖旧报告，旧文件不能当作本次成功结果。开发只用 mock fixture，真实输入留待人工 Reality Check。
 
+### Unified Image Eligibility Dry Run（纯本地）
+
+只消费两份已成功、已脱敏的本地正式报告，并逐资产调用现有 Unified Image Eligibility Core：
+
+```powershell
+python -m sync_worker evaluate-image-eligibility `
+  --folder-role-report reports/folder-role-dry-run.json `
+  --webp-report reports/webp-output-policy-dry-run.json
+```
+
+两个参数均必填。Folder Role 必须是 `xxxxdoll-folder-role-v1`，WebP 必须是 `xxxxdoll-webp-output-v1`；输入报告必须 `status=ok` 且所有 network/download/conversion/WordPress upload/external-write counters 为 0。命令不读取 `.env`、credentials、Drive manifest 或媒体文件，不创建 API 客户端，不下载、不转换、不上传。
+
+非 Root 资产只使用 SKU、product source row range、manifest kind、depth、当前安全目录名及 depth-2 parent 安全目录名进行大小写敏感的完整相等 join。不做模糊、substring、case-insensitive、SKU-only、depth-only 或上一条继承；同一 key 的 0 条匹配输出 `missing_folder_role_join`，多条输出 `ambiguous_folder_role_join`，都 fail closed。Root 没有 folder context，明确进入 Core 的 `missing_folder_role` 分支。重复记录不会被去重或选择第一条。
+
+输出固定为 `reports/unified-image-eligibility-dry-run.json`，版本为 `xxxxdoll-unified-image-eligibility-v1`。报告保留安全 hierarchy、source class/MIME、WebP action/固定 target、folder role、统一 eligibility/reason、warnings/blockers 与动态 summary；不包含 ID、fingerprint、URL、本地路径、凭据、媒体内容或 `wordpress_upload_ready=true`。Storefront/Factory 只有在 Folder Role 和 WebP 两侧同时满足现有 Core 时才合格；Banner/Video/Eye/Promo/Skin/Unknown、Root、源资产不合格及异常 WebP contract 均保持不合格。`requires_deeper_inventory` 只作为 warning/audit 信息，不触发遍历或阻断已发现的直接图片。
+
+正常无 blocker 报告返回 0；缺失/歧义 join、无效上游 contract 或其他 blocker 生成 `blocked` 报告并返回 1；输入/运行错误返回 2 且不覆盖旧输出。报告及 summary 的五项请求计数固定为 0，唯一文件写入是这份本地 JSON 审计报告。
+
 ## CLM RMB Price List Parser V1
 
 `sync_worker.clm_price_parser` 是纯本地、无网络和无写入的中间模型解析器。它接收已经生成的 sheet-layout 结构，依据每个动态系列标题划分产品 Block，并提取规格、included features、upgrade options、价格、notice 与图片链接占位符。未知规格和商业字段会连同坐标保留，不会被静默丢弃；`Height(Model)` 保持为独立原始规格并附加 warning，不会猜测拆分。
