@@ -43,6 +43,8 @@ from sync_worker.image_mapping import ProductSourceRange
 JPEG = b"\xff\xd8\xff" + b"jpeg-mock-content"
 PNG = b"\x89PNG\r\n\x1a\n" + b"png-mock-content"
 WEBP = b"RIFF\x10\x00\x00\x00WEBP" + b"webp-mock-content"
+REALITY_SOURCE_SIZE = 12_458_951
+REALITY_SOURCE_MD5 = "5c53847fc04463312e389b98e8184026"
 
 
 @pytest.fixture(autouse=True)
@@ -650,13 +652,19 @@ def test_143_provider_status_classification(status, code, transient):
     assert result.code == code and result.transient is transient and str(result) == code
 
 
-def test_149_gateway_uses_files_get_alt_media_in_bounded_chunks():
-    calls = []
+def test_149_gateway_uses_get_media_request_in_bounded_chunks():
+    get_calls = []
+    get_media_calls = []
+    media_request = object()
 
     class Files:
         def get(self, **kwargs):
-            calls.append(kwargs)
-            return object()
+            get_calls.append(kwargs)
+            raise AssertionError("files.get must not be used for media download")
+
+        def get_media(self, **kwargs):
+            get_media_calls.append(kwargs)
+            return media_request
 
     class Drive:
         def files(self):
@@ -672,6 +680,7 @@ def test_149_gateway_uses_files_get_alt_media_in_bounded_chunks():
     class Downloader:
         def __init__(self, sink, request, chunksize):
             assert chunksize == download_core.DOWNLOAD_CHUNK_SIZE
+            assert request is media_request
             self.sink = sink
 
         def next_chunk(self, num_retries):
@@ -687,8 +696,140 @@ def test_149_gateway_uses_files_get_alt_media_in_bounded_chunks():
         receipt = GoogleDriveContentGateway(Drive()).download_file(
             "opaque_file_001", Sink(), chunk_size=download_core.DOWNLOAD_CHUNK_SIZE,
         )
-    assert calls == [{"fileId": "opaque_file_001", "alt": "media", "supportsAllDrives": True}]
+    assert get_calls == []
+    assert get_media_calls == [{"fileId": "opaque_file_001", "supportsAllDrives": True}]
+    assert "alt" not in get_media_calls[0]
     assert receipt == GoogleDriveContentDownloadReceipt(1, len(JPEG))
+
+
+def test_150_gateway_request_counter_tracks_each_next_chunk():
+    media_request = object()
+
+    class Files:
+        def get_media(self, **kwargs):
+            return media_request
+
+    class Drive:
+        def files(self):
+            return Files()
+
+    class Sink:
+        bytes_written = 0
+
+        def write(self, value):
+            self.bytes_written += len(value)
+            return len(value)
+
+    class Downloader:
+        def __init__(self, sink, request, chunksize):
+            assert request is media_request
+            assert chunksize == 256 * 1024
+            self.sink = sink
+            self.calls = 0
+
+        def next_chunk(self, num_retries):
+            assert num_retries == 0
+            self.calls += 1
+            self.sink.write(b"chunk")
+            return None, self.calls == 3
+
+    package = ModuleType("googleapiclient")
+    http = ModuleType("googleapiclient.http")
+    http.MediaIoBaseDownload = Downloader
+    package.http = http
+    gateway = GoogleDriveContentGateway(Drive())
+    with patch.dict(sys.modules, {"googleapiclient": package, "googleapiclient.http": http}):
+        receipt = gateway.download_file(
+            "opaque_file_001", Sink(), chunk_size=download_core.DOWNLOAD_CHUNK_SIZE,
+        )
+    assert receipt == GoogleDriveContentDownloadReceipt(3, 15)
+    assert gateway.counters.read_requests_performed == 3
+
+
+@pytest.mark.parametrize("status,code", [
+    (403, "drive_download_forbidden"),
+    (404, "drive_download_not_found"),
+])
+def test_151_get_media_provider_status_remains_safe(status, code):
+    class Files:
+        def get_media(self, **kwargs):
+            return object()
+
+    class Drive:
+        def files(self):
+            return Files()
+
+    class Sink:
+        bytes_written = 0
+
+    class Downloader:
+        def __init__(self, sink, request, chunksize):
+            pass
+
+        def next_chunk(self, num_retries):
+            error = RuntimeError("unsafe provider body")
+            error.resp = SimpleNamespace(status=status)
+            raise error
+
+    package = ModuleType("googleapiclient")
+    http = ModuleType("googleapiclient.http")
+    http.MediaIoBaseDownload = Downloader
+    package.http = http
+    gateway = GoogleDriveContentGateway(Drive())
+    with patch.dict(sys.modules, {"googleapiclient": package, "googleapiclient.http": http}):
+        with pytest.raises(GoogleDriveContentDownloadError) as caught:
+            gateway.download_file(
+                "opaque_file_001", Sink(), chunk_size=download_core.DOWNLOAD_CHUNK_SIZE,
+            )
+    assert caught.value.code == code
+    assert caught.value.transient is False
+    assert caught.value.requests_performed == 1
+
+
+def test_153_reality_shape_mock_stream_is_multichunk_and_verified(tmp_path):
+    assert REALITY_SOURCE_SIZE == 12_458_951
+    assert REALITY_SOURCE_MD5 == "5c53847fc04463312e389b98e8184026"
+    pattern = b"mock-canary-media-block"
+    body_size = REALITY_SOURCE_SIZE - 3
+    mock_media = b"\xff\xd8\xff" + (
+        pattern * ((body_size + len(pattern) - 1) // len(pattern))
+    )[:body_size]
+    assert len(mock_media) == REALITY_SOURCE_SIZE
+    assert hashlib.md5(mock_media, usedforsecurity=False).hexdigest() != REALITY_SOURCE_MD5
+    handle = make_handle(mock_media)
+    raw_id = handle_core._provider_file_id_for_download(handle)
+    gateway = FakeGateway(
+        {raw_id: mock_media}, chunksize=download_core.DOWNLOAD_CHUNK_SIZE,
+    )
+    result = download_core.download_secure_media(
+        (handle,), gateway, workspace_parent=tmp_path,
+    )
+    report = safe(result)
+    assert len(gateway.write_sizes) > 1
+    assert sum(gateway.write_sizes) == REALITY_SOURCE_SIZE
+    assert report["status"] == "ok"
+    assert report["summary"]["downloads_verified"] == 1
+    assert report["summary"]["authoritative_artifacts"] == 1
+    result.cleanup()
+
+
+def test_154_short_unexpected_payload_is_rejected_and_cleaned(tmp_path):
+    expected = b"\xff\xd8\xff" + b"expected" * 100
+    short_payload = b"\xff\xd8\xff" + b"x" * 151
+    assert len(short_payload) == 154
+    handle = make_handle(expected)
+    raw_id = handle_core._provider_file_id_for_download(handle)
+    gateway = FakeGateway({raw_id: short_payload}, chunksize=64)
+    result = download_core.download_secure_media(
+        (handle,), gateway, workspace_parent=tmp_path,
+    )
+    report = safe(result)
+    assert report["status"] == "blocked"
+    assert report["summary"]["checksum_mismatch"] == 1
+    assert report["summary"]["downloads_verified"] == 0
+    assert report["summary"]["authoritative_artifacts"] == 0
+    assert report["summary"]["source_files_cleaned"] == 1
+    assert not tuple(tmp_path.iterdir())
 
 
 def test_150_gateway_exposes_no_write_methods():

@@ -632,7 +632,7 @@ def _safe_content_download_error(
 
 
 class GoogleDriveContentGateway:
-    """Expose only bounded `files.get(alt=media)` streaming downloads."""
+    """Expose only bounded `files.get_media` streaming downloads."""
 
     def __init__(self, drive_client: Any) -> None:
         self._drive = drive_client
@@ -657,9 +657,8 @@ class GoogleDriveContentGateway:
         try:
             from googleapiclient.http import MediaIoBaseDownload
 
-            request = self._drive.files().get(
+            request = self._drive.files().get_media(
                 fileId=provider_file_id,
-                alt="media",
                 supportsAllDrives=True,
             )
             downloader = MediaIoBaseDownload(sink, request, chunksize=chunk_size)
