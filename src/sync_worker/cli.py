@@ -54,6 +54,10 @@ from .image_selection_dry_run import (
     ImageSelectionDryRunInputError,
     run_image_selection_dry_run,
 )
+from .selected_media_baseline_snapshot import (
+    SelectedMediaBaselineSnapshotError,
+    run_selected_media_baseline_snapshot,
+)
 from .media_source_discovery_dry_run import (
     run_media_source_discovery_dry_run,
 )
@@ -918,6 +922,47 @@ def _run_select_product_images(
     return 0 if report["status"] == "ok" else 1
 
 
+def _run_freeze_selected_media_baseline(
+    logger: logging.Logger,
+    selection_report_path: Path,
+    nested_baseline_path: Path,
+    depth2_baseline_path: Path,
+) -> int:
+    try:
+        report, _ = run_selected_media_baseline_snapshot(
+            selection_report_path,
+            nested_baseline_path,
+            depth2_baseline_path,
+            project_root=PROJECT_ROOT,
+        )
+    except SelectedMediaBaselineSnapshotError as error:
+        _log_failure(
+            logger, error, event="selected_media_baseline_snapshot_aborted"
+        )
+        return 2
+    except Exception:
+        _log_failure(
+            logger,
+            ValueError("selected_media_baseline_snapshot_failed"),
+            event="selected_media_baseline_snapshot_aborted",
+        )
+        return 2
+    logger.info(json.dumps({
+        "event": "selected_media_baseline_snapshot_written",
+        "path": "reports/selected-media-baseline-snapshot.json",
+        "status": report["status"],
+        "summary": report["summary"],
+        "network_requests_performed": 0,
+        "drive_read_requests_performed": 0,
+        "download_requests_performed": 0,
+        "media_read_requests_performed": 0,
+        "conversion_requests_performed": 0,
+        "wordpress_upload_requests_performed": 0,
+        "write_requests_performed": 0,
+    }, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
 def _run_link_product_options(
     logger: logging.Logger,
     product_input_path: Path,
@@ -1433,6 +1478,25 @@ def build_parser() -> argparse.ArgumentParser:
         "--quality-report", required=True, type=Path, dest="quality_report_path",
         help="Local Image Quality dry-run JSON with status=ok",
     )
+    freeze_selected_media_baseline = subcommands.add_parser(
+        "freeze-selected-media-baseline",
+        help="Freeze selected images against historical safe manifest snapshots",
+    )
+    freeze_selected_media_baseline.add_argument(
+        "--selection-report", required=True, type=Path,
+        dest="selection_report_path",
+        help="Local image-selection-dry-run.json report with status=ok",
+    )
+    freeze_selected_media_baseline.add_argument(
+        "--nested-baseline", required=True, type=Path,
+        dest="nested_baseline_path",
+        help="Historical nested Drive manifest dry-run JSON report",
+    )
+    freeze_selected_media_baseline.add_argument(
+        "--depth2-baseline", required=True, type=Path,
+        dest="depth2_baseline_path",
+        help="Historical depth-two Drive manifest dry-run JSON report",
+    )
     link_product_options = subcommands.add_parser(
         "link-product-options",
         help="Link local Product and Additional Option dry-run reports",
@@ -1654,6 +1718,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     if arguments.command == "select-product-images":
         return _run_select_product_images(logger, arguments.quality_report_path)
+    if arguments.command == "freeze-selected-media-baseline":
+        return _run_freeze_selected_media_baseline(
+            logger,
+            arguments.selection_report_path,
+            arguments.nested_baseline_path,
+            arguments.depth2_baseline_path,
+        )
     if arguments.command == "link-product-options":
         return _run_link_product_options(
             logger,

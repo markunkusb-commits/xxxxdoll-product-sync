@@ -279,6 +279,23 @@ python -m sync_worker select-product-images `
 
 输入必须 `status=ok`、Quality Policy 版本准确，并且 network/download/conversion/WordPress upload/external-write counters 全部为 0。本命令不读取 Unified/Asset/Drive/Folder Role 报告、`.env`、credentials 或媒体文件，不创建 API 客户端，不遍历、不下载、不转换、不上传；唯一文件写入是这份本地 JSON 审计报告。
 
+### Selected Media Baseline Snapshot V1（纯本地、只创建一次）
+
+在任何 fresh Drive traversal 前，可把已批准的 Selection 与两份历史安全 manifest 冻结为无下载权限的 identity anchor：
+
+```powershell
+python -m sync_worker freeze-selected-media-baseline `
+  --selection-report reports/image-selection-dry-run.json `
+  --nested-baseline reports/google-drive-nested-folder-manifest-dry-run.json `
+  --depth2-baseline reports/google-drive-depth2-folder-manifest-dry-run.json
+```
+
+命令只接受上述三类本地 JSON，Selection 必须为 `status=ok`、`xxxxdoll-image-selection-v1` 且所有离线计数为 0；历史 manifest 必须为 `status=ok`，并从其 `results[]` 恢复正式 Nested/Depth-2 domain。历史 `provider_content_checksum` 映射为内存 `md5_checksum`，`provider_file_id` 始终为 `None`，每个 selected item 再交由现有 Secure Selected Media Baseline Core 做大小写敏感的完整 provenance、fingerprint、MD5 与 image-candidate 校验。
+
+输出固定为 `reports/selected-media-baseline-snapshot.json`，版本为 `xxxxdoll-selected-media-baseline-snapshot-v1`。它仅保存三份输入文件的 SHA-256、Selection 顺序审计和 `SelectedMediaBaselineIdentity.to_safe_dict()` 结果，不保存输入路径、raw provider ID、URL、凭据或任何下载/上传 authority。结果按 SKU、`selection_position` 确定性排序，不重新选择或排名；若目标文件已存在则以 `selected_media_baseline_snapshot_already_exists` 终止，绝不覆盖或自动刷新。
+
+该流程不读取 `.env`、credentials 或媒体，不创建 Google/Drive/HTTP 客户端，不执行 Drive read、下载、媒体读取、转换或上传；唯一允许的写入是首次创建本地 baseline snapshot，报告中的外部写请求计数固定为 0。
+
 ## CLM RMB Price List Parser V1
 
 `sync_worker.clm_price_parser` 是纯本地、无网络和无写入的中间模型解析器。它接收已经生成的 sheet-layout 结构，依据每个动态系列标题划分产品 Block，并提取规格、included features、upgrade options、价格、notice 与图片链接占位符。未知规格和商业字段会连同坐标保留，不会被静默丢弃；`Height(Model)` 保持为独立原始规格并附加 warning，不会猜测拆分。
