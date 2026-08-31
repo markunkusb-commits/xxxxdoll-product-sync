@@ -296,6 +296,23 @@ python -m sync_worker freeze-selected-media-baseline `
 
 该流程不读取 `.env`、credentials 或媒体，不创建 Google/Drive/HTTP 客户端，不执行 Drive read、下载、媒体读取、转换或上传；唯一允许的写入是首次创建本地 baseline snapshot，报告中的外部写请求计数固定为 0。
 
+### Selected Media Handle Preparation V1
+
+经人工批准后，使用 frozen baseline 与当前 Selection 驱动一次最小 fresh metadata traversal：
+
+```powershell
+python -m sync_worker prepare-selected-media-handles `
+  --selection-report reports/image-selection-dry-run.json `
+  --baseline-snapshot reports/selected-media-baseline-snapshot.json `
+  --mapping reports/image-mapping-dry-run.json `
+  --sheet "RMB Price List" `
+  --sku-report reports/sku-dry-run.json
+```
+
+命令先在本地验证 Snapshot/Selection schema、版本、Selection 原始字节 SHA-256、Mapping/SKU snapshot compatibility，以及 `spreadsheets.readonly` + `drive.metadata.readonly` scopes；任何失败都发生在 Google client 创建前。随后复用现有 Secure Media Reader、SKU exact-range join、Media Discovery 和 Root Core，只 promotion 并读取 Selection 实际需要的唯一 depth-1/depth-2 路径，不生成或覆盖任何 Root/Nested/Depth2 manifest 报告，也不进入 depth 3。
+
+核心运行结果同时包含安全 audit 与仅内存的 `tuple[SecureSelectedMediaHandle, ...]`。历史 baseline restore 永远不含 provider ID；raw provider authority 只能来自 fresh Drive domain item。只有全部 selected item 均通过 fingerprint、MD5、MIME、size 和 dimensions 比对时才暴露完整 handle tuple；任一 blocker 都令 authoritative handles 为空，禁止部分下载。安全报告固定写入 `reports/selected-media-handle-preparation.json`，不含 raw IDs、URL、路径或 credentials，且不提供下载/上传 authority。本阶段仅执行 Sheets/Drive metadata read；下载、媒体读取、转换、WordPress 上传及外部写入计数均为 0。
+
 ## CLM RMB Price List Parser V1
 
 `sync_worker.clm_price_parser` 是纯本地、无网络和无写入的中间模型解析器。它接收已经生成的 sheet-layout 结构，依据每个动态系列标题划分产品 Block，并提取规格、included features、upgrade options、价格、notice 与图片链接占位符。未知规格和商业字段会连同坐标保留，不会被静默丢弃；`Height(Model)` 保持为独立原始规格并附加 warning，不会猜测拆分。

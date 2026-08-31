@@ -58,6 +58,10 @@ from .selected_media_baseline_snapshot import (
     SelectedMediaBaselineSnapshotError,
     run_selected_media_baseline_snapshot,
 )
+from .selected_media_handle_preparation import (
+    SelectedMediaHandlePreparationError,
+    run_selected_media_handle_preparation,
+)
 from .media_source_discovery_dry_run import (
     run_media_source_discovery_dry_run,
 )
@@ -963,6 +967,40 @@ def _run_freeze_selected_media_baseline(
     return 0
 
 
+def _run_prepare_selected_media_handles(
+    logger: logging.Logger,
+    selection_report_path: Path,
+    baseline_snapshot_path: Path,
+    mapping_path: Path,
+    sheet_title: str,
+    sku_report_path: Path,
+) -> int:
+    try:
+        settings = load_google_drive_metadata_config()
+        result, _ = run_selected_media_handle_preparation(
+            selection_report_path, baseline_snapshot_path, mapping_path,
+            sheet_title, sku_report_path, settings,
+            OfficialGoogleClientFactory(), project_root=PROJECT_ROOT,
+        )
+    except SelectedMediaHandlePreparationError as error:
+        _log_failure(logger, error, event="selected_media_handle_preparation_aborted")
+        return 2
+    except Exception:
+        _log_failure(
+            logger, ValueError("selected_media_handle_preparation_failed"),
+            event="selected_media_handle_preparation_aborted",
+        )
+        return 2
+    report = result.to_safe_report_dict()
+    logger.info(json.dumps({
+        "event": "selected_media_handle_preparation_report_written",
+        "path": "reports/selected-media-handle-preparation.json",
+        "status": result.status, "summary": report["summary"],
+        "write_requests_performed": 0,
+    }, ensure_ascii=False, sort_keys=True))
+    return 0 if result.status == "ok" else 1
+
+
 def _run_link_product_options(
     logger: logging.Logger,
     product_input_path: Path,
@@ -1497,6 +1535,23 @@ def build_parser() -> argparse.ArgumentParser:
         dest="depth2_baseline_path",
         help="Historical depth-two Drive manifest dry-run JSON report",
     )
+    prepare_selected_media_handles = subcommands.add_parser(
+        "prepare-selected-media-handles",
+        help="Prepare all selected media handles from frozen identity and fresh metadata",
+    )
+    for flag, dest, help_text in (
+        ("--selection-report", "selection_report_path", "Current Image Selection report"),
+        ("--baseline-snapshot", "baseline_snapshot_path", "Frozen selected media baseline snapshot"),
+        ("--mapping", "mapping_path", "Current Image Mapping report"),
+        ("--sku-report", "sku_report_path", "Current verified SKU report"),
+    ):
+        prepare_selected_media_handles.add_argument(
+            flag, required=True, type=Path, dest=dest, help=help_text,
+        )
+    prepare_selected_media_handles.add_argument(
+        "--sheet", required=True, type=_sheet_title_argument,
+        dest="sheet_title", help="Exact Google Sheet title",
+    )
     link_product_options = subcommands.add_parser(
         "link-product-options",
         help="Link local Product and Additional Option dry-run reports",
@@ -1724,6 +1779,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             arguments.selection_report_path,
             arguments.nested_baseline_path,
             arguments.depth2_baseline_path,
+        )
+    if arguments.command == "prepare-selected-media-handles":
+        return _run_prepare_selected_media_handles(
+            logger, arguments.selection_report_path,
+            arguments.baseline_snapshot_path, arguments.mapping_path,
+            arguments.sheet_title, arguments.sku_report_path,
         )
     if arguments.command == "link-product-options":
         return _run_link_product_options(

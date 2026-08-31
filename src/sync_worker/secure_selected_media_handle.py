@@ -33,6 +33,12 @@ _GALLERY_FOLDER_ROLES = frozenset({
     folder_role_policy.FolderRole.STOREFRONT_PHOTOS,
     folder_role_policy.FolderRole.FACTORY_PHOTOS,
 })
+_SAFE_BASELINE_IDENTITY_FIELDS = frozenset({
+    "policy_version", "sku", "product_source", "source_manifest_kind", "depth",
+    "safe_folder_name", "parent_safe_folder_name", "safe_name",
+    "file_id_fingerprint", "md5_checksum", "source_mime_type", "size_bytes",
+    "image_width", "image_height",
+})
 
 
 class SecureSelectedMediaHandleError(ValueError):
@@ -397,6 +403,60 @@ def create_selected_media_baseline_identity(
         _BASELINE_CAPABILITY, selection_item=selection, source_item=source_item,
     )
     return _validate_baseline_identity(baseline, selection)
+
+
+def restore_selected_media_baseline_identity(
+    selection_item: image_selection_policy.ImageSelectionItem,
+    safe_baseline_identity: Mapping[str, object],
+) -> SelectedMediaBaselineIdentity:
+    """Restore a non-authorizing baseline from an exact safe snapshot record."""
+    selection = _validate_selection_item(selection_item)
+    if (
+        not isinstance(safe_baseline_identity, Mapping)
+        or any(type(key) is not str for key in safe_baseline_identity)
+        or set(safe_baseline_identity) != _SAFE_BASELINE_IDENTITY_FIELDS
+    ):
+        raise SecureSelectedMediaHandleError("invalid_safe_baseline_identity")
+    value = safe_baseline_identity
+    source = value.get("product_source")
+    if (
+        value.get("policy_version") != POLICY_VERSION
+        or not isinstance(source, Mapping)
+        or set(source) != {"start_row", "end_row"}
+        or type(source.get("start_row")) is not int
+        or type(source.get("end_row")) is not int
+    ):
+        raise SecureSelectedMediaHandleError("invalid_safe_baseline_identity")
+    restored_source = ProductSourceRange(source["start_row"], source["end_row"])
+    if (
+        value.get("sku") != selection.sku
+        or restored_source != selection.product_source
+        or value.get("source_manifest_kind") != selection.source_manifest_kind
+        or value.get("depth") != selection.depth
+        or value.get("safe_folder_name") != selection.safe_folder_name
+        or value.get("parent_safe_folder_name") != selection.parent_safe_folder_name
+        or value.get("safe_name") != selection.safe_name
+    ):
+        raise SecureSelectedMediaHandleError("selected_media_baseline_provenance_mismatch")
+    item = root_core.DriveManifestItem(
+        safe_name=value["safe_name"],
+        mime_type=value["source_mime_type"],
+        size_bytes=value["size_bytes"], modified_time=None,
+        md5_checksum=value["md5_checksum"],
+        file_id_fingerprint=value["file_id_fingerprint"],
+        item_kind="image_candidate", image_candidate=True,
+        image_candidate_status="historical_snapshot_identity",
+        image_width=value["image_width"], image_height=value["image_height"],
+        image_rotation=None, warnings=(), provider_file_id=None,
+    )
+    try:
+        _validate_item_shape(item)
+        baseline = SelectedMediaBaselineIdentity(
+            _BASELINE_CAPABILITY, selection_item=selection, source_item=item,
+        )
+        return _validate_baseline_identity(baseline, selection)
+    except (SecureSelectedMediaHandleError, TypeError, ValueError):
+        raise SecureSelectedMediaHandleError("invalid_safe_baseline_identity") from None
 
 
 class SecureSelectedMediaHandle:
