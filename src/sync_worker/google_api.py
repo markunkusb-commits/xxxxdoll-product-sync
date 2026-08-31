@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any, BinaryIO, Protocol
 
 from .config import GoogleSettings
 from .sanitization import Redactor
@@ -31,6 +31,10 @@ class GoogleClientFactory(Protocol):
 
 class GoogleDriveMetadataClientFactory(Protocol):
     def create_drive_metadata(self, settings: GoogleSettings) -> Any: ...
+
+
+class GoogleDriveContentClientFactory(Protocol):
+    def create_drive_content_readonly(self, settings: GoogleSettings) -> Any: ...
 
 
 class GoogleDriveMetadataAndSheetsClientFactory(Protocol):
@@ -205,6 +209,28 @@ class OfficialGoogleClientFactory:
         """Build only Drive v3 with the exact metadata-only OAuth scope."""
 
         settings.validate_drive_metadata()
+        redactor = google_redactor_for_settings(settings)
+        authorized_http = self._create_authorized_http(
+            settings,
+            (settings.drive_scope,),
+            redactor,
+        )
+        try:
+            from googleapiclient.discovery import build
+
+            return build(
+                "drive",
+                "v3",
+                http=authorized_http,
+                cache_discovery=False,
+            )
+        except Exception as error:
+            raise _stage_error("drive_client_build", error, redactor) from None
+
+    def create_drive_content_readonly(self, settings: GoogleSettings) -> Any:
+        """Build Drive v3 with only the exact file-content read scope."""
+
+        settings.validate_drive_content_readonly()
         redactor = google_redactor_for_settings(settings)
         authorized_http = self._create_authorized_http(
             settings,
@@ -550,3 +576,113 @@ class GoogleDriveMetadataGateway:
         ensure_google_operation_allowed("drive.files.list")
         self.counters.read_requests_performed += 1
         return request.execute()
+
+
+@dataclass(frozen=True, slots=True)
+class GoogleDriveContentDownloadReceipt:
+    """Safe accounting returned after one bounded streaming download attempt."""
+
+    requests_performed: int
+    bytes_written: int
+
+
+class GoogleDriveContentDownloadError(RuntimeError):
+    """Fixed-code provider error carrying only safe retry/accounting metadata."""
+
+    __slots__ = ("code", "transient", "requests_performed")
+
+    def __init__(
+        self, code: str, *, transient: bool, requests_performed: int
+    ) -> None:
+        super().__init__(code)
+        self.code = code
+        self.transient = transient
+        self.requests_performed = requests_performed
+
+
+class GoogleDriveContentSinkError(RuntimeError):
+    """Fixed-code local streaming sink rejection; never a provider failure."""
+
+
+_TRANSIENT_DOWNLOAD_STATUS_CODES = frozenset({408, 429, 500, 502, 503, 504})
+_TRANSIENT_DOWNLOAD_ERROR_NAMES = frozenset({
+    "ConnectionError", "ConnectionResetError", "ServerNotFoundError",
+    "TimeoutError", "TransportError",
+})
+
+
+def _safe_content_download_error(
+    error: BaseException, requests_performed: int
+) -> GoogleDriveContentDownloadError:
+    response = getattr(error, "resp", None)
+    status = getattr(response, "status", None)
+    if status == 403:
+        code, transient = "drive_download_forbidden", False
+    elif status == 404:
+        code, transient = "drive_download_not_found", False
+    elif status in _TRANSIENT_DOWNLOAD_STATUS_CODES:
+        code, transient = "drive_download_transient_error", True
+    elif isinstance(error, (ConnectionError, TimeoutError, OSError)) or type(error).__name__ in _TRANSIENT_DOWNLOAD_ERROR_NAMES:
+        code, transient = "drive_download_transient_error", True
+    else:
+        code, transient = "drive_download_provider_error", False
+    return GoogleDriveContentDownloadError(
+        code, transient=transient, requests_performed=requests_performed,
+    )
+
+
+class GoogleDriveContentGateway:
+    """Expose only bounded `files.get(alt=media)` streaming downloads."""
+
+    def __init__(self, drive_client: Any) -> None:
+        self._drive = drive_client
+        self.counters = GoogleRequestCounters()
+
+    def download_file(
+        self,
+        provider_file_id: str,
+        sink: BinaryIO,
+        *,
+        chunk_size: int,
+    ) -> GoogleDriveContentDownloadReceipt:
+        if (
+            type(provider_file_id) is not str
+            or _DRIVE_RESOURCE_ID_PATTERN.fullmatch(provider_file_id) is None
+        ):
+            raise GoogleOperationBlocked("Drive file identifier is invalid")
+        if type(chunk_size) is not int or not 64 * 1024 <= chunk_size <= 8 * 1024 * 1024:
+            raise ValueError("Drive content chunk_size is outside the safe range")
+        ensure_google_operation_allowed("drive.files.get")
+        start_requests = self.counters.read_requests_performed
+        try:
+            from googleapiclient.http import MediaIoBaseDownload
+
+            request = self._drive.files().get(
+                fileId=provider_file_id,
+                alt="media",
+                supportsAllDrives=True,
+            )
+            downloader = MediaIoBaseDownload(sink, request, chunksize=chunk_size)
+            done = False
+            while not done:
+                self.counters.read_requests_performed += 1
+                _, done = downloader.next_chunk(num_retries=0)
+        except GoogleDriveContentSinkError:
+            raise
+        except Exception as error:
+            raise _safe_content_download_error(
+                error,
+                self.counters.read_requests_performed - start_requests,
+            ) from None
+        requests = self.counters.read_requests_performed - start_requests
+        bytes_written = getattr(sink, "bytes_written", None)
+        if type(bytes_written) is not int or bytes_written < 0:
+            raise GoogleDriveContentDownloadError(
+                "drive_download_sink_contract_violation",
+                transient=False,
+                requests_performed=requests,
+            )
+        return GoogleDriveContentDownloadReceipt(
+            requests_performed=requests,
+            bytes_written=bytes_written,
+        )

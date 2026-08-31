@@ -28,7 +28,11 @@ _PORT_PATTERN = re.compile(r"^[0-9]+$")
 _DOUBLE_QUOTED_ESCAPE_PATTERN = re.compile(r'\\([\\"nrt])')
 DEFAULT_DOTENV_PATH = Path(__file__).resolve().parents[2] / ".env"
 PROJECT_ROOT = DEFAULT_DOTENV_PATH.parent
-GOOGLE_DRIVE_READONLY_SCOPE = "https://www.googleapis.com/auth/drive.readonly"
+GOOGLE_DRIVE_CONTENT_READONLY_SCOPE = (
+    "https://www.googleapis.com/auth/drive.readonly"
+)
+# Backward-compatible name used by the full Google doctor workflow.
+GOOGLE_DRIVE_READONLY_SCOPE = GOOGLE_DRIVE_CONTENT_READONLY_SCOPE
 GOOGLE_DRIVE_METADATA_READONLY_SCOPE = (
     "https://www.googleapis.com/auth/drive.metadata.readonly"
 )
@@ -382,6 +386,16 @@ class GoogleSettings:
         if self.drive_scope != GOOGLE_DRIVE_METADATA_READONLY_SCOPE:
             raise ConfigError("drive_metadata_scope_unavailable")
 
+    def validate_drive_content_readonly(
+        self, *, project_root: Path = PROJECT_ROOT
+    ) -> None:
+        """Validate only the configuration needed to read Drive file bytes."""
+
+        self._validate_proxy()
+        self._validate_service_account_file(project_root=project_root)
+        if self.drive_scope != GOOGLE_DRIVE_CONTENT_READONLY_SCOPE:
+            raise ConfigError("drive_content_readonly_scope_unavailable")
+
     def validate_drive_metadata_with_sheets(
         self, *, project_root: Path = PROJECT_ROOT
     ) -> None:
@@ -494,6 +508,20 @@ def load_google_drive_metadata_config(
     source = _configuration_source(environ, dotenv_path)
     settings = _google_settings_from_source(source)
     settings.validate_drive_metadata(project_root=project_root)
+    return settings
+
+
+def load_google_drive_content_config(
+    environ: Mapping[str, str] | None = None,
+    *,
+    dotenv_path: str | Path | None = None,
+    project_root: Path = PROJECT_ROOT,
+) -> GoogleSettings:
+    """Load only proxy, credentials path, and exact Drive content-read scope."""
+
+    source = _configuration_source(environ, dotenv_path)
+    settings = _google_settings_from_source(source)
+    settings.validate_drive_content_readonly(project_root=project_root)
     return settings
 
 
