@@ -313,6 +313,23 @@ python -m sync_worker prepare-selected-media-handles `
 
 核心运行结果同时包含安全 audit 与仅内存的 `tuple[SecureSelectedMediaHandle, ...]`。历史 baseline restore 永远不含 provider ID；raw provider authority 只能来自 fresh Drive domain item。只有全部 selected item 均通过 fingerprint、MD5、MIME、size 和 dimensions 比对时才暴露完整 handle tuple；任一 blocker 都令 authoritative handles 为空，禁止部分下载。安全报告固定写入 `reports/selected-media-handle-preparation.json`，不含 raw IDs、URL、路径或 credentials，且不提供下载/上传 authority。本阶段仅执行 Sheets/Drive metadata read；下载、媒体读取、转换、WordPress 上传及外部写入计数均为 0。
 
+### Secure Media Download Canary Execution V1
+
+Canary 在同一进程内先完成全部 Selection 的 fresh metadata Preparation，再按精确 SKU 与 selection position 选择唯一 handle，并用独立的 `drive.readonly` client 验证一张源图片：
+
+```powershell
+python -m sync_worker download-selected-media-canary `
+  --selection-report reports/image-selection-dry-run.json `
+  --baseline-snapshot reports/selected-media-baseline-snapshot.json `
+  --mapping reports/image-mapping-dry-run.json `
+  --sheet "RMB Price List" `
+  --sku-report reports/sku-dry-run.json `
+  --sku CLM-CLASSIC-SI70CM-AR `
+  --position 0
+```
+
+Preparation 始终继续使用 `spreadsheets.readonly` 与 `drive.metadata.readonly`；只有精确命中的单个 canary handle 会交给 `drive.readonly` Download Core。源文件经过 MD5、size 和 magic signature 验证后会在命令返回前立即清理，不保留下载 artifact，不执行 WebP 转换或 WordPress 上传。唯一新报告为 `reports/secure-media-download-canary.json`；不会读取 Preparation JSON 来恢复 authority，也不会生成或覆盖 Root/Nested/Depth2 manifest 报告。
+
 ## CLM RMB Price List Parser V1
 
 `sync_worker.clm_price_parser` 是纯本地、无网络和无写入的中间模型解析器。它接收已经生成的 sheet-layout 结构，依据每个动态系列标题划分产品 Block，并提取规格、included features、upgrade options、价格、notice 与图片链接占位符。未知规格和商业字段会连同坐标保留，不会被静默丢弃；`Height(Model)` 保持为独立原始规格并附加 warning，不会猜测拆分。

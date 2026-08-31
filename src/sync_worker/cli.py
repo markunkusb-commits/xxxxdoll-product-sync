@@ -62,6 +62,10 @@ from .selected_media_handle_preparation import (
     SelectedMediaHandlePreparationError,
     run_selected_media_handle_preparation,
 )
+from .secure_media_download_canary import (
+    SecureMediaDownloadCanaryError,
+    run_secure_media_download_canary,
+)
 from .media_source_discovery_dry_run import (
     run_media_source_discovery_dry_run,
 )
@@ -335,6 +339,16 @@ def _sheet_title_argument(value: str) -> str:
         return validate_sheet_title(value)
     except ValueError as error:
         raise argparse.ArgumentTypeError(str(error)) from None
+
+
+def _selection_position_argument(value: str) -> int:
+    try:
+        position = int(value)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError("position_must_be_nonnegative_integer") from None
+    if position < 0:
+        raise argparse.ArgumentTypeError("position_must_be_nonnegative_integer")
+    return position
 
 
 def _sheet_range_argument(value: str) -> str:
@@ -1001,6 +1015,46 @@ def _run_prepare_selected_media_handles(
     return 0 if result.status == "ok" else 1
 
 
+def _run_secure_media_download_canary(
+    logger: logging.Logger,
+    selection_report_path: Path,
+    baseline_snapshot_path: Path,
+    mapping_path: Path,
+    sheet_title: str,
+    sku_report_path: Path,
+    sku: str,
+    position: int,
+) -> int:
+    try:
+        settings = load_google_drive_metadata_config()
+        report, _ = run_secure_media_download_canary(
+            selection_report_path, baseline_snapshot_path, mapping_path,
+            sheet_title, sku_report_path, sku, position,
+            settings, OfficialGoogleClientFactory(), project_root=PROJECT_ROOT,
+        )
+    except SecureMediaDownloadCanaryError as error:
+        _log_failure(logger, error, event="secure_media_download_canary_aborted")
+        return 2
+    except Exception:
+        _log_failure(
+            logger, ValueError("secure_media_download_canary_failed"),
+            event="secure_media_download_canary_aborted",
+        )
+        return 2
+    logger.info(json.dumps({
+        "event": "secure_media_download_canary_report_written",
+        "path": "reports/secure-media-download-canary.json",
+        "status": report["status"],
+        "cleanup_completed": report["cleanup_completed"],
+        "source_files_remaining": report["source_files_remaining"],
+        "download_requests_performed": report["download_requests_performed"],
+        "write_requests_performed": 0,
+    }, ensure_ascii=False, sort_keys=True))
+    if report["status"] == "ok":
+        return 0
+    return 2 if report["status"] == "failed" else 1
+
+
 def _run_link_product_options(
     logger: logging.Logger,
     product_input_path: Path,
@@ -1552,6 +1606,30 @@ def build_parser() -> argparse.ArgumentParser:
         "--sheet", required=True, type=_sheet_title_argument,
         dest="sheet_title", help="Exact Google Sheet title",
     )
+    download_selected_media_canary = subcommands.add_parser(
+        "download-selected-media-canary",
+        help="Prepare all handles and verify one exact Drive media download",
+    )
+    for flag, dest, help_text in (
+        ("--selection-report", "selection_report_path", "Current Image Selection report"),
+        ("--baseline-snapshot", "baseline_snapshot_path", "Frozen selected media baseline snapshot"),
+        ("--mapping", "mapping_path", "Current Image Mapping report"),
+        ("--sku-report", "sku_report_path", "Current verified SKU report"),
+    ):
+        download_selected_media_canary.add_argument(
+            flag, required=True, type=Path, dest=dest, help=help_text,
+        )
+    download_selected_media_canary.add_argument(
+        "--sheet", required=True, type=_sheet_title_argument,
+        dest="sheet_title", help="Exact Google Sheet title",
+    )
+    download_selected_media_canary.add_argument(
+        "--sku", required=True, help="Exact selected product SKU",
+    )
+    download_selected_media_canary.add_argument(
+        "--position", required=True, type=_selection_position_argument,
+        help="Exact zero-based selected image position",
+    )
     link_product_options = subcommands.add_parser(
         "link-product-options",
         help="Link local Product and Additional Option dry-run reports",
@@ -1785,6 +1863,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             logger, arguments.selection_report_path,
             arguments.baseline_snapshot_path, arguments.mapping_path,
             arguments.sheet_title, arguments.sku_report_path,
+        )
+    if arguments.command == "download-selected-media-canary":
+        return _run_secure_media_download_canary(
+            logger, arguments.selection_report_path,
+            arguments.baseline_snapshot_path, arguments.mapping_path,
+            arguments.sheet_title, arguments.sku_report_path,
+            arguments.sku, arguments.position,
         )
     if arguments.command == "link-product-options":
         return _run_link_product_options(

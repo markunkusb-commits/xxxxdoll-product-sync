@@ -472,7 +472,7 @@ def prepare_selected_media_handles_from_fresh_root(
     return SelectedMediaHandlePreparationResult(report["status"], sanitized, authoritative)
 
 
-def run_selected_media_handle_preparation(
+def prepare_selected_media_handles(
     selection_report_path: Path,
     baseline_snapshot_path: Path,
     mapping_path: Path,
@@ -480,9 +480,8 @@ def run_selected_media_handle_preparation(
     sku_report_path: Path,
     settings: GoogleSettings,
     client_factory: GoogleDriveMetadataAndSheetsClientFactory,
-    *, project_root: Path,
-) -> tuple[SelectedMediaHandlePreparationResult, Path]:
-    """Validate local inputs, perform bounded metadata reads, write one audit."""
+) -> SelectedMediaHandlePreparationResult:
+    """Prepare authoritative handles without writing any report."""
     try:
         selection_path = snapshot_core._local_path(selection_report_path)
         raw_selection = selection_path.read_bytes()
@@ -513,6 +512,25 @@ def run_selected_media_handle_preparation(
     result = prepare_selected_media_handles_from_fresh_root(
         selections, baselines, root_read, gateway,
         sheets_read_requests_performed=read_batch.read_requests_performed,
+    )
+    return result
+
+
+def run_selected_media_handle_preparation(
+    selection_report_path: Path,
+    baseline_snapshot_path: Path,
+    mapping_path: Path,
+    sheet_title: str,
+    sku_report_path: Path,
+    settings: GoogleSettings,
+    client_factory: GoogleDriveMetadataAndSheetsClientFactory,
+    *, project_root: Path,
+) -> tuple[SelectedMediaHandlePreparationResult, Path]:
+    """Prepare handles and write the standalone Preparation audit."""
+
+    result = prepare_selected_media_handles(
+        selection_report_path, baseline_snapshot_path, mapping_path,
+        sheet_title, sku_report_path, settings, client_factory,
     )
     output = Path(project_root) / "reports" / REPORT_FILENAME
     SafeJsonReportWriter(output, Redactor()).write(result.to_safe_report_dict())
