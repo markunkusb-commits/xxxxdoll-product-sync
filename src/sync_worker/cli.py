@@ -66,6 +66,10 @@ from .secure_media_download_canary import (
     SecureMediaDownloadCanaryError,
     run_secure_media_download_canary,
 )
+from .secure_media_download_execution import (
+    SecureMediaDownloadExecutionError,
+    run_secure_media_download_execution,
+)
 from .media_source_discovery_dry_run import (
     run_media_source_discovery_dry_run,
 )
@@ -1055,6 +1059,62 @@ def _run_secure_media_download_canary(
     return 2 if report["status"] == "failed" else 1
 
 
+def _run_secure_media_download_execution(
+    logger: logging.Logger,
+    selection_report_path: Path,
+    baseline_snapshot_path: Path,
+    mapping_path: Path,
+    sheet_title: str,
+    sku_report_path: Path,
+) -> int:
+    def safe_progress(event: object) -> None:
+        if not isinstance(event, dict):
+            raise ValueError("invalid_download_progress_event")
+        safe_event = {
+            key: event.get(key)
+            for key in (
+                "current_index", "total_items", "sku",
+                "selection_position", "status",
+            )
+        }
+        logger.info(json.dumps({
+            "event": "secure_media_download_progress",
+            **safe_event,
+        }, ensure_ascii=False, sort_keys=True))
+
+    try:
+        settings = load_google_drive_metadata_config()
+        report, _ = run_secure_media_download_execution(
+            selection_report_path, baseline_snapshot_path, mapping_path,
+            sheet_title, sku_report_path, settings,
+            OfficialGoogleClientFactory(), project_root=PROJECT_ROOT,
+            progress_callback=safe_progress,
+        )
+    except SecureMediaDownloadExecutionError as error:
+        _log_failure(logger, error, event="secure_media_download_execution_aborted")
+        return 2
+    except Exception:
+        _log_failure(
+            logger, ValueError("secure_media_download_execution_failed"),
+            event="secure_media_download_execution_aborted",
+        )
+        return 2
+    logger.info(json.dumps({
+        "event": "secure_media_download_execution_report_written",
+        "path": "reports/secure-media-download-execution.json",
+        "status": report["status"],
+        "selected_items": report["selected_items"],
+        "downloads_verified": report["downloads_verified"],
+        "cleanup_completed": report["cleanup_completed"],
+        "source_files_remaining": report["source_files_remaining"],
+        "download_requests_performed": report["download_requests_performed"],
+        "write_requests_performed": 0,
+    }, ensure_ascii=False, sort_keys=True))
+    if report["status"] == "ok":
+        return 0
+    return 2 if report["status"] == "failed" else 1
+
+
 def _run_link_product_options(
     logger: logging.Logger,
     product_input_path: Path,
@@ -1630,6 +1690,23 @@ def build_parser() -> argparse.ArgumentParser:
         "--position", required=True, type=_selection_position_argument,
         help="Exact zero-based selected image position",
     )
+    download_selected_media_batch = subcommands.add_parser(
+        "download-selected-media-batch",
+        help="Prepare and verify the full approved Drive media batch",
+    )
+    for flag, dest, help_text in (
+        ("--selection-report", "selection_report_path", "Current Image Selection report"),
+        ("--baseline-snapshot", "baseline_snapshot_path", "Frozen selected media baseline snapshot"),
+        ("--mapping", "mapping_path", "Current Image Mapping report"),
+        ("--sku-report", "sku_report_path", "Current verified SKU report"),
+    ):
+        download_selected_media_batch.add_argument(
+            flag, required=True, type=Path, dest=dest, help=help_text,
+        )
+    download_selected_media_batch.add_argument(
+        "--sheet", required=True, type=_sheet_title_argument,
+        dest="sheet_title", help="Exact Google Sheet title",
+    )
     link_product_options = subcommands.add_parser(
         "link-product-options",
         help="Link local Product and Additional Option dry-run reports",
@@ -1870,6 +1947,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             arguments.baseline_snapshot_path, arguments.mapping_path,
             arguments.sheet_title, arguments.sku_report_path,
             arguments.sku, arguments.position,
+        )
+    if arguments.command == "download-selected-media-batch":
+        return _run_secure_media_download_execution(
+            logger, arguments.selection_report_path,
+            arguments.baseline_snapshot_path, arguments.mapping_path,
+            arguments.sheet_title, arguments.sku_report_path,
         )
     if arguments.command == "link-product-options":
         return _run_link_product_options(

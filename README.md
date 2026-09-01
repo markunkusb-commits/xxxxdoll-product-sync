@@ -330,6 +330,21 @@ python -m sync_worker download-selected-media-canary `
 
 Preparation 始终继续使用 `spreadsheets.readonly` 与 `drive.metadata.readonly`；只有精确命中的单个 canary handle 会交给 `drive.readonly` Download Core。源文件经过 MD5、size 和 magic signature 验证后会在命令返回前立即清理，不保留下载 artifact，不执行 WebP 转换或 WordPress 上传。唯一新报告为 `reports/secure-media-download-canary.json`；不会读取 Preparation JSON 来恢复 authority，也不会生成或覆盖 Root/Nested/Depth2 manifest 报告。
 
+### Secure Media Download Execution V1
+
+完整 Source Download Reality 命令会在同一进程内重新完成全部 selected media 的 fresh metadata Preparation，并将保持 canonical 顺序的完整 authoritative handle tuple 交给既有 Download Core：
+
+```powershell
+python -m sync_worker download-selected-media-batch `
+  --selection-report reports/image-selection-dry-run.json `
+  --baseline-snapshot reports/selected-media-baseline-snapshot.json `
+  --mapping reports/image-mapping-dry-run.json `
+  --sheet "RMB Price List" `
+  --sku-report reports/sku-dry-run.json
+```
+
+任何 content request 前都会验证每个预期文件大小，并检查临时 workspace 至少具有全部预期源文件大小加 512 MiB reserve 的可用空间。Preparation 继续限定为 `spreadsheets.readonly` 与 `drive.metadata.readonly`，下载客户端独立限定为 `drive.readonly`。CLI 会逐项输出仅包含 index、total、SKU、selection position 和状态的安全进度；不输出 Drive ID、URL、文件名、校验值或本地路径。完整 batch 采用 all-or-nothing：任一 MD5、size、signature 或 transport 失败都会令 authoritative artifacts 为 0 并清理已创建源文件；`KeyboardInterrupt`、`SystemExit` 或其他 `BaseException` 也会先清理整个 batch workspace 再原样抛出，且不会写最终 Execution 报告。即使全部成功，CLI 也会在写入 `reports/secure-media-download-execution.json` 前完成 cleanup，不保留源文件，不转换 WebP，也不访问 WordPress。
+
 ## CLM RMB Price List Parser V1
 
 `sync_worker.clm_price_parser` 是纯本地、无网络和无写入的中间模型解析器。它接收已经生成的 sheet-layout 结构，依据每个动态系列标题划分产品 Block，并提取规格、included features、upgrade options、价格、notice 与图片链接占位符。未知规格和商业字段会连同坐标保留，不会被静默丢弃；`Height(Model)` 保持为独立原始规格并附加 warning，不会猜测拆分。
