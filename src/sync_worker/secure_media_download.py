@@ -14,7 +14,7 @@ import os
 import re
 import stat
 import tempfile
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Protocol
 
@@ -64,6 +64,9 @@ class DriveContentDownloadGateway(Protocol):
         *,
         chunk_size: int,
     ) -> GoogleDriveContentDownloadReceipt: ...
+
+
+DownloadProgressCallback = Callable[[Mapping[str, object]], None]
 
 
 class _BoundedHashingSink:
@@ -531,13 +534,49 @@ def _normalized_handles(
     return handles
 
 
-def download_secure_media(
+class _DownloadWorkspaceLifecycle:
+    __slots__ = ("workspace", "paths")
+
+    def __init__(self) -> None:
+        self.workspace: Path | None = None
+        self.paths: list[Path] = []
+
+    def cleanup(self) -> int:
+        return _cleanup_files(tuple(self.paths), self.workspace)
+
+
+def _emit_download_progress(
+    callback: DownloadProgressCallback | None,
+    handle: handle_core.SecureSelectedMediaHandle,
+    *,
+    current_index: int,
+    total_items: int,
+    status: str,
+) -> None:
+    if callback is None:
+        return
+    event = {
+        "current_index": current_index,
+        "total_items": total_items,
+        "sku": handle.sku,
+        "selection_position": handle.selection_position,
+        "status": status,
+    }
+    try:
+        callback(event)
+    except Exception:
+        raise SecureMediaDownloadError("download_progress_callback_failed") from None
+
+
+def _download_secure_media_impl(
     handles: handle_core.SecureSelectedMediaHandle | tuple[handle_core.SecureSelectedMediaHandle, ...],
     gateway: DriveContentDownloadGateway,
     *,
     workspace_parent: Path | None = None,
+    progress_callback: DownloadProgressCallback | None = None,
+    lifecycle: _DownloadWorkspaceLifecycle,
 ) -> SecureMediaDownloadBatchResult:
-    """Stream and verify every handle, exposing artifacts only on total success."""
+    """Unprotected implementation; the public wrapper owns lifecycle cleanup."""
 
     selected = _normalized_handles(handles)
     parent = _safe_workspace_parent(workspace_parent)
@@ -546,12 +585,13 @@ def download_secure_media(
             prefix="xxxxdoll-secure-media-",
             dir=None if parent is None else str(parent),
         ))
+        lifecycle.workspace = workspace
     except OSError:
         raise SecureMediaDownloadError("download_workspace_creation_failed") from None
 
     audits: list[dict[str, object]] = []
     artifacts: list[VerifiedDownloadedMediaArtifact] = []
-    paths: list[Path] = []
+    paths = lifecycle.paths
     counters = {
         "handles_received": len(selected),
         "downloads_attempted": 0,
@@ -576,6 +616,13 @@ def download_secure_media(
             audit["blocking_issues"] = ["batch_aborted_after_failure"]
             audits.append(audit)
             continue
+        _emit_download_progress(
+            progress_callback,
+            handle,
+            current_index=index + 1,
+            total_items=len(selected),
+            status="download_started",
+        )
         extension = _MIME_EXTENSIONS.get(handle.source_mime_type)
         blocker: str | None = None
         if extension is None:
@@ -588,10 +635,18 @@ def download_secure_media(
             counters["downloads_failed"] += 1
             audits.append(audit)
             blocked = True
+            _emit_download_progress(
+                progress_callback,
+                handle,
+                current_index=index + 1,
+                total_items=len(selected),
+                status="download_blocked",
+            )
             continue
         source_path = workspace / (
             f"source-{index:03d}-{handle.selection_position:03d}.source{extension}"
         )
+        paths.append(source_path)
         try:
             stream = source_path.open("xb")
         except OSError:
@@ -600,8 +655,14 @@ def download_secure_media(
             counters["downloads_failed"] += 1
             audits.append(audit)
             blocked = True
+            _emit_download_progress(
+                progress_callback,
+                handle,
+                current_index=index + 1,
+                total_items=len(selected),
+                status="download_blocked",
+            )
             continue
-        paths.append(source_path)
         counters["source_files_created"] += 1
         try:
             sink = _BoundedHashingSink(stream, MAX_SOURCE_FILE_BYTES)
@@ -612,6 +673,13 @@ def download_secure_media(
             counters["downloads_failed"] += 1
             audits.append(audit)
             blocked = True
+            _emit_download_progress(
+                progress_callback,
+                handle,
+                current_index=index + 1,
+                total_items=len(selected),
+                status="download_blocked",
+            )
             continue
         counters["downloads_attempted"] += 1
         try:
@@ -726,7 +794,17 @@ def download_secure_media(
             audit["download_status"] = "download_blocked"
             audit["blocking_issues"] = [blocker]
             blocked = True
+            progress_status = "download_blocked"
+        else:
+            progress_status = "download_verified"
         audits.append(audit)
+        _emit_download_progress(
+            progress_callback,
+            handle,
+            current_index=index + 1,
+            total_items=len(selected),
+            status=progress_status,
+        )
 
     if blocked:
         cleaned = _cleanup_files(tuple(paths), workspace)
@@ -738,3 +816,28 @@ def download_secure_media(
         status="ok", summary=counters, results=tuple(audits),
         artifacts=tuple(artifacts), paths=tuple(paths), workspace=workspace,
     )
+
+
+def download_secure_media(
+    handles: handle_core.SecureSelectedMediaHandle | tuple[handle_core.SecureSelectedMediaHandle, ...],
+    gateway: DriveContentDownloadGateway,
+    *,
+    workspace_parent: Path | None = None,
+    progress_callback: DownloadProgressCallback | None = None,
+) -> SecureMediaDownloadBatchResult:
+    """Stream one batch and clean every tracked path on any BaseException."""
+
+    if progress_callback is not None and not callable(progress_callback):
+        raise SecureMediaDownloadError("invalid_download_progress_callback")
+    lifecycle = _DownloadWorkspaceLifecycle()
+    try:
+        return _download_secure_media_impl(
+            handles,
+            gateway,
+            workspace_parent=workspace_parent,
+            progress_callback=progress_callback,
+            lifecycle=lifecycle,
+        )
+    except BaseException:
+        lifecycle.cleanup()
+        raise

@@ -849,3 +849,202 @@ def test_152_no_json_report_created(tmp_path):
     after = set(tmp_path.rglob("*.json"))
     assert after == before
     result.cleanup()
+
+
+def interrupt_batch_handles(count):
+    return tuple(
+        make_handle(
+            position=index,
+            raw_id=f"interrupt_file_{index:03d}",
+            name=f"interrupt-{index:03d}.jpg",
+        )
+        for index in range(count)
+    )
+
+
+def interrupt_gateway(handles, interrupt_index, error):
+    data = {}
+    failures = {}
+    for index, handle in enumerate(handles):
+        raw_id = handle_core._provider_file_id_for_download(handle)
+        data[raw_id] = JPEG
+        if index == interrupt_index:
+            failures[raw_id] = [error]
+    return FakeGateway(data, failures=failures)
+
+
+@pytest.mark.parametrize("count,interrupt_index", [(1, 0), (6, 3), (96, 95)])
+def test_155_keyboard_interrupt_cleans_entire_batch_and_reraises(
+    tmp_path, count, interrupt_index,
+):
+    handles = interrupt_batch_handles(count)
+    gateway = interrupt_gateway(handles, interrupt_index, KeyboardInterrupt())
+    with pytest.raises(KeyboardInterrupt):
+        download_core.download_secure_media(
+            handles, gateway, workspace_parent=tmp_path,
+        )
+    assert not tuple(tmp_path.iterdir())
+    assert not tuple(tmp_path.rglob("source-*"))
+
+
+@pytest.mark.parametrize("count,interrupt_index,exit_code", [(1, 0, 3), (8, 4, 9)])
+def test_158_system_exit_cleans_entire_batch_and_reraises(
+    tmp_path, count, interrupt_index, exit_code,
+):
+    handles = interrupt_batch_handles(count)
+    gateway = interrupt_gateway(handles, interrupt_index, SystemExit(exit_code))
+    with pytest.raises(SystemExit) as caught:
+        download_core.download_secure_media(
+            handles, gateway, workspace_parent=tmp_path,
+        )
+    assert caught.value.code == exit_code
+    assert not tuple(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize("stage", ["write", "signature", "artifact"])
+def test_160_base_exception_guard_covers_entire_workspace_lifecycle(tmp_path, stage):
+    handle = make_handle()
+    raw_id = handle_core._provider_file_id_for_download(handle)
+    gateway = FakeGateway({raw_id: JPEG})
+    if stage == "write":
+        target = patch.object(
+            download_core._BoundedHashingSink,
+            "write",
+            side_effect=KeyboardInterrupt(),
+        )
+    elif stage == "signature":
+        target = patch.object(
+            download_core,
+            "_signature_matches",
+            side_effect=KeyboardInterrupt(),
+        )
+    else:
+        target = patch.object(
+            download_core,
+            "VerifiedDownloadedMediaArtifact",
+            side_effect=KeyboardInterrupt(),
+        )
+    with target:
+        with pytest.raises(KeyboardInterrupt):
+            download_core.download_secure_media(
+                (handle,), gateway, workspace_parent=tmp_path,
+            )
+    assert not tuple(tmp_path.iterdir())
+
+
+def test_163_progress_emits_started_and_verified_in_canonical_order(tmp_path):
+    handles = interrupt_batch_handles(3)
+    gateway = interrupt_gateway(handles, -1, KeyboardInterrupt())
+    events = []
+    result = download_core.download_secure_media(
+        handles,
+        gateway,
+        workspace_parent=tmp_path,
+        progress_callback=events.append,
+    )
+    assert [event["status"] for event in events] == [
+        "download_started", "download_verified",
+        "download_started", "download_verified",
+        "download_started", "download_verified",
+    ]
+    verified = events[1::2]
+    assert [event["current_index"] for event in verified] == [1, 2, 3]
+    assert all(event["total_items"] == 3 for event in events)
+    assert [(event["sku"], event["selection_position"]) for event in verified] == [
+        (handle.sku, handle.selection_position) for handle in handles
+    ]
+    result.cleanup()
+
+
+def test_164_progress_emits_blocked_and_stops_download_progress(tmp_path):
+    handles = interrupt_batch_handles(3)
+    target = handles[1]
+    raw_id = handle_core._provider_file_id_for_download(target)
+    gateway = interrupt_gateway(handles, -1, KeyboardInterrupt())
+    gateway.data_by_id[raw_id] = JPEG[:-1] + b"x"
+    events = []
+    result = download_core.download_secure_media(
+        handles,
+        gateway,
+        workspace_parent=tmp_path,
+        progress_callback=events.append,
+    )
+    assert result.status == "blocked"
+    assert [event["status"] for event in events] == [
+        "download_started", "download_verified",
+        "download_started", "download_blocked",
+    ]
+    assert len(gateway.calls) == 2
+    assert not tuple(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize("forbidden", [
+    "provider_file_id", "file_id_fingerprint", "drive.google.com", "download_url",
+    "safe_name", "local_source_path", "temp", "md5", "credentials",
+])
+def test_165_progress_event_contains_only_safe_fields(tmp_path, forbidden):
+    handle = make_handle()
+    raw_id = handle_core._provider_file_id_for_download(handle)
+    events = []
+    result = download_core.download_secure_media(
+        (handle,), FakeGateway({raw_id: JPEG}), workspace_parent=tmp_path,
+        progress_callback=events.append,
+    )
+    assert set(events[0]) == {
+        "current_index", "total_items", "sku", "selection_position", "status",
+    }
+    assert forbidden.casefold() not in json.dumps(events).casefold()
+    result.cleanup()
+
+
+@pytest.mark.parametrize("failure_status", ["download_started", "download_verified"])
+def test_174_progress_callback_exception_cleans_and_becomes_fixed_error(
+    tmp_path, failure_status,
+):
+    handle = make_handle()
+    raw_id = handle_core._provider_file_id_for_download(handle)
+
+    def callback(event):
+        if event["status"] == failure_status:
+            raise RuntimeError("unsafe callback detail and path")
+
+    with pytest.raises(
+        download_core.SecureMediaDownloadError,
+        match="^download_progress_callback_failed$",
+    ):
+        download_core.download_secure_media(
+            (handle,), FakeGateway({raw_id: JPEG}), workspace_parent=tmp_path,
+            progress_callback=callback,
+        )
+    assert not tuple(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize("signal", [KeyboardInterrupt(), SystemExit(7)])
+def test_176_progress_callback_base_exception_is_original_and_cleanup(tmp_path, signal):
+    handle = make_handle()
+    raw_id = handle_core._provider_file_id_for_download(handle)
+
+    def callback(event):
+        if event["status"] == "download_verified":
+            raise signal
+
+    with pytest.raises(type(signal)) as caught:
+        download_core.download_secure_media(
+            (handle,), FakeGateway({raw_id: JPEG}), workspace_parent=tmp_path,
+            progress_callback=callback,
+        )
+    assert caught.value is signal
+    assert not tuple(tmp_path.iterdir())
+
+
+def test_178_invalid_progress_callback_fails_before_workspace(tmp_path):
+    handle = make_handle()
+    with pytest.raises(
+        download_core.SecureMediaDownloadError,
+        match="^invalid_download_progress_callback$",
+    ):
+        download_core.download_secure_media(
+            (handle,), FakeGateway(), workspace_parent=tmp_path,
+            progress_callback="not-callable",
+        )
+    assert not tuple(tmp_path.iterdir())
