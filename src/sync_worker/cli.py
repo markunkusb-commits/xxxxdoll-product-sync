@@ -70,6 +70,10 @@ from .verified_webp_conversion_canary import (
     VerifiedWebPConversionCanaryError,
     run_verified_webp_conversion_canary,
 )
+from .verified_webp_conversion_execution import (
+    VerifiedWebPConversionExecutionError,
+    run_verified_webp_conversion_execution,
+)
 from .secure_media_download_execution import (
     SecureMediaDownloadExecutionError,
     run_secure_media_download_execution,
@@ -1175,6 +1179,84 @@ def _run_secure_media_download_execution(
     return 2 if report["status"] == "failed" else 1
 
 
+def _run_verified_webp_conversion_execution(
+    logger: logging.Logger,
+    selection_report_path: Path,
+    baseline_snapshot_path: Path,
+    mapping_path: Path,
+    sheet_title: str,
+    sku_report_path: Path,
+) -> int:
+    def safe_progress(event: object) -> None:
+        if not isinstance(event, dict):
+            raise ValueError("invalid_webp_execution_progress_event")
+        status = event.get("status")
+        stage = event.get("stage")
+        if stage is None and type(status) is str and status.startswith("download_"):
+            stage = "download"
+        safe_event = {
+            key: event.get(key)
+            for key in (
+                "current_index",
+                "total_items",
+                "sku",
+                "selection_position",
+            )
+        }
+        safe_event["stage"] = stage
+        safe_event["status"] = status
+        logger.info(json.dumps({
+            "event": "verified_webp_conversion_execution_progress",
+            **safe_event,
+        }, ensure_ascii=False, sort_keys=True))
+
+    try:
+        settings = load_google_drive_metadata_config()
+        report, _ = run_verified_webp_conversion_execution(
+            selection_report_path,
+            baseline_snapshot_path,
+            mapping_path,
+            sheet_title,
+            sku_report_path,
+            settings,
+            OfficialGoogleClientFactory(),
+            project_root=PROJECT_ROOT,
+            download_progress_callback=safe_progress,
+            conversion_progress_callback=safe_progress,
+        )
+    except VerifiedWebPConversionExecutionError as error:
+        _log_failure(
+            logger,
+            error,
+            event="verified_webp_conversion_execution_aborted",
+        )
+        return 2
+    except Exception:
+        _log_failure(
+            logger,
+            ValueError("verified_webp_conversion_execution_failed"),
+            event="verified_webp_conversion_execution_aborted",
+        )
+        return 2
+    logger.info(json.dumps({
+        "event": "verified_webp_conversion_execution_report_written",
+        "path": "reports/verified-webp-conversion-execution.json",
+        "status": report["status"],
+        "selected_items": report["selected_items"],
+        "downloads_verified": report["downloads_verified"],
+        "conversion_verified": report["conversion_verified"],
+        "source_cleanup_completed": report["source_cleanup_completed"],
+        "source_files_remaining": report["source_files_remaining"],
+        "webp_cleanup_completed": report["webp_cleanup_completed"],
+        "webp_files_remaining": report["webp_files_remaining"],
+        "wordpress_upload_requests_performed": 0,
+        "write_requests_performed": 0,
+    }, ensure_ascii=False, sort_keys=True))
+    if report["status"] == "ok":
+        return 0
+    return 2 if report["status"] == "failed" else 1
+
+
 def _run_link_product_options(
     logger: logging.Logger,
     product_input_path: Path,
@@ -1774,6 +1856,23 @@ def build_parser() -> argparse.ArgumentParser:
         "--position", required=True, type=_selection_position_argument,
         help="Exact zero-based selected image position",
     )
+    convert_selected_media_batch = subcommands.add_parser(
+        "convert-selected-media-batch",
+        help="Fresh-prepare, download, and verify the full selected WebP batch",
+    )
+    for flag, dest, help_text in (
+        ("--selection-report", "selection_report_path", "Current Image Selection report"),
+        ("--baseline-snapshot", "baseline_snapshot_path", "Frozen selected media baseline snapshot"),
+        ("--mapping", "mapping_path", "Current Image Mapping report"),
+        ("--sku-report", "sku_report_path", "Current verified SKU report"),
+    ):
+        convert_selected_media_batch.add_argument(
+            flag, required=True, type=Path, dest=dest, help=help_text,
+        )
+    convert_selected_media_batch.add_argument(
+        "--sheet", required=True, type=_sheet_title_argument,
+        dest="sheet_title", help="Exact Google Sheet title",
+    )
     download_selected_media_batch = subcommands.add_parser(
         "download-selected-media-batch",
         help="Prepare and verify the full approved Drive media batch",
@@ -2042,6 +2141,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             arguments.sku_report_path,
             arguments.sku,
             arguments.position,
+        )
+    if arguments.command == "convert-selected-media-batch":
+        return _run_verified_webp_conversion_execution(
+            logger,
+            arguments.selection_report_path,
+            arguments.baseline_snapshot_path,
+            arguments.mapping_path,
+            arguments.sheet_title,
+            arguments.sku_report_path,
         )
     if arguments.command == "download-selected-media-batch":
         return _run_secure_media_download_execution(

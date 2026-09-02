@@ -347,6 +347,23 @@ python -m sync_worker convert-selected-media-canary `
 
 命令不读取 Download Execution/Canary JSON，也不从 path、dict 或报告恢复 artifact authority。JPEG/PNG 使用固定 Pillow profile `quality=85, method=6`，不 resize；已有 WebP 只验证并复制。最终 WebP 经过 RIFF/WEBP magic、完整 Pillow decode、像素尺寸、size 与 SHA-256 再验证后，仅用于生成安全审计。命令严格先 cleanup WebP workspace，再 cleanup source workspace，返回时两类文件和两类 retained artifacts 都必须为 0。报告固定写入 `reports/verified-webp-conversion-canary.json`，不含 provider ID、Drive URL、本地路径、临时目录、凭据或媒体 bytes；本阶段不访问 WordPress 或 WooCommerce。
 
+### Verified WebP Conversion Execution V1
+
+完整 WebP Reality Execution 会在同一进程内重新完成 fresh Preparation，把完整 authoritative handle tuple 一次性交给 Download Core，再把完整 `VerifiedDownloadedMediaArtifact` tuple 一次性交给 Conversion Core：
+
+```powershell
+python -m sync_worker convert-selected-media-batch `
+  --selection-report reports/image-selection-dry-run.json `
+  --baseline-snapshot reports/selected-media-baseline-snapshot.json `
+  --mapping reports/image-mapping-dry-run.json `
+  --sheet "RMB Price List" `
+  --sku-report reports/sku-dry-run.json
+```
+
+命令不会读取 Download Execution 或 WebP Canary 报告来恢复 authority。任何 content download 前，combined capacity preflight 会保留实际 source 总量、每个选中项最多 100 MiB 的受 Core 强制约束 WebP 输出额度，以及既有 512 MiB safety reserve；空间不足固定阻断为 `insufficient_webp_conversion_workspace_capacity`，下载请求为 0。转换仍使用固定 `xxxxdoll-pillow-webp-q85-m6-v1`（`quality=85, method=6`），不 resize、crop 或动态重编码；安全进度仅包含 index、total、SKU、selection position、stage 和 status。
+
+完整 download/conversion 均为 all-or-nothing。任一源校验或 WebP 校验失败都不会暴露部分 WebP authority；成功、失败及中断路径均先 cleanup WebP workspace，再 cleanup source workspace。CLI 返回前不保留任何 WebP 或 source artifact，固定写入 `reports/verified-webp-conversion-execution.json`，且 WordPress/WooCommerce 上传和外部写入计数始终为 0。
+
 ### Secure Media Download Execution V1
 
 完整 Source Download Reality 命令会在同一进程内重新完成全部 selected media 的 fresh metadata Preparation，并将保持 canonical 顺序的完整 authoritative handle tuple 交给既有 Download Core：

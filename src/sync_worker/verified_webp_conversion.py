@@ -20,7 +20,7 @@ import shutil
 import stat
 import tempfile
 import warnings
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Final, Literal
 
@@ -39,6 +39,7 @@ WEBP_QUALITY: Final = 85
 WEBP_METHOD: Final = 6
 MAX_DECODE_PIXELS: Final = 100_000_000
 MAX_ARTIFACTS_PER_BATCH: Final = download_core.MAX_HANDLES_PER_BATCH
+MAX_WEBP_OUTPUT_FILE_BYTES: Final = download_core.MAX_SOURCE_FILE_BYTES
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _WEBP_ARTIFACT_CAPABILITY = object()
 _WEBP_NAME_PATTERN = re.compile(r"webp-[0-9]{3}-[0-9]+\.webp\Z", re.ASCII)
@@ -58,6 +59,9 @@ _ZERO_EXTERNAL_COUNTERS = {
 
 class VerifiedWebPConversionError(ValueError):
     """Fixed safe error codes only; never paths or source authority values."""
+
+
+ConversionProgressCallback = Callable[[Mapping[str, object]], None]
 
 
 class _ConversionBlocked(Exception):
@@ -644,7 +648,9 @@ def _verify_final_webp(
         size, digest, prefix = _read_size_sha256_and_magic(path)
     except VerifiedWebPConversionError:
         raise _ConversionBlocked("webp_output_file_unavailable") from None
-    if size <= 0 or not _webp_magic_matches(prefix):
+    if size <= 0 or size > MAX_WEBP_OUTPUT_FILE_BYTES:
+        raise _ConversionBlocked("webp_output_file_too_large")
+    if not _webp_magic_matches(prefix):
         raise _ConversionBlocked("webp_output_signature_mismatch")
     try:
         with warnings.catch_warnings():
@@ -693,6 +699,32 @@ def _increment_failure_counters(counters: dict[str, int], code: str) -> None:
         counters["webp_decode_failed"] += 1
     if code == "webp_output_dimensions_mismatch":
         counters["dimension_mismatch"] += 1
+
+
+def _emit_conversion_progress(
+    callback: ConversionProgressCallback | None,
+    source: download_core.VerifiedDownloadedMediaArtifact,
+    *,
+    current_index: int,
+    total_items: int,
+    status: str,
+) -> None:
+    if callback is None:
+        return
+    event = {
+        "current_index": current_index,
+        "total_items": total_items,
+        "sku": source.sku,
+        "selection_position": source.selection_position,
+        "stage": "conversion",
+        "status": status,
+    }
+    try:
+        callback(event)
+    except Exception:
+        raise VerifiedWebPConversionError(
+            "conversion_progress_callback_failed"
+        ) from None
 
 
 class VerifiedWebPConversionBatchResult:
@@ -787,6 +819,7 @@ def _convert_verified_media_to_webp_impl(
     ),
     *,
     workspace_parent: Path | None,
+    progress_callback: ConversionProgressCallback | None,
     lifecycle: _WebPWorkspaceLifecycle,
 ) -> VerifiedWebPConversionBatchResult:
     sources = _normalize_sources(sources_value)
@@ -828,6 +861,13 @@ def _convert_verified_media_to_webp_impl(
             audit["blocking_issues"] = ["batch_aborted_after_failure"]
             audits.append(audit)
             continue
+        _emit_conversion_progress(
+            progress_callback,
+            source,
+            current_index=index + 1,
+            total_items=len(sources),
+            status="conversion_started",
+        )
         counters["conversion_attempted"] += 1
         target = workspace / f"webp-{index:03d}-{source.selection_position:03d}.webp"
         blocker: _ConversionBlocked | None = None
@@ -922,7 +962,17 @@ def _convert_verified_media_to_webp_impl(
             audit["blocking_issues"] = [blocker.code]
             _increment_failure_counters(counters, blocker.code)
             blocked = True
+            progress_status = "conversion_blocked"
+        else:
+            progress_status = "conversion_verified"
         audits.append(audit)
+        _emit_conversion_progress(
+            progress_callback,
+            source,
+            current_index=index + 1,
+            total_items=len(sources),
+            status=progress_status,
+        )
 
     if blocked:
         cleaned = lifecycle.cleanup()
@@ -955,14 +1005,18 @@ def convert_verified_media_to_webp(
     ),
     *,
     workspace_parent: Path | None = None,
+    progress_callback: ConversionProgressCallback | None = None,
 ) -> VerifiedWebPConversionBatchResult:
     """Convert/validate one authoritative batch and clean on interruption."""
 
+    if progress_callback is not None and not callable(progress_callback):
+        raise VerifiedWebPConversionError("invalid_conversion_progress_callback")
     lifecycle = _WebPWorkspaceLifecycle()
     try:
         return _convert_verified_media_to_webp_impl(
             sources,
             workspace_parent=workspace_parent,
+            progress_callback=progress_callback,
             lifecycle=lifecycle,
         )
     except BaseException:
