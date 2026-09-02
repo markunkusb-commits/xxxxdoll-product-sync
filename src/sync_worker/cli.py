@@ -66,6 +66,10 @@ from .secure_media_download_canary import (
     SecureMediaDownloadCanaryError,
     run_secure_media_download_canary,
 )
+from .verified_webp_conversion_canary import (
+    VerifiedWebPConversionCanaryError,
+    run_verified_webp_conversion_canary,
+)
 from .secure_media_download_execution import (
     SecureMediaDownloadExecutionError,
     run_secure_media_download_execution,
@@ -1059,6 +1063,62 @@ def _run_secure_media_download_canary(
     return 2 if report["status"] == "failed" else 1
 
 
+def _run_verified_webp_conversion_canary(
+    logger: logging.Logger,
+    selection_report_path: Path,
+    baseline_snapshot_path: Path,
+    mapping_path: Path,
+    sheet_title: str,
+    sku_report_path: Path,
+    sku: str,
+    position: int,
+) -> int:
+    try:
+        settings = load_google_drive_metadata_config()
+        report, _ = run_verified_webp_conversion_canary(
+            selection_report_path,
+            baseline_snapshot_path,
+            mapping_path,
+            sheet_title,
+            sku_report_path,
+            sku,
+            position,
+            settings,
+            OfficialGoogleClientFactory(),
+            project_root=PROJECT_ROOT,
+        )
+    except VerifiedWebPConversionCanaryError as error:
+        _log_failure(
+            logger,
+            error,
+            event="verified_webp_conversion_canary_aborted",
+        )
+        return 2
+    except Exception:
+        _log_failure(
+            logger,
+            ValueError("verified_webp_conversion_canary_failed"),
+            event="verified_webp_conversion_canary_aborted",
+        )
+        return 2
+    logger.info(json.dumps({
+        "event": "verified_webp_conversion_canary_report_written",
+        "path": "reports/verified-webp-conversion-canary.json",
+        "status": report["status"],
+        "source_cleanup_completed": report["source_cleanup_completed"],
+        "source_files_remaining": report["source_files_remaining"],
+        "webp_cleanup_completed": report["webp_cleanup_completed"],
+        "webp_files_remaining": report["webp_files_remaining"],
+        "retained_download_artifacts": report["retained_download_artifacts"],
+        "retained_webp_artifacts": report["retained_webp_artifacts"],
+        "wordpress_upload_requests_performed": 0,
+        "write_requests_performed": 0,
+    }, ensure_ascii=False, sort_keys=True))
+    if report["status"] == "ok":
+        return 0
+    return 2 if report["status"] == "failed" else 1
+
+
 def _run_secure_media_download_execution(
     logger: logging.Logger,
     selection_report_path: Path,
@@ -1690,6 +1750,30 @@ def build_parser() -> argparse.ArgumentParser:
         "--position", required=True, type=_selection_position_argument,
         help="Exact zero-based selected image position",
     )
+    convert_selected_media_canary = subcommands.add_parser(
+        "convert-selected-media-canary",
+        help="Fresh-prepare all handles, download one exact source, and verify WebP",
+    )
+    for flag, dest, help_text in (
+        ("--selection-report", "selection_report_path", "Current Image Selection report"),
+        ("--baseline-snapshot", "baseline_snapshot_path", "Frozen selected media baseline snapshot"),
+        ("--mapping", "mapping_path", "Current Image Mapping report"),
+        ("--sku-report", "sku_report_path", "Current verified SKU report"),
+    ):
+        convert_selected_media_canary.add_argument(
+            flag, required=True, type=Path, dest=dest, help=help_text,
+        )
+    convert_selected_media_canary.add_argument(
+        "--sheet", required=True, type=_sheet_title_argument,
+        dest="sheet_title", help="Exact Google Sheet title",
+    )
+    convert_selected_media_canary.add_argument(
+        "--sku", required=True, help="Exact selected product SKU",
+    )
+    convert_selected_media_canary.add_argument(
+        "--position", required=True, type=_selection_position_argument,
+        help="Exact zero-based selected image position",
+    )
     download_selected_media_batch = subcommands.add_parser(
         "download-selected-media-batch",
         help="Prepare and verify the full approved Drive media batch",
@@ -1947,6 +2031,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             arguments.baseline_snapshot_path, arguments.mapping_path,
             arguments.sheet_title, arguments.sku_report_path,
             arguments.sku, arguments.position,
+        )
+    if arguments.command == "convert-selected-media-canary":
+        return _run_verified_webp_conversion_canary(
+            logger,
+            arguments.selection_report_path,
+            arguments.baseline_snapshot_path,
+            arguments.mapping_path,
+            arguments.sheet_title,
+            arguments.sku_report_path,
+            arguments.sku,
+            arguments.position,
         )
     if arguments.command == "download-selected-media-batch":
         return _run_secure_media_download_execution(

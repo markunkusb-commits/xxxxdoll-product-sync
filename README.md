@@ -330,6 +330,23 @@ python -m sync_worker download-selected-media-canary `
 
 Preparation 始终继续使用 `spreadsheets.readonly` 与 `drive.metadata.readonly`；只有精确命中的单个 canary handle 会交给 `drive.readonly` Download Core。源文件经过 MD5、size 和 magic signature 验证后会在命令返回前立即清理，不保留下载 artifact，不执行 WebP 转换或 WordPress 上传。唯一新报告为 `reports/secure-media-download-canary.json`；不会读取 Preparation JSON 来恢复 authority，也不会生成或覆盖 Root/Nested/Depth2 manifest 报告。
 
+### Verified WebP Conversion Canary V1
+
+WebP Canary 在同一进程内重新完成完整 Preparation，按大小写敏感的精确 SKU 与 selection position 选择唯一 handle，只下载这一张 source，并把内存中的唯一 `VerifiedDownloadedMediaArtifact` 直接交给 Verified WebP Conversion Core：
+
+```powershell
+python -m sync_worker convert-selected-media-canary `
+  --selection-report reports/image-selection-dry-run.json `
+  --baseline-snapshot reports/selected-media-baseline-snapshot.json `
+  --mapping reports/image-mapping-dry-run.json `
+  --sheet "RMB Price List" `
+  --sku-report reports/sku-dry-run.json `
+  --sku CLM-CLASSIC-SI70CM-AR `
+  --position 0
+```
+
+命令不读取 Download Execution/Canary JSON，也不从 path、dict 或报告恢复 artifact authority。JPEG/PNG 使用固定 Pillow profile `quality=85, method=6`，不 resize；已有 WebP 只验证并复制。最终 WebP 经过 RIFF/WEBP magic、完整 Pillow decode、像素尺寸、size 与 SHA-256 再验证后，仅用于生成安全审计。命令严格先 cleanup WebP workspace，再 cleanup source workspace，返回时两类文件和两类 retained artifacts 都必须为 0。报告固定写入 `reports/verified-webp-conversion-canary.json`，不含 provider ID、Drive URL、本地路径、临时目录、凭据或媒体 bytes；本阶段不访问 WordPress 或 WooCommerce。
+
 ### Secure Media Download Execution V1
 
 完整 Source Download Reality 命令会在同一进程内重新完成全部 selected media 的 fresh metadata Preparation，并将保持 canonical 顺序的完整 authoritative handle tuple 交给既有 Download Core：
