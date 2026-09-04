@@ -530,10 +530,10 @@ def _safe_application_password(value: object) -> bool:
     )
 
 
-def _create_test_application_password_credentials(
+def _create_staging_application_password_credentials(
     username: str, application_password: str
 ) -> WordPressApplicationPasswordCredentials:
-    """Test-only factory; real creation belongs to a future approved canary."""
+    """Package-private factory for an explicitly approved staging workflow."""
 
     return WordPressApplicationPasswordCredentials(
         _CREDENTIAL_CAPABILITY,
@@ -542,13 +542,31 @@ def _create_test_application_password_credentials(
     )
 
 
-def _create_test_media_write_permit(settings: Settings) -> WordPressMediaWritePermit:
-    """Test-only explicit write authorization bound to one validated target."""
+def _create_staging_media_write_permit(
+    settings: Settings,
+) -> WordPressMediaWritePermit:
+    """Package-private write capability bound to a freshly validated target."""
 
     return WordPressMediaWritePermit(
         _WRITE_PERMIT_CAPABILITY,
         target_binding=gate_core._target_binding(settings),
     )
+
+
+def _create_test_application_password_credentials(
+    username: str, application_password: str
+) -> WordPressApplicationPasswordCredentials:
+    """Compatibility alias used only by mock tests."""
+
+    return _create_staging_application_password_credentials(
+        username, application_password
+    )
+
+
+def _create_test_media_write_permit(settings: Settings) -> WordPressMediaWritePermit:
+    """Compatibility alias used only by mock tests."""
+
+    return _create_staging_media_write_permit(settings)
 
 
 def _credentials_values(
