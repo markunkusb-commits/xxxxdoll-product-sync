@@ -531,15 +531,32 @@ def test_media_slug_is_deterministic_ascii_and_bounded(gated):
     assert first == second
     assert first.isascii()
     assert len(first) <= transport_core.MAX_MEDIA_SLUG_LENGTH
-    assert first.startswith("xxxxdoll-media-")
+    assert first == intents[0].upload_filename.removesuffix(".webp")
 
 
 @pytest.mark.parametrize("index", range(64))
-def test_slug_contains_only_lower_hex_identity_digest(gated, index):
+def test_slug_contains_only_gate_filename_characters(gated, index):
     _, intents = gated
     slug = transport_core._media_slug(intents[0])
-    character = slug[len(transport_core.MEDIA_SLUG_PREFIX) + index]
-    assert character in "0123456789abcdef"
+    character = slug[index % len(slug)]
+    assert character in "abcdefghijklmnopqrstuvwxyz0123456789-"
+
+
+def test_reality_filename_shape_maps_to_wordpress_slug():
+    filename = "clm-classic-si70cm-ar-00-3f68bc92c33df0bf.webp"
+    assert transport_core._canonical_wordpress_slug(filename) == (
+        "clm-classic-si70cm-ar-00-3f68bc92c33df0bf"
+    )
+
+
+def test_media_identity_remains_full_internal_digest(gated):
+    _, intents = gated
+    identity = intents[0].media_identity
+    version, digest = identity.split(":", 1)
+    assert version == gate_core.MEDIA_IDENTITY_VERSION
+    assert len(digest) == 64
+    assert all(character in "0123456789abcdef" for character in digest)
+    assert transport_core._media_slug(intents[0]) != digest
 
 
 def test_lookup_zero_then_raw_webp_post(gated):
@@ -618,6 +635,34 @@ def test_existing_media_mismatch_blocks_reuse_and_post(gated, changes):
     value.update(changes)
     transport = ScriptedTransport(lookups=[response(200, [value])])
     result = run_one(intents[0], transport)
+    assert result.status == "blocked"
+    assert not transport.upload_calls
+
+
+def test_collision_slug_suffix_is_blocked(gated):
+    _, intents = gated
+    intent = intents[0]
+    value = record(intent, slug=transport_core._media_slug(intent) + "-1")
+    transport = ScriptedTransport(lookups=[response(200, [value])])
+    result = run_one(intent, transport)
+    assert result.status == "blocked"
+    assert not transport.upload_calls
+
+
+def test_collision_filename_suffix_is_blocked(gated):
+    _, intents = gated
+    intent = intents[0]
+    collision_filename = intent.upload_filename.removesuffix(".webp") + "-1.webp"
+    value = record(
+        intent,
+        source_url=(
+            "https://staging-unit-test.wpcomstaging.com/wp-content/uploads/"
+            "2026/09/" + collision_filename
+        ),
+        media_details={"file": "2026/09/" + collision_filename},
+    )
+    transport = ScriptedTransport(lookups=[response(200, [value])])
+    result = run_one(intent, transport)
     assert result.status == "blocked"
     assert not transport.upload_calls
 
@@ -1099,7 +1144,9 @@ def test_stdlib_lookup_uses_only_exact_get_endpoint(gated):
         )
     method, target, body, headers = FakeHTTPSConnection.instances[-1].calls[0]
     assert method == "GET"
-    assert target.startswith("/wp-json/wp/v2/media?slug=xxxxdoll-media-")
+    assert target.startswith(
+        "/wp-json/wp/v2/media?slug=" + transport_core._media_slug(intents[0])
+    )
     assert target.endswith("&per_page=2")
     assert body is None
     assert set(headers) == {"Authorization", "Accept"}
@@ -1127,6 +1174,7 @@ def test_stdlib_upload_uses_raw_body_and_exact_headers(gated):
     assert headers["Content-Type"] == "image/webp"
     assert headers["Content-Disposition"] == f'attachment; filename="{intent.upload_filename}"'
     assert headers["Content-Length"] == str(len(body))
+    assert "X-WP-Media-Slug" not in headers
     assert "Cookie" not in headers
 
 

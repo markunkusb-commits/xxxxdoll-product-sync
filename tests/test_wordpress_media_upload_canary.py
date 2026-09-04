@@ -35,6 +35,8 @@ from sync_worker.config import (
 )
 from sync_worker.google_api import GoogleDriveContentDownloadReceipt
 from sync_worker.image_mapping import ProductSourceRange
+from sync_worker.report import SafeJsonReportWriter, SafeWriteAuditJsonReportWriter
+from sync_worker.sanitization import Redactor
 from sync_worker.selected_media_handle_preparation import (
     SelectedMediaHandlePreparationResult,
 )
@@ -458,6 +460,10 @@ def test_created_path_is_ok_and_cleans_both_workspaces(tmp_path):
     assert report["remote_media_created"] == 1
     assert report["remote_media_reused"] == 0
     assert report["upload_requests_performed"] == 1
+    assert report["write_requests_performed"] == 1
+    assert report["write_requests_performed"] == (
+        report["transport_summary"]["write_requests_performed"]
+    )
     assert report["delete_requests_performed"] == 0
     assert report["webp_cleanup_completed"] is True
     assert report["source_cleanup_completed"] is True
@@ -476,6 +482,7 @@ def test_reuse_path_skips_post(tmp_path):
     assert report["remote_media_created"] == 0
     assert report["remote_media_reused"] == 1
     assert report["upload_requests_performed"] == 0
+    assert report["write_requests_performed"] == 0
     assert transport.upload_calls == []
 
 
@@ -485,6 +492,7 @@ def test_timeout_reconciliation_path_never_reposts(tmp_path):
     assert report["status"] == "ok"
     assert report["canary"]["upload_status"] == "created_reconciled"
     assert report["reconciliation_requests_performed"] == 1
+    assert report["write_requests_performed"] == 1
     assert len(transport.lookup_calls) == 2
     assert len(transport.upload_calls) == 1
 
@@ -852,6 +860,58 @@ def test_run_fresh_prepares_full_selection_and_writes_safe_report(tmp_path):
     assert report["preparation_summary"]["selected_items"] == 2
     assert output == tmp_path / "reports" / canary_core.REPORT_FILENAME
     assert output.exists()
+    assert json.loads(output.read_text(encoding="utf-8"))[
+        "write_requests_performed"
+    ] == 1
+
+
+def test_read_only_writer_still_forces_write_count_to_zero(tmp_path):
+    output = tmp_path / "read-only.json"
+    SafeJsonReportWriter(output, Redactor()).write(
+        {"status": "ok", "write_requests_performed": 1}
+    )
+    assert json.loads(output.read_text(encoding="utf-8"))[
+        "write_requests_performed"
+    ] == 0
+
+
+@pytest.mark.parametrize("write_count", [0, 1])
+def test_write_audit_writer_preserves_valid_write_count(tmp_path, write_count):
+    output = tmp_path / "write-audit.json"
+    SafeWriteAuditJsonReportWriter(output, Redactor()).write(
+        {"status": "ok", "write_requests_performed": write_count}
+    )
+    saved = json.loads(output.read_text(encoding="utf-8"))
+    assert saved["write_requests_performed"] == write_count
+
+
+@pytest.mark.parametrize("write_count", [-1, True, False, None, "1", 1.0])
+def test_write_audit_writer_rejects_invalid_write_count(tmp_path, write_count):
+    output = tmp_path / "write-audit.json"
+    with pytest.raises(ValueError, match="write_audit_request_count_invalid"):
+        SafeWriteAuditJsonReportWriter(output, Redactor()).write(
+            {"status": "blocked", "write_requests_performed": write_count}
+        )
+    assert not output.exists()
+
+
+def test_write_audit_writer_rejects_missing_write_count(tmp_path):
+    output = tmp_path / "write-audit.json"
+    with pytest.raises(ValueError, match="write_audit_request_count_invalid"):
+        SafeWriteAuditJsonReportWriter(output, Redactor()).write({"status": "ok"})
+    assert not output.exists()
+
+
+def test_write_audit_writer_still_sanitizes_forbidden_fields(tmp_path):
+    output = tmp_path / "write-audit.json"
+    SafeWriteAuditJsonReportWriter(output, Redactor()).write(
+        {
+            "status": "ok",
+            "write_requests_performed": 1,
+            "Authorization": "Basic synthetic-secret",
+        }
+    )
+    assert "synthetic-secret" not in output.read_text(encoding="utf-8")
 
 
 def test_run_wrong_confirmation_never_prepares_or_writes(tmp_path):

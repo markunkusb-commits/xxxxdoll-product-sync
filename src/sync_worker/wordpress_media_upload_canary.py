@@ -28,7 +28,7 @@ from .config import (
     Settings,
 )
 from .google_api import GoogleClients, GoogleDriveContentGateway
-from .report import SafeJsonReportWriter, sanitize_report_data
+from .report import SafeWriteAuditJsonReportWriter, sanitize_report_data
 from .sanitization import Redactor
 from .selected_media_handle_preparation import (
     SelectedMediaHandlePreparationResult,
@@ -274,9 +274,14 @@ def _safe_report(
 ) -> dict[str, object]:
     lookup = int(transport_summary.get("lookup_requests_performed") or 0)
     uploads = int(transport_summary.get("wordpress_upload_requests_performed") or 0)
+    writes = int(transport_summary.get("write_requests_performed") or 0)
     reconciliations = int(
         transport_summary.get("reconciliation_requests_performed") or 0
     )
+    if writes != uploads:
+        raise WordPressMediaUploadCanaryError(
+            "wordpress_media_canary_write_audit_mismatch"
+        )
     preparation_network = int(
         preparation_summary.get("network_requests_performed") or 0
     )
@@ -292,6 +297,7 @@ def _safe_report(
         "transport_summary": dict(transport_summary),
         "lookup_requests_performed": lookup,
         "upload_requests_performed": uploads,
+        "write_requests_performed": writes,
         "reconciliation_requests_performed": reconciliations,
         "network_requests_performed": (
             preparation_network + downloads + lookup + uploads + reconciliations
@@ -881,5 +887,5 @@ def run_wordpress_media_upload_canary(
             status="failed",
         )
     output = Path(project_root) / "reports" / REPORT_FILENAME
-    SafeJsonReportWriter(output, Redactor()).write(report)
+    SafeWriteAuditJsonReportWriter(output, Redactor()).write(report)
     return report, output

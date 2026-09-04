@@ -30,8 +30,7 @@ from .sanitization import Redactor
 POLICY_VERSION: Final = "xxxxdoll-wordpress-media-upload-transport-v1"
 WORDPRESS_MEDIA_ENDPOINT: Final = gate_core.WORDPRESS_MEDIA_ENDPOINT
 WORDPRESS_RESOURCE: Final = gate_core.WORDPRESS_RESOURCE
-MEDIA_SLUG_PREFIX: Final = "xxxxdoll-media-"
-MAX_MEDIA_SLUG_LENGTH: Final = 96
+MAX_MEDIA_SLUG_LENGTH: Final = gate_core.MAX_UPLOAD_FILENAME_LENGTH - len(".webp")
 MAX_RESPONSE_BYTES: Final = 1_000_000
 CONNECT_TIMEOUT_SECONDS: Final = 10.0
 READ_TIMEOUT_SECONDS: Final = 30.0
@@ -40,7 +39,7 @@ LOOKUP_PER_PAGE: Final = 2
 _CREDENTIAL_CAPABILITY = object()
 _WRITE_PERMIT_CAPABILITY = object()
 _REFERENCE_CAPABILITY = object()
-_SLUG_PATTERN = re.compile(r"xxxxdoll-media-[0-9a-f]{64}\Z", re.ASCII)
+_SLUG_PATTERN = re.compile(r"[a-z0-9][a-z0-9-]*\Z", re.ASCII)
 _BINDING_PATTERN = gate_core._TARGET_BINDING_PATTERN
 _SAFE_UPLOAD_STATUSES = frozenset({"created", "reused", "created_reconciled"})
 _DETERMINISTIC_POST_ERRORS = {
@@ -277,6 +276,7 @@ class StdlibWordPressMediaHttpTransport:
         if (
             _SLUG_PATTERN.fullmatch(slug) is None
             or gate_core._ASCII_FILENAME_PATTERN.fullmatch(upload_filename) is None
+            or slug != upload_filename.removesuffix(".webp")
             or type(body) is not bytes
             or not body
             or len(body) > gate_core.conversion_core.MAX_WEBP_OUTPUT_FILE_BYTES
@@ -296,7 +296,6 @@ class StdlibWordPressMediaHttpTransport:
                     f'attachment; filename="{upload_filename}"'
                 ),
                 "Content-Length": str(len(body)),
-                "X-WP-Media-Slug": slug,
             },
         )
 
@@ -669,19 +668,29 @@ def _normalize_intents(
     return intents
 
 
-def _media_slug(intent: gate_core.WordPressMediaUploadIntent) -> str:
-    try:
-        _, digest = intent.media_identity.split(":", 1)
-    except (AttributeError, ValueError):
+def _canonical_wordpress_slug(upload_filename: object) -> str:
+    if (
+        type(upload_filename) is not str
+        or gate_core._ASCII_FILENAME_PATTERN.fullmatch(upload_filename) is None
+        or len(upload_filename) > gate_core.MAX_UPLOAD_FILENAME_LENGTH
+    ):
         raise WordPressMediaUploadTransportError(
-            "wordpress_media_identity_invalid"
-        ) from None
-    slug = MEDIA_SLUG_PREFIX + digest
+            "wordpress_media_upload_filename_invalid"
+        )
+    slug = upload_filename.removesuffix(".webp")
     if len(slug) > MAX_MEDIA_SLUG_LENGTH or _SLUG_PATTERN.fullmatch(slug) is None:
         raise WordPressMediaUploadTransportError(
-            "wordpress_media_identity_invalid"
+            "wordpress_media_slug_invalid"
         )
     return slug
+
+
+def _media_slug(intent: gate_core.WordPressMediaUploadIntent) -> str:
+    if not gate_core._valid_intent(intent):
+        raise WordPressMediaUploadTransportError(
+            "valid_wordpress_media_upload_intent_required"
+        )
+    return _canonical_wordpress_slug(intent.upload_filename)
 
 
 def _emit_progress(

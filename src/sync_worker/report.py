@@ -116,6 +116,33 @@ class SafeJsonReportWriter:
         return self._path
 
 
+class SafeWriteAuditJsonReportWriter:
+    """Atomically persist a sanitized audit with an explicit write count."""
+
+    def __init__(self, path: Path, redactor: Redactor) -> None:
+        self._path = path
+        self._redactor = redactor
+
+    def write(self, report: Mapping[str, object]) -> Path:
+        write_count = report.get("write_requests_performed")
+        if type(write_count) is not int or write_count < 0:
+            raise ValueError("write_audit_request_count_invalid")
+        sanitized = sanitize_report_data(report, self._redactor)
+        if not isinstance(sanitized, dict):
+            raise TypeError("Safe write audit report must be a mapping")
+        if sanitized.get("write_requests_performed") != write_count:
+            raise ValueError("write_audit_request_count_invalid")
+
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        temporary_path = self._path.with_name(self._path.name + ".tmp")
+        temporary_path.write_text(
+            json.dumps(sanitized, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(temporary_path, self._path)
+        return self._path
+
+
 class DoctorReportWriter(SafeJsonReportWriter):
     """Backward-compatible writer name for doctor reports."""
 
