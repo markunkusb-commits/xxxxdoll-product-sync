@@ -347,6 +347,26 @@ python -m sync_worker convert-selected-media-canary `
 
 命令不读取 Download Execution/Canary JSON，也不从 path、dict 或报告恢复 artifact authority。JPEG/PNG 使用固定 Pillow profile `quality=85, method=6`，不 resize；已有 WebP 只验证并复制。最终 WebP 经过 RIFF/WEBP magic、完整 Pillow decode、像素尺寸、size 与 SHA-256 再验证后，仅用于生成安全审计。命令严格先 cleanup WebP workspace，再 cleanup source workspace，返回时两类文件和两类 retained artifacts 都必须为 0。报告固定写入 `reports/verified-webp-conversion-canary.json`，不含 provider ID、Drive URL、本地路径、临时目录、凭据或媒体 bytes；本阶段不访问 WordPress 或 WooCommerce。
 
+### WordPress Media Upload Canary V1
+
+该命令在同一进程内重新完成完整的 fresh Preparation，只按大小写敏感的精确 SKU 与 selection position 选择一张媒体，随后依次执行 Secure Download、Verified WebP Conversion、WordPress Media Upload Gate、exact-slug lookup 和最多一次 staging media POST：
+
+```powershell
+python -m sync_worker upload-selected-media-canary `
+  --selection-report reports/image-selection-dry-run.json `
+  --baseline-snapshot reports/selected-media-baseline-snapshot.json `
+  --mapping reports/image-mapping-dry-run.json `
+  --sheet "RMB Price List" `
+  --sku-report reports/sku-dry-run.json `
+  --sku CLM-CLASSIC-SI70CM-AR `
+  --position 0 `
+  --confirm-staging-media-upload I_CONFIRM_ONE_STAGING_MEDIA_UPLOAD
+```
+
+确认 token 必须完全匹配，且它在任何配置读取或客户端创建之前校验。`DRY_RUN=true` 保持不变；实际 media 写权限来自独立、绑定 fresh staging fingerprint 的 package-private permit。命令只允许 HTTPS `wpcomstaging.com` 且拒绝 `xxxxdoll.com`，只对 `/wp-json/wp/v2/media` 做 exact-slug GET 和最多一次 raw WebP POST。已有合法 attachment 会复用；POST 结果不确定时只做 GET reconciliation，不会再次 POST、DELETE 或 rollback。
+
+报告固定写入 `reports/wordpress-media-upload-canary.json`。无论 created、reused、created_reconciled、blocked 或中断，均先清理 WebP workspace，再清理 source workspace；WordPress attachment 永不由 Canary 清理。报告和日志不保存账号、Application Password、Authorization、Cookie、完整站点 URL、source URL、本地路径、provider ID 或媒体 bytes；Canary 不更新 WooCommerce 产品、featured image、gallery、alt text 或 payload。
+
 ### Verified WebP Conversion Execution V1
 
 完整 WebP Reality Execution 会在同一进程内重新完成 fresh Preparation，把完整 authoritative handle tuple 一次性交给 Download Core，再把完整 `VerifiedDownloadedMediaArtifact` tuple 一次性交给 Conversion Core：

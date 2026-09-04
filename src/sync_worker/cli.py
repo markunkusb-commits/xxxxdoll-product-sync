@@ -70,6 +70,14 @@ from .verified_webp_conversion_canary import (
     VerifiedWebPConversionCanaryError,
     run_verified_webp_conversion_canary,
 )
+from .wordpress_media_upload_canary import (
+    WordPressMediaUploadCanaryError,
+    run_wordpress_media_upload_canary,
+    validate_staging_media_upload_confirmation,
+)
+from .wordpress_media_upload_transport import (
+    StdlibWordPressMediaHttpTransport,
+)
 from .verified_webp_conversion_execution import (
     VerifiedWebPConversionExecutionError,
     run_verified_webp_conversion_execution,
@@ -1123,6 +1131,96 @@ def _run_verified_webp_conversion_canary(
     return 2 if report["status"] == "failed" else 1
 
 
+def _run_wordpress_media_upload_canary(
+    logger: logging.Logger,
+    selection_report_path: Path,
+    baseline_snapshot_path: Path,
+    mapping_path: Path,
+    sheet_title: str,
+    sku_report_path: Path,
+    sku: str,
+    position: int,
+    confirmation_token: str,
+) -> int:
+    def safe_progress(event: object) -> None:
+        if not isinstance(event, dict):
+            raise ValueError("invalid_wordpress_media_canary_progress_event")
+        safe_event = {
+            key: event.get(key)
+            for key in (
+                "current_index",
+                "total_items",
+                "sku",
+                "selection_position",
+                "stage",
+                "status",
+            )
+        }
+        logger.info(json.dumps({
+            "event": "wordpress_media_upload_canary_progress",
+            **safe_event,
+        }, ensure_ascii=False, sort_keys=True))
+
+    try:
+        # Confirmation precedes every config loader and client construction.
+        validate_staging_media_upload_confirmation(confirmation_token)
+        wordpress_settings = load_config()
+        metadata_settings = load_google_drive_metadata_config()
+        client_factory = OfficialGoogleClientFactory()
+        wordpress_transport = StdlibWordPressMediaHttpTransport(
+            wordpress_settings
+        )
+        report, _ = run_wordpress_media_upload_canary(
+            selection_report_path,
+            baseline_snapshot_path,
+            mapping_path,
+            sheet_title,
+            sku_report_path,
+            sku,
+            position,
+            confirmation_token,
+            metadata_settings,
+            client_factory,
+            wordpress_settings,
+            wordpress_transport,
+            project_root=PROJECT_ROOT,
+            progress_callback=safe_progress,
+        )
+    except WordPressMediaUploadCanaryError as error:
+        _log_failure(
+            logger,
+            error,
+            event="wordpress_media_upload_canary_aborted",
+        )
+        return 2
+    except Exception:
+        _log_failure(
+            logger,
+            ValueError("wordpress_media_upload_canary_failed"),
+            event="wordpress_media_upload_canary_aborted",
+        )
+        return 2
+    logger.info(json.dumps({
+        "event": "wordpress_media_upload_canary_report_written",
+        "path": "reports/wordpress-media-upload-canary.json",
+        "status": report["status"],
+        "upload_status": report["canary"]["upload_status"],
+        "wordpress_media_id": report["canary"]["wordpress_media_id"],
+        "lookup_requests_performed": report["lookup_requests_performed"],
+        "upload_requests_performed": report["upload_requests_performed"],
+        "reconciliation_requests_performed": (
+            report["reconciliation_requests_performed"]
+        ),
+        "webp_cleanup_completed": report["webp_cleanup_completed"],
+        "source_cleanup_completed": report["source_cleanup_completed"],
+        "delete_requests_performed": 0,
+        "woocommerce_requests_performed": 0,
+    }, ensure_ascii=False, sort_keys=True))
+    if report["status"] == "ok":
+        return 0
+    return 2 if report["status"] == "failed" else 1
+
+
 def _run_secure_media_download_execution(
     logger: logging.Logger,
     selection_report_path: Path,
@@ -1856,6 +1954,36 @@ def build_parser() -> argparse.ArgumentParser:
         "--position", required=True, type=_selection_position_argument,
         help="Exact zero-based selected image position",
     )
+    upload_selected_media_canary = subcommands.add_parser(
+        "upload-selected-media-canary",
+        help="Explicitly confirm and upload/reuse one exact staging media item",
+    )
+    for flag, dest, help_text in (
+        ("--selection-report", "selection_report_path", "Current Image Selection report"),
+        ("--baseline-snapshot", "baseline_snapshot_path", "Frozen selected media baseline snapshot"),
+        ("--mapping", "mapping_path", "Current Image Mapping report"),
+        ("--sku-report", "sku_report_path", "Current verified SKU report"),
+    ):
+        upload_selected_media_canary.add_argument(
+            flag, required=True, type=Path, dest=dest, help=help_text,
+        )
+    upload_selected_media_canary.add_argument(
+        "--sheet", required=True, type=_sheet_title_argument,
+        dest="sheet_title", help="Exact Google Sheet title",
+    )
+    upload_selected_media_canary.add_argument(
+        "--sku", required=True, help="Exact selected product SKU",
+    )
+    upload_selected_media_canary.add_argument(
+        "--position", required=True, type=_selection_position_argument,
+        help="Exact zero-based selected image position",
+    )
+    upload_selected_media_canary.add_argument(
+        "--confirm-staging-media-upload",
+        required=True,
+        dest="confirmation_token",
+        help="Exact one-item staging media upload confirmation token",
+    )
     convert_selected_media_batch = subcommands.add_parser(
         "convert-selected-media-batch",
         help="Fresh-prepare, download, and verify the full selected WebP batch",
@@ -2141,6 +2269,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             arguments.sku_report_path,
             arguments.sku,
             arguments.position,
+        )
+    if arguments.command == "upload-selected-media-canary":
+        return _run_wordpress_media_upload_canary(
+            logger,
+            arguments.selection_report_path,
+            arguments.baseline_snapshot_path,
+            arguments.mapping_path,
+            arguments.sheet_title,
+            arguments.sku_report_path,
+            arguments.sku,
+            arguments.position,
+            arguments.confirmation_token,
         )
     if arguments.command == "convert-selected-media-batch":
         return _run_verified_webp_conversion_execution(
