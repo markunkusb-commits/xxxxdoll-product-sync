@@ -75,6 +75,12 @@ from .wordpress_media_upload_canary import (
     run_wordpress_media_upload_canary,
     validate_staging_media_upload_confirmation,
 )
+from .wordpress_media_upload_execution import (
+    WordPressMediaUploadExecutionError,
+    run_wordpress_media_upload_execution,
+    validate_expected_selected_items,
+    validate_staging_media_batch_upload_confirmation,
+)
 from .wordpress_media_upload_transport import (
     StdlibWordPressMediaHttpTransport,
 )
@@ -1221,6 +1227,98 @@ def _run_wordpress_media_upload_canary(
     return 2 if report["status"] == "failed" else 1
 
 
+def _run_wordpress_media_upload_execution(
+    logger: logging.Logger,
+    selection_report_path: Path,
+    baseline_snapshot_path: Path,
+    mapping_path: Path,
+    sheet_title: str,
+    sku_report_path: Path,
+    expected_selected_items: int,
+    confirmation_token: str,
+) -> int:
+    def safe_progress(event: object) -> None:
+        if not isinstance(event, dict):
+            raise ValueError("invalid_wordpress_media_execution_progress_event")
+        safe_event = {
+            key: event.get(key)
+            for key in (
+                "current_index",
+                "total_items",
+                "sku",
+                "selection_position",
+                "stage",
+                "status",
+            )
+        }
+        logger.info(json.dumps({
+            "event": "wordpress_media_upload_execution_progress",
+            **safe_event,
+        }, ensure_ascii=False, sort_keys=True))
+
+    try:
+        # Both explicit authorities are checked before config, clients, or transport.
+        validate_staging_media_batch_upload_confirmation(confirmation_token)
+        validate_expected_selected_items(expected_selected_items)
+        wordpress_settings = load_config()
+        metadata_settings = load_google_drive_metadata_config()
+        client_factory = OfficialGoogleClientFactory()
+        wordpress_transport = StdlibWordPressMediaHttpTransport(
+            wordpress_settings
+        )
+        report, _ = run_wordpress_media_upload_execution(
+            selection_report_path,
+            baseline_snapshot_path,
+            mapping_path,
+            sheet_title,
+            sku_report_path,
+            expected_selected_items,
+            confirmation_token,
+            metadata_settings,
+            client_factory,
+            wordpress_settings,
+            wordpress_transport,
+            project_root=PROJECT_ROOT,
+            progress_callback=safe_progress,
+        )
+    except WordPressMediaUploadExecutionError as error:
+        _log_failure(
+            logger,
+            error,
+            event="wordpress_media_upload_execution_aborted",
+        )
+        return 2
+    except Exception:
+        _log_failure(
+            logger,
+            ValueError("wordpress_media_upload_execution_failed"),
+            event="wordpress_media_upload_execution_aborted",
+        )
+        return 2
+    logger.info(json.dumps({
+        "event": "wordpress_media_upload_execution_report_written",
+        "path": "reports/wordpress-media-upload-execution.json",
+        "status": report["status"],
+        "selected_items": report["selected_items"],
+        "expected_selected_items": report["expected_selected_items"],
+        "lookup_requests_performed": report["lookup_requests_performed"],
+        "upload_requests_performed": report["upload_requests_performed"],
+        "reconciliation_requests_performed": (
+            report["reconciliation_requests_performed"]
+        ),
+        "write_requests_performed": report["write_requests_performed"],
+        "references_created": report["references_created"],
+        "failed_at_index": report["failed_at_index"],
+        "webp_cleanup_completed": report["webp_cleanup_completed"],
+        "source_cleanup_completed": report["source_cleanup_completed"],
+        "delete_requests_performed": 0,
+        "woocommerce_requests_performed": 0,
+    }, ensure_ascii=False, sort_keys=True))
+    if report["status"] == "ok":
+        return 0
+    return 2 if report["status"] == "failed" else 1
+
+
 def _run_secure_media_download_execution(
     logger: logging.Logger,
     selection_report_path: Path,
@@ -1984,6 +2082,36 @@ def build_parser() -> argparse.ArgumentParser:
         dest="confirmation_token",
         help="Exact one-item staging media upload confirmation token",
     )
+    upload_selected_media_batch = subcommands.add_parser(
+        "upload-selected-media-batch",
+        help="Explicitly confirm and sequentially upload/reuse the full staging media batch",
+    )
+    for flag, dest, help_text in (
+        ("--selection-report", "selection_report_path", "Current Image Selection report"),
+        ("--baseline-snapshot", "baseline_snapshot_path", "Frozen selected media baseline snapshot"),
+        ("--mapping", "mapping_path", "Current Image Mapping report"),
+        ("--sku-report", "sku_report_path", "Current verified SKU report"),
+    ):
+        upload_selected_media_batch.add_argument(
+            flag, required=True, type=Path, dest=dest, help=help_text,
+        )
+    upload_selected_media_batch.add_argument(
+        "--sheet", required=True, type=_sheet_title_argument,
+        dest="sheet_title", help="Exact Google Sheet title",
+    )
+    upload_selected_media_batch.add_argument(
+        "--expected-selected-items",
+        required=True,
+        type=int,
+        dest="expected_selected_items",
+        help="Exact expected fresh selected-media count",
+    )
+    upload_selected_media_batch.add_argument(
+        "--confirm-staging-media-batch-upload",
+        required=True,
+        dest="confirmation_token",
+        help="Exact full-batch staging media upload confirmation token",
+    )
     convert_selected_media_batch = subcommands.add_parser(
         "convert-selected-media-batch",
         help="Fresh-prepare, download, and verify the full selected WebP batch",
@@ -2280,6 +2408,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             arguments.sku_report_path,
             arguments.sku,
             arguments.position,
+            arguments.confirmation_token,
+        )
+    if arguments.command == "upload-selected-media-batch":
+        return _run_wordpress_media_upload_execution(
+            logger,
+            arguments.selection_report_path,
+            arguments.baseline_snapshot_path,
+            arguments.mapping_path,
+            arguments.sheet_title,
+            arguments.sku_report_path,
+            arguments.expected_selected_items,
             arguments.confirmation_token,
         )
     if arguments.command == "convert-selected-media-batch":

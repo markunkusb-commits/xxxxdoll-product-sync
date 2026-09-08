@@ -367,6 +367,25 @@ python -m sync_worker upload-selected-media-canary `
 
 报告固定写入 `reports/wordpress-media-upload-canary.json`。无论 created、reused、created_reconciled、blocked 或中断，均先清理 WebP workspace，再清理 source workspace；WordPress attachment 永不由 Canary 清理。报告和日志不保存账号、Application Password、Authorization、Cookie、完整站点 URL、source URL、本地路径、provider ID 或媒体 bytes；Canary 不更新 WooCommerce 产品、featured image、gallery、alt text 或 payload。
 
+### WordPress Media Full Upload Execution V1
+
+完整 staging media batch 必须提供 fresh selection 的精确预期数量和独立的全批次确认 token：
+
+```powershell
+python -m sync_worker upload-selected-media-batch `
+  --selection-report reports/image-selection-dry-run.json `
+  --baseline-snapshot reports/selected-media-baseline-snapshot.json `
+  --mapping reports/image-mapping-dry-run.json `
+  --sheet "RMB Price List" `
+  --sku-report reports/sku-dry-run.json `
+  --expected-selected-items 96 `
+  --confirm-staging-media-batch-upload I_CONFIRM_FULL_STAGING_MEDIA_UPLOAD
+```
+
+命令先逐字校验确认 token 和正整数 expected count，再读取任何配置或创建客户端。它在同一进程中依次传递 fresh authority：完整 Preparation、combined capacity preflight、全量 Download、全量 WebP Conversion、全量 Upload Gate，最后才创建 staging write permit，并将完整、保持 canonical 顺序的 intent tuple 一次性交给既有顺序 Transport。fresh selected count 与 expected count 不一致会在 content download 和 WordPress 请求前以 `wordpress_media_batch_selected_item_count_changed` 阻断。
+
+Transport 对每项先做 exact-slug lookup；合法现有媒体自然复用，否则最多一次 POST。任一远端失败立即停止，后续项不尝试；不重排、不并行、不 DELETE、不 rollback，也不更新 WooCommerce 产品。成功、阻断和异常路径均先清理 WebP workspace，再清理 source workspace。安全写审计固定保存到 `reports/wordpress-media-upload-execution.json`；顶层 `write_requests_performed` 必须与 Transport 的实际 media POST 数完全一致，且报告不含凭据、认证头、Cookie、完整 URL、Drive ID、本地路径、临时目录、媒体 bytes 或校验值。
+
 ### Verified WebP Conversion Execution V1
 
 完整 WebP Reality Execution 会在同一进程内重新完成 fresh Preparation，把完整 authoritative handle tuple 一次性交给 Download Core，再把完整 `VerifiedDownloadedMediaArtifact` tuple 一次性交给 Conversion Core：
