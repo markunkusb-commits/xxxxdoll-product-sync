@@ -384,7 +384,7 @@ python -m sync_worker upload-selected-media-batch `
 
 命令先逐字校验确认 token 和正整数 expected count，再读取任何配置或创建客户端。它在同一进程中依次传递 fresh authority：完整 Preparation、combined capacity preflight、全量 Download、全量 WebP Conversion、全量 Upload Gate，最后才创建 staging write permit，并将完整、保持 canonical 顺序的 intent tuple 一次性交给既有顺序 Transport。fresh selected count 与 expected count 不一致会在 content download 和 WordPress 请求前以 `wordpress_media_batch_selected_item_count_changed` 阻断。
 
-Transport 对每项先做 exact-slug lookup；合法现有媒体自然复用，否则最多一次 POST。任一远端失败立即停止，后续项不尝试；不重排、不并行、不 DELETE、不 rollback，也不更新 WooCommerce 产品。成功、阻断和异常路径均先清理 WebP workspace，再清理 source workspace。安全写审计固定保存到 `reports/wordpress-media-upload-execution.json`；顶层 `write_requests_performed` 必须与 Transport 的实际 media POST 数完全一致，且报告不含凭据、认证头、Cookie、完整 URL、Drive ID、本地路径、临时目录、媒体 bytes 或校验值。
+Transport 对每项先做 exact-slug lookup；GET 遇到窄网络错误或 HTTP 429/500/502/503/504 时最多尝试 3 次，并采用 0.2/0.4 秒固定退避。Initial lookup 与 POST 后 reconciliation 分别按真实 GET attempt 数审计；retry 不重复发出 `lookup_started` 进度。合法现有媒体自然复用，否则最多一次 POST，POST 本身绝不重试。任一远端失败立即停止，后续项不尝试；不重排、不并行、不 DELETE、不 rollback，也不更新 WooCommerce 产品。成功、阻断和异常路径均先清理 WebP workspace，再清理 source workspace。安全写审计固定保存到 `reports/wordpress-media-upload-execution.json`；顶层 `write_requests_performed` 必须与 Transport 的实际 media POST 数完全一致，且报告不含凭据、认证头、Cookie、完整 URL、Drive ID、本地路径、临时目录、媒体 bytes 或校验值。
 
 ### Verified WebP Conversion Execution V1
 

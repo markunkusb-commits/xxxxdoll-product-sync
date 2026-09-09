@@ -15,6 +15,7 @@ import http.client
 import json
 import re
 import ssl
+import time
 from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Final, Protocol
@@ -35,6 +36,9 @@ MAX_RESPONSE_BYTES: Final = 1_000_000
 CONNECT_TIMEOUT_SECONDS: Final = 10.0
 READ_TIMEOUT_SECONDS: Final = 30.0
 LOOKUP_PER_PAGE: Final = 2
+MAX_LOOKUP_ATTEMPTS: Final = 3
+LOOKUP_RETRY_BACKOFF_SECONDS: Final = 0.2
+LOOKUP_RETRYABLE_HTTP_STATUSES: Final = frozenset({429, 500, 502, 503, 504})
 
 _CREDENTIAL_CAPABILITY = object()
 _WRITE_PERMIT_CAPABILITY = object()
@@ -850,16 +854,43 @@ def _lookup(
     slug: str,
     authorization: str,
     fresh_settings: Settings,
+    attempt_callback: Callable[[], None],
 ) -> VerifiedWordPressMediaReference | None:
-    try:
-        raw_response = transport.lookup_media(
-            slug=slug, authorization=authorization
-        )
-    except Exception:
+    response: WordPressMediaHttpResponse | None = None
+    for attempt in range(1, MAX_LOOKUP_ATTEMPTS + 1):
+        attempt_callback()
+        try:
+            raw_response = transport.lookup_media(
+                slug=slug, authorization=authorization
+            )
+        except Exception as error:
+            retryable = isinstance(
+                error,
+                (WordPressMediaTransportNetworkError, TimeoutError, ConnectionError, OSError),
+            )
+            if not retryable:
+                raise WordPressMediaUploadTransportError(
+                    "wordpress_media_lookup_failed"
+                ) from None
+        else:
+            response = _validated_response(raw_response)
+            retryable = response.status_code in LOOKUP_RETRYABLE_HTTP_STATUSES
+            if not retryable:
+                break
+        if attempt == MAX_LOOKUP_ATTEMPTS:
+            raise WordPressMediaUploadTransportError(
+                "wordpress_media_lookup_failed"
+            ) from None
+        try:
+            _sleep_lookup_backoff(attempt * LOOKUP_RETRY_BACKOFF_SECONDS)
+        except Exception:
+            raise WordPressMediaUploadTransportError(
+                "wordpress_media_lookup_failed"
+            ) from None
+    if response is None:
         raise WordPressMediaUploadTransportError(
             "wordpress_media_lookup_failed"
-        ) from None
-    response = _validated_response(raw_response)
+        )
     if 300 <= response.status_code <= 399:
         raise WordPressMediaUploadTransportError(
             "wordpress_media_redirect_forbidden"
@@ -886,6 +917,10 @@ def _lookup(
         fresh_settings=fresh_settings,
         upload_status="reused",
     )
+
+
+def _sleep_lookup_backoff(seconds: float) -> None:
+    time.sleep(seconds)
 
 
 def _read_verified_body(
@@ -1073,6 +1108,14 @@ def execute_wordpress_media_uploads(
     failed_at_index: int | None = None
     blocker: str | None = None
 
+    def count_initial_lookup_attempt() -> None:
+        nonlocal lookup_requests
+        lookup_requests += 1
+
+    def count_reconciliation_lookup_attempt() -> None:
+        nonlocal reconciliation_requests
+        reconciliation_requests += 1
+
     for index, intent in enumerate(intents, start=1):
         if failed_at_index is not None:
             results.append(_empty_item(
@@ -1100,13 +1143,13 @@ def execute_wordpress_media_uploads(
                 total_items=len(intents),
                 status="lookup_started",
             )
-            lookup_requests += 1
             existing = _lookup(
                 transport,
                 intent=intent,
                 slug=slug,
                 authorization=authorization,
                 fresh_settings=fresh_settings,
+                attempt_callback=count_initial_lookup_attempt,
             )
             if existing is not None:
                 reference = existing
@@ -1131,7 +1174,6 @@ def execute_wordpress_media_uploads(
                         fresh_settings=fresh_settings,
                     )
                 except WordPressMediaTransportNetworkError as uncertain:
-                    reconciliation_requests += 1
                     try:
                         found_after_post = _lookup(
                             transport,
@@ -1139,6 +1181,7 @@ def execute_wordpress_media_uploads(
                             slug=slug,
                             authorization=authorization,
                             fresh_settings=fresh_settings,
+                            attempt_callback=count_reconciliation_lookup_attempt,
                         )
                     except WordPressMediaUploadTransportError as error:
                         if str(error) == "wordpress_media_identity_ambiguous":

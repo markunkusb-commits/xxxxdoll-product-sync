@@ -1238,3 +1238,25 @@ def test_production_does_not_hardcode_existing_media_id_or_reality_count():
     assert "18169" not in source
     assert "selected_items == 96" not in source
     assert "expected_selected_items == 96" not in source
+
+
+def test_execution_report_counts_actual_lookup_retry_attempts(tmp_path):
+    class RetryThenCreateTransport(WordPressTransport):
+        def lookup_media(self, *, slug, authorization):
+            if not self.lookup_calls:
+                self.lookup_calls.append((slug, authorization))
+                raise TimeoutError("synthetic transient lookup")
+            return super().lookup_media(slug=slug, authorization=authorization)
+
+    transport = RetryThenCreateTransport(("created",))
+    with patch.object(transport_core, "_sleep_lookup_backoff", return_value=None):
+        report, _, _, _ = execute(
+            tmp_path, ("created",), transport=transport
+        )
+    assert report["status"] == "ok"
+    assert report["lookup_requests_performed"] == 2
+    assert report["transport_summary"]["lookup_requests_performed"] == 2
+    assert report["upload_requests_performed"] == 1
+    assert report["write_requests_performed"] == 1
+    assert len(transport.lookup_calls) == 2
+    assert len(transport.upload_calls) == 1

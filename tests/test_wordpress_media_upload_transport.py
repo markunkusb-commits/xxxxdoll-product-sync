@@ -53,6 +53,7 @@ def deny_external(monkeypatch):
     monkeypatch.setattr(socket.socket, "connect", denied)
     monkeypatch.setattr(socket, "create_connection", denied)
     monkeypatch.setattr(socket, "getaddrinfo", denied)
+    monkeypatch.setattr(transport_core, "_sleep_lookup_backoff", lambda seconds: None)
 
 
 def settings(**overrides):
@@ -1277,3 +1278,333 @@ def test_mock_suite_declares_zero_real_network_and_wordpress_calls():
 
 def test_mock_suite_declares_no_real_uploads():
     assert 0 == 0
+
+
+def test_lookup_retry_policy_constants_are_bounded_and_deterministic():
+    assert transport_core.MAX_LOOKUP_ATTEMPTS == 3
+    assert transport_core.LOOKUP_RETRY_BACKOFF_SECONDS == 0.2
+    assert transport_core.LOOKUP_RETRYABLE_HTTP_STATUSES == {
+        429, 500, 502, 503, 504
+    }
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        transport_core.WordPressMediaTransportNetworkError(),
+        TimeoutError("synthetic timeout"),
+        ConnectionError("synthetic reset"),
+        OSError("synthetic transport failure"),
+    ],
+)
+def test_initial_network_failure_then_existing_retries_and_reuses(
+    gated, failure
+):
+    _, intents = gated
+    intent = intents[0]
+    transport = ScriptedTransport(
+        lookups=[failure, response(200, [record(intent)])]
+    )
+    result = run_one(intent, transport)
+    summary = result.to_safe_dict()["summary"]
+    assert result.status == "ok"
+    assert result.references[0].upload_status == "reused"
+    assert summary["lookup_requests_performed"] == 2
+    assert summary["wordpress_upload_requests_performed"] == 0
+    assert len(transport.lookup_calls) == 2
+    assert transport.upload_calls == []
+
+
+def test_initial_network_failure_then_missing_retries_and_posts_once(gated):
+    _, intents = gated
+    intent = intents[0]
+    transport = ScriptedTransport(
+        lookups=[TimeoutError(), response(200, [])],
+        uploads=[response(201, record(intent))],
+    )
+    result = run_one(intent, transport)
+    summary = result.to_safe_dict()["summary"]
+    assert result.status == "ok"
+    assert summary["lookup_requests_performed"] == 2
+    assert summary["wordpress_upload_requests_performed"] == 1
+    assert summary["write_requests_performed"] == 1
+    assert len(transport.upload_calls) == 1
+
+
+def test_two_network_failures_then_missing_posts_once(gated):
+    _, intents = gated
+    intent = intents[0]
+    transport = ScriptedTransport(
+        lookups=[TimeoutError(), ConnectionError(), response(200, [])],
+        uploads=[response(201, record(intent))],
+    )
+    report = run_one(intent, transport).to_safe_dict()
+    assert report["summary"]["lookup_requests_performed"] == 3
+    assert report["summary"]["wordpress_upload_requests_performed"] == 1
+    assert len(transport.lookup_calls) == 3
+    assert len(transport.upload_calls) == 1
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        transport_core.WordPressMediaTransportNetworkError(),
+        TimeoutError(),
+        ConnectionError(),
+        OSError(),
+    ],
+)
+def test_three_initial_network_failures_exhaust_and_never_post(gated, failure):
+    _, intents = gated
+    transport = ScriptedTransport(lookups=[failure, failure, failure])
+    report = run_one(intents[0], transport).to_safe_dict()
+    assert report["status"] == "blocked"
+    assert report["blocking_issues"] == ["wordpress_media_lookup_failed"]
+    assert report["summary"]["lookup_requests_performed"] == 3
+    assert len(transport.lookup_calls) == 3
+    assert transport.upload_calls == []
+
+
+@pytest.mark.parametrize("status", [429, 500, 502, 503, 504])
+def test_retryable_initial_http_status_then_existing_reuses(gated, status):
+    _, intents = gated
+    intent = intents[0]
+    transport = ScriptedTransport(
+        lookups=[response(status, {}), response(200, [record(intent)])]
+    )
+    report = run_one(intent, transport).to_safe_dict()
+    assert report["status"] == "ok"
+    assert report["summary"]["reused"] == 1
+    assert report["summary"]["lookup_requests_performed"] == 2
+    assert len(transport.lookup_calls) == 2
+    assert transport.upload_calls == []
+
+
+def test_initial_500_then_missing_retries_and_posts_once(gated):
+    _, intents = gated
+    intent = intents[0]
+    transport = ScriptedTransport(
+        lookups=[response(500, {}), response(200, [])],
+        uploads=[response(201, record(intent))],
+    )
+    report = run_one(intent, transport).to_safe_dict()
+    assert report["summary"]["lookup_requests_performed"] == 2
+    assert report["summary"]["wordpress_upload_requests_performed"] == 1
+    assert len(transport.upload_calls) == 1
+
+
+@pytest.mark.parametrize("status", [429, 503])
+def test_retryable_initial_http_status_exhaustion_never_posts(gated, status):
+    _, intents = gated
+    transport = ScriptedTransport(
+        lookups=[response(status, {}) for _ in range(3)]
+    )
+    report = run_one(intents[0], transport).to_safe_dict()
+    assert report["status"] == "blocked"
+    assert report["blocking_issues"] == ["wordpress_media_lookup_failed"]
+    assert report["summary"]["lookup_requests_performed"] == 3
+    assert len(transport.lookup_calls) == 3
+    assert transport.upload_calls == []
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [b"not-json", {"id": 1}],
+)
+def test_http_200_invalid_lookup_payload_is_not_retried(gated, payload):
+    _, intents = gated
+    transport = ScriptedTransport(lookups=[response(200, payload)])
+    report = run_one(intents[0], transport).to_safe_dict()
+    assert report["status"] == "blocked"
+    assert report["summary"]["lookup_requests_performed"] == 1
+    assert len(transport.lookup_calls) == 1
+    assert transport.upload_calls == []
+
+
+def test_http_200_ambiguous_lookup_is_not_retried(gated):
+    _, intents = gated
+    intent = intents[0]
+    transport = ScriptedTransport(
+        lookups=[response(200, [record(intent, media_id=1), record(intent, media_id=2)])]
+    )
+    report = run_one(intent, transport).to_safe_dict()
+    assert report["blocking_issues"] == ["wordpress_media_identity_ambiguous"]
+    assert report["summary"]["lookup_requests_performed"] == 1
+    assert len(transport.lookup_calls) == 1
+    assert transport.upload_calls == []
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"mime_type": "image/jpeg"},
+        {"media_details": {"file": "collision-1.webp"}},
+    ],
+)
+def test_invalid_existing_record_is_not_retried(gated, changes):
+    _, intents = gated
+    value = record(intents[0])
+    value.update(changes)
+    transport = ScriptedTransport(lookups=[response(200, [value])])
+    report = run_one(intents[0], transport).to_safe_dict()
+    assert report["status"] == "blocked"
+    assert report["summary"]["lookup_requests_performed"] == 1
+    assert len(transport.lookup_calls) == 1
+    assert transport.upload_calls == []
+
+
+@pytest.mark.parametrize("status", [301, 400, 401, 403, 404, 418, 501, 505])
+def test_deterministic_lookup_status_is_not_retried(gated, status):
+    _, intents = gated
+    transport = ScriptedTransport(lookups=[response(status, {})])
+    report = run_one(intents[0], transport).to_safe_dict()
+    assert report["status"] == "blocked"
+    assert report["summary"]["lookup_requests_performed"] == 1
+    assert len(transport.lookup_calls) == 1
+    assert transport.upload_calls == []
+
+
+def test_initial_lookup_progress_is_emitted_once_across_retries(gated):
+    _, intents = gated
+    intent = intents[0]
+    events = []
+    transport = ScriptedTransport(
+        lookups=[response(503, {}), response(200, [record(intent)])]
+    )
+    run_one(intent, transport, progress_callback=events.append)
+    assert [event["status"] for event in events].count("lookup_started") == 1
+    assert len(transport.lookup_calls) == 2
+
+
+def test_lookup_backoff_is_point_two_then_point_four(gated, monkeypatch):
+    _, intents = gated
+    delays = []
+    monkeypatch.setattr(transport_core, "_sleep_lookup_backoff", delays.append)
+    transport = ScriptedTransport(
+        lookups=[response(503, {}), response(503, {}), response(200, [])],
+        uploads=[response(201, record(intents[0]))],
+    )
+    run_one(intents[0], transport)
+    assert delays == [0.2, 0.4]
+
+
+@pytest.mark.parametrize("post_failure", [TimeoutError(), 429, 500, 503])
+def test_post_uncertainty_reconciles_without_second_post(gated, post_failure):
+    _, intents = gated
+    intent = intents[0]
+    upload_result = (
+        post_failure
+        if isinstance(post_failure, BaseException)
+        else response(post_failure, {})
+    )
+    transport = ScriptedTransport(
+        lookups=[response(200, []), response(200, [record(intent)])],
+        uploads=[upload_result],
+    )
+    report = run_one(intent, transport).to_safe_dict()
+    assert report["status"] == "ok"
+    assert report["summary"]["created_reconciled"] == 1
+    assert report["summary"]["wordpress_upload_requests_performed"] == 1
+    assert report["summary"]["reconciliation_requests_performed"] == 1
+    assert len(transport.upload_calls) == 1
+
+
+def test_reconciliation_network_failure_retries_then_finds(gated):
+    _, intents = gated
+    intent = intents[0]
+    transport = ScriptedTransport(
+        lookups=[
+            response(200, []), TimeoutError(), response(200, [record(intent)])
+        ],
+        uploads=[TimeoutError()],
+    )
+    report = run_one(intent, transport).to_safe_dict()
+    assert report["status"] == "ok"
+    assert report["summary"]["lookup_requests_performed"] == 1
+    assert report["summary"]["reconciliation_requests_performed"] == 2
+    assert report["summary"]["wordpress_upload_requests_performed"] == 1
+    assert report["summary"]["created_reconciled"] == 1
+    assert len(transport.upload_calls) == 1
+
+
+def test_reconciliation_transient_exhaustion_blocks_without_repost(gated):
+    _, intents = gated
+    transport = ScriptedTransport(
+        lookups=[response(200, [])] + [response(503, {}) for _ in range(3)],
+        uploads=[TimeoutError()],
+    )
+    report = run_one(intents[0], transport).to_safe_dict()
+    assert report["status"] == "blocked"
+    assert report["summary"]["lookup_requests_performed"] == 1
+    assert report["summary"]["reconciliation_requests_performed"] == 3
+    assert report["summary"]["wordpress_upload_requests_performed"] == 1
+    assert len(transport.upload_calls) == 1
+
+
+def test_three_intent_retry_counter_integrity(gated):
+    _, intents = gated
+    transport = ScriptedTransport(
+        lookups=[
+            TimeoutError(), response(200, [record(intents[0], media_id=1)]),
+            response(200, []),
+            response(200, [record(intents[2], media_id=3)]),
+        ],
+        uploads=[response(201, record(intents[1], media_id=2))],
+    )
+    report = transport_core.execute_wordpress_media_uploads(
+        intents, settings(), credentials(), permit(), transport
+    ).to_safe_dict()
+    summary = report["summary"]
+    assert report["status"] == "ok"
+    assert summary["references_created"] == 3
+    assert summary["lookup_requests_performed"] == len(transport.lookup_calls) == 4
+    assert summary["wordpress_upload_requests_performed"] == 1
+    assert summary["write_requests_performed"] == 1
+    assert summary["network_requests_performed"] == 5
+
+
+def test_batch_fail_stop_after_lookup_retry_exhaustion(gated):
+    _, intents = gated
+    transport = ScriptedTransport(
+        lookups=[TimeoutError(), TimeoutError(), TimeoutError()]
+    )
+    report = transport_core.execute_wordpress_media_uploads(
+        intents, settings(), credentials(), permit(), transport
+    ).to_safe_dict()
+    assert report["status"] == "blocked"
+    assert report["summary"]["failed_at_index"] == 1
+    assert report["summary"]["lookup_requests_performed"] == 3
+    assert report["results"][1]["upload_status"] == "not_attempted"
+    assert report["results"][2]["upload_status"] == "not_attempted"
+    assert transport.upload_calls == []
+
+
+@pytest.mark.parametrize(
+    "secret",
+    [
+        "Authorization", "Basic forbidden", "mock-user-not-read",
+        "mock-app-password-not-read", "Cookie=forbidden",
+        "https://staging-unit-test.wpcomstaging.com", "source_url",
+    ],
+)
+def test_lookup_retry_report_remains_redacted(gated, secret):
+    _, intents = gated
+    transport = ScriptedTransport(
+        lookups=[
+            TimeoutError(
+                "Authorization: Basic forbidden Cookie=forbidden "
+                "https://staging-unit-test.wpcomstaging.com"
+            ),
+            response(200, [record(intents[0])]),
+        ]
+    )
+    report = run_one(intents[0], transport).to_safe_dict()
+    assert secret not in safe_text(report)
+
+
+def test_lookup_retry_does_not_wrap_post_in_retry_loop():
+    lookup_source = inspect.getsource(transport_core._lookup)
+    post_source = inspect.getsource(transport_core._post)
+    assert "MAX_LOOKUP_ATTEMPTS" in lookup_source
+    assert "MAX_LOOKUP_ATTEMPTS" not in post_source
+    assert "for attempt" not in post_source
