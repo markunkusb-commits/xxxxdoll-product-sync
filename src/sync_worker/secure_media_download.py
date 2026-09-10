@@ -14,6 +14,7 @@ import os
 import re
 import stat
 import tempfile
+import time
 from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Protocol
@@ -34,6 +35,7 @@ DOWNLOAD_CHUNK_SIZE = 256 * 1024
 MAX_HANDLES_PER_BATCH = 200
 MAX_SOURCE_FILE_BYTES = 100 * 1024 * 1024
 MAX_DOWNLOAD_ATTEMPTS = 3
+DOWNLOAD_RETRY_BACKOFF_SECONDS = 1.0
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _ARTIFACT_CAPABILITY = object()
 _MIME_EXTENSIONS = {
@@ -568,6 +570,10 @@ def _emit_download_progress(
         raise SecureMediaDownloadError("download_progress_callback_failed") from None
 
 
+def _sleep_download_backoff(seconds: float) -> None:
+    time.sleep(seconds)
+
+
 def _download_secure_media_impl(
     handles: handle_core.SecureSelectedMediaHandle | tuple[handle_core.SecureSelectedMediaHandle, ...],
     gateway: DriveContentDownloadGateway,
@@ -712,7 +718,14 @@ def _download_secure_media_impl(
                 except GoogleDriveContentDownloadError as error:
                     counters["bytes_downloaded"] += sink.bytes_written
                     counters["download_requests_performed"] += max(0, error.requests_performed)
-                    if error.transient and attempt < MAX_DOWNLOAD_ATTEMPTS:
+                    if error.transient is True and attempt < MAX_DOWNLOAD_ATTEMPTS:
+                        try:
+                            _sleep_download_backoff(
+                                attempt * DOWNLOAD_RETRY_BACKOFF_SECONDS
+                            )
+                        except Exception:
+                            blocker = "drive_download_transient_error"
+                            break
                         continue
                     blocker = error.code if error.code in {
                         "drive_download_forbidden", "drive_download_not_found",

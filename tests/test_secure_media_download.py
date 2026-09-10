@@ -55,6 +55,7 @@ def deny_external(monkeypatch):
     monkeypatch.setattr(socket.socket, "connect", denied)
     monkeypatch.setattr(socket, "create_connection", denied)
     monkeypatch.setattr(socket, "getaddrinfo", denied)
+    monkeypatch.setattr(download_core, "_sleep_download_backoff", lambda seconds: None)
 
 
 def make_handle(
@@ -1048,3 +1049,400 @@ def test_178_invalid_progress_callback_fails_before_workspace(tmp_path):
             progress_callback="not-callable",
         )
     assert not tuple(tmp_path.iterdir())
+
+
+class PartialRetryGateway:
+    def __init__(self, data, scripts):
+        self.data = data
+        self.scripts = list(scripts)
+        self.calls = []
+
+    def download_file(self, provider_file_id, sink, *, chunk_size):
+        self.calls.append((provider_file_id, chunk_size))
+        script = self.scripts.pop(0)
+        partial = script.get("partial", self.data)
+        for offset in range(0, len(partial), 4):
+            sink.write(partial[offset : offset + 4])
+        requests = script["requests"]
+        if script.get("transient"):
+            raise GoogleDriveContentDownloadError(
+                "drive_download_transient_error",
+                transient=True,
+                requests_performed=requests,
+            )
+        return GoogleDriveContentDownloadReceipt(requests, len(partial))
+
+
+def test_retry_policy_version_and_attempt_limit_are_unchanged():
+    assert download_core.POLICY_VERSION == "xxxxdoll-secure-media-download-v1"
+    assert download_core.MAX_DOWNLOAD_ATTEMPTS == 3
+    assert download_core.DOWNLOAD_RETRY_BACKOFF_SECONDS == 1.0
+
+
+def test_first_transient_then_second_success_uses_one_second_backoff(
+    tmp_path, monkeypatch
+):
+    handle = make_handle()
+    raw_id = handle_core._provider_file_id_for_download(handle)
+    gateway = FakeGateway(
+        {raw_id: JPEG},
+        failures={raw_id: [error("drive_download_transient_error", True), None]},
+    )
+    sleeps = []
+    monkeypatch.setattr(download_core, "_sleep_download_backoff", sleeps.append)
+    result = download_core.download_secure_media(
+        handle, gateway, workspace_parent=tmp_path
+    )
+    report = safe(result)
+    assert report["status"] == "ok"
+    assert len(gateway.calls) == 2
+    assert report["results"][0]["download_attempts"] == 2
+    assert sleeps == [1.0]
+    result.cleanup()
+
+
+def test_two_transients_then_third_success_uses_one_and_two_second_backoff(
+    tmp_path, monkeypatch
+):
+    handle = make_handle()
+    raw_id = handle_core._provider_file_id_for_download(handle)
+    gateway = FakeGateway(
+        {raw_id: JPEG},
+        failures={
+            raw_id: [
+                error("drive_download_transient_error", True),
+                error("drive_download_transient_error", True),
+                None,
+            ]
+        },
+    )
+    sleeps = []
+    monkeypatch.setattr(download_core, "_sleep_download_backoff", sleeps.append)
+    result = download_core.download_secure_media(
+        handle, gateway, workspace_parent=tmp_path
+    )
+    report = safe(result)
+    assert report["status"] == "ok"
+    assert len(gateway.calls) == 3
+    assert report["results"][0]["download_attempts"] == 3
+    assert sleeps == [1.0, 2.0]
+    result.cleanup()
+
+
+def test_three_transient_failures_have_no_sleep_after_last_attempt(
+    tmp_path, monkeypatch
+):
+    handle = make_handle()
+    raw_id = handle_core._provider_file_id_for_download(handle)
+    gateway = FakeGateway(
+        failures={
+            raw_id: [error("drive_download_transient_error", True)] * 3
+        }
+    )
+    sleeps = []
+    monkeypatch.setattr(download_core, "_sleep_download_backoff", sleeps.append)
+    result = download_core.download_secure_media(
+        handle, gateway, workspace_parent=tmp_path
+    )
+    report = safe(result)
+    assert report["status"] == "blocked"
+    assert report["results"][0]["download_attempts"] == 3
+    assert report["results"][0]["blocking_issues"] == [
+        "drive_download_transient_error"
+    ]
+    assert len(gateway.calls) == 3
+    assert sleeps == [1.0, 2.0]
+
+
+def test_first_attempt_success_never_sleeps(tmp_path, monkeypatch):
+    sleeps = []
+    monkeypatch.setattr(download_core, "_sleep_download_backoff", sleeps.append)
+    result, gateway = run_one(tmp_path)
+    assert result.status == "ok"
+    assert len(gateway.calls) == 1
+    assert safe(result)["results"][0]["download_attempts"] == 1
+    assert sleeps == []
+    result.cleanup()
+
+
+@pytest.mark.parametrize(
+    "code",
+    [
+        "drive_download_forbidden",
+        "drive_download_not_found",
+        "drive_download_provider_error",
+        "drive_download_sink_contract_violation",
+    ],
+)
+def test_nontransient_provider_failure_never_sleeps_or_retries(
+    tmp_path, monkeypatch, code
+):
+    handle = make_handle()
+    raw_id = handle_core._provider_file_id_for_download(handle)
+    gateway = FakeGateway(failures={raw_id: [error(code, False)]})
+    sleeps = []
+    monkeypatch.setattr(download_core, "_sleep_download_backoff", sleeps.append)
+    result = download_core.download_secure_media(
+        handle, gateway, workspace_parent=tmp_path
+    )
+    assert result.status == "blocked"
+    assert len(gateway.calls) == 1
+    assert safe(result)["results"][0]["download_attempts"] == 1
+    assert sleeps == []
+
+
+@pytest.mark.parametrize(
+    "code",
+    [
+        "download_chunk_limit_exceeded",
+        "download_chunk_must_be_bytes",
+        "download_source_file_too_large",
+        "download_source_write_incomplete",
+        "download_source_write_failed",
+    ],
+)
+def test_sink_failure_never_sleeps_or_retries(tmp_path, monkeypatch, code):
+    handle = make_handle()
+    raw_id = handle_core._provider_file_id_for_download(handle)
+    gateway = FakeGateway(
+        failures={raw_id: [GoogleDriveContentSinkError(code)]}
+    )
+    sleeps = []
+    monkeypatch.setattr(download_core, "_sleep_download_backoff", sleeps.append)
+    result = download_core.download_secure_media(
+        handle, gateway, workspace_parent=tmp_path
+    )
+    assert result.status == "blocked"
+    assert len(gateway.calls) == 1
+    assert safe(result)["results"][0]["download_attempts"] == 1
+    assert sleeps == []
+
+
+@pytest.mark.parametrize("failure_kind", ["checksum", "size", "signature"])
+def test_integrity_failure_never_sleeps_or_retries(
+    tmp_path, monkeypatch, failure_kind
+):
+    if failure_kind == "checksum":
+        handle = make_handle(JPEG)
+        downloaded = JPEG + b"changed"
+    elif failure_kind == "size":
+        handle = make_handle(JPEG, expected_size=len(JPEG) + 1)
+        downloaded = JPEG
+    else:
+        handle = make_handle(PNG, mime="image/jpeg")
+        downloaded = PNG
+    raw_id = handle_core._provider_file_id_for_download(handle)
+    gateway = FakeGateway({raw_id: downloaded})
+    sleeps = []
+    monkeypatch.setattr(download_core, "_sleep_download_backoff", sleeps.append)
+    result = download_core.download_secure_media(
+        handle, gateway, workspace_parent=tmp_path
+    )
+    assert result.status == "blocked"
+    assert len(gateway.calls) == 1
+    assert safe(result)["results"][0]["download_attempts"] == 1
+    assert sleeps == []
+
+
+def test_partial_first_attempt_is_reset_before_successful_second_attempt(
+    tmp_path, monkeypatch
+):
+    handle = make_handle(JPEG)
+    gateway = PartialRetryGateway(
+        JPEG,
+        [
+            {"partial": JPEG[:7], "requests": 5, "transient": True},
+            {"partial": JPEG, "requests": 11},
+        ],
+    )
+    sleeps = []
+    monkeypatch.setattr(download_core, "_sleep_download_backoff", sleeps.append)
+    result = download_core.download_secure_media(
+        handle, gateway, workspace_parent=tmp_path
+    )
+    report = safe(result)
+    item = report["results"][0]
+    summary = report["summary"]
+    assert report["status"] == "ok"
+    assert item["download_attempts"] == 2
+    assert item["actual_size_bytes"] == len(JPEG)
+    assert item["actual_md5_checksum"] == hashlib.md5(
+        JPEG, usedforsecurity=False
+    ).hexdigest()
+    assert summary["checksum_verified"] == 1
+    assert summary["size_verified"] == 1
+    assert summary["signature_verified"] == 1
+    assert summary["bytes_downloaded"] == 7 + len(JPEG)
+    assert summary["download_requests_performed"] == 5 + 11
+    assert summary["downloads_attempted"] == 1
+    assert sleeps == [1.0]
+    result.cleanup()
+
+
+def test_two_partial_attempts_are_both_reset_before_third_success(
+    tmp_path, monkeypatch
+):
+    handle = make_handle(JPEG)
+    gateway = PartialRetryGateway(
+        JPEG,
+        [
+            {"partial": JPEG[:4], "requests": 2, "transient": True},
+            {"partial": JPEG[:9], "requests": 3, "transient": True},
+            {"partial": JPEG, "requests": 7},
+        ],
+    )
+    sleeps = []
+    monkeypatch.setattr(download_core, "_sleep_download_backoff", sleeps.append)
+    result = download_core.download_secure_media(
+        handle, gateway, workspace_parent=tmp_path
+    )
+    report = safe(result)
+    assert report["status"] == "ok"
+    assert report["results"][0]["download_attempts"] == 3
+    assert report["results"][0]["actual_size_bytes"] == len(JPEG)
+    assert report["summary"]["bytes_downloaded"] == 4 + 9 + len(JPEG)
+    assert report["summary"]["download_requests_performed"] == 12
+    assert report["summary"]["downloads_attempted"] == 1
+    assert sleeps == [1.0, 2.0]
+    result.cleanup()
+
+
+def test_batch_fail_stop_after_transient_exhaustion_cleans_all_sources(
+    tmp_path, monkeypatch
+):
+    handles, data = make_batch(3)
+    failed_id = handle_core._provider_file_id_for_download(handles[1])
+    gateway = FakeGateway(
+        data,
+        failures={
+            failed_id: [error("drive_download_transient_error", True)] * 3
+        },
+    )
+    sleeps = []
+    monkeypatch.setattr(download_core, "_sleep_download_backoff", sleeps.append)
+    result = download_core.download_secure_media(
+        handles, gateway, workspace_parent=tmp_path
+    )
+    report = safe(result)
+    assert report["status"] == "blocked"
+    assert report["summary"]["downloads_attempted"] == 2
+    assert report["summary"]["downloads_verified"] == 1
+    assert report["summary"]["downloads_failed"] == 1
+    assert report["summary"]["authoritative_artifacts"] == 0
+    assert report["results"][0]["download_status"] == "downloaded_verified"
+    assert report["results"][1]["download_attempts"] == 3
+    assert report["results"][2]["download_status"] == "not_attempted"
+    assert report["results"][2]["blocking_issues"] == [
+        "batch_aborted_after_failure"
+    ]
+    assert result.artifacts == ()
+    assert sleeps == [1.0, 2.0]
+    assert not tuple(tmp_path.iterdir())
+
+
+def test_retry_keeps_one_started_and_one_verified_progress_pair(
+    tmp_path, monkeypatch
+):
+    handle = make_handle()
+    raw_id = handle_core._provider_file_id_for_download(handle)
+    gateway = FakeGateway(
+        {raw_id: JPEG},
+        failures={raw_id: [error("drive_download_transient_error", True), None]},
+    )
+    events = []
+    result = download_core.download_secure_media(
+        handle,
+        gateway,
+        workspace_parent=tmp_path,
+        progress_callback=events.append,
+    )
+    assert [event["status"] for event in events] == [
+        "download_started", "download_verified"
+    ]
+    result.cleanup()
+
+
+class StopDuringDownloadBackoff(BaseException):
+    pass
+
+
+@pytest.mark.parametrize(
+    "signal",
+    [KeyboardInterrupt(), SystemExit(11), StopDuringDownloadBackoff("stop")],
+)
+def test_backoff_baseexception_cleans_workspace_and_reraises_original(
+    tmp_path, monkeypatch, signal
+):
+    handle = make_handle()
+    raw_id = handle_core._provider_file_id_for_download(handle)
+    gateway = FakeGateway(
+        failures={raw_id: [error("drive_download_transient_error", True)]}
+    )
+
+    def interrupted(seconds):
+        raise signal
+
+    monkeypatch.setattr(download_core, "_sleep_download_backoff", interrupted)
+    with pytest.raises(type(signal)) as caught:
+        download_core.download_secure_media(
+            handle, gateway, workspace_parent=tmp_path
+        )
+    assert caught.value is signal
+    assert not tuple(tmp_path.iterdir())
+
+
+def test_backoff_regular_exception_becomes_safe_transient_blocker(
+    tmp_path, monkeypatch
+):
+    handle = make_handle()
+    raw_id = handle_core._provider_file_id_for_download(handle)
+    gateway = FakeGateway(
+        failures={raw_id: [error("drive_download_transient_error", True)]}
+    )
+
+    def failed_sleep(seconds):
+        raise RuntimeError("credentials path token and provider ID")
+
+    monkeypatch.setattr(download_core, "_sleep_download_backoff", failed_sleep)
+    report = safe(download_core.download_secure_media(
+        handle, gateway, workspace_parent=tmp_path
+    ))
+    text = json.dumps(report)
+    assert report["status"] == "blocked"
+    assert report["results"][0]["blocking_issues"] == [
+        "drive_download_transient_error"
+    ]
+    assert "credentials path token" not in text
+
+
+@pytest.mark.parametrize(
+    "forbidden",
+    [
+        "provider_file_id", "raw_file_id", "opaque_file_001",
+        "drive.google.com", "local_source_path", "temp_directory",
+        "Authorization", "Cookie", "access_token", "refresh_token",
+        "client_secret", "credentials",
+    ],
+)
+def test_retry_report_contains_no_authority_secret_or_exception_detail(
+    tmp_path, monkeypatch, forbidden
+):
+    handle = make_handle()
+    raw_id = handle_core._provider_file_id_for_download(handle)
+    gateway = FakeGateway(
+        {raw_id: JPEG},
+        failures={raw_id: [error("drive_download_transient_error", True), None]},
+    )
+    result = download_core.download_secure_media(
+        handle, gateway, workspace_parent=tmp_path
+    )
+    assert forbidden.casefold() not in json.dumps(safe(result)).casefold()
+    result.cleanup()
+
+
+def test_download_core_remains_the_only_retry_owner():
+    gateway_source = inspect.getsource(GoogleDriveContentGateway.download_file)
+    core_source = inspect.getsource(download_core._download_secure_media_impl)
+    assert "next_chunk(num_retries=0)" in gateway_source
+    assert "MAX_DOWNLOAD_ATTEMPTS" in core_source
+    assert "random" not in core_source

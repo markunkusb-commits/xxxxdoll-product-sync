@@ -416,7 +416,9 @@ python -m sync_worker download-selected-media-batch `
   --sku-report reports/sku-dry-run.json
 ```
 
-任何 content request 前都会验证每个预期文件大小，并检查临时 workspace 至少具有全部预期源文件大小加 512 MiB reserve 的可用空间。Preparation 继续限定为 `spreadsheets.readonly` 与 `drive.metadata.readonly`，下载客户端独立限定为 `drive.readonly`。CLI 会逐项输出仅包含 index、total、SKU、selection position 和状态的安全进度；不输出 Drive ID、URL、文件名、校验值或本地路径。完整 batch 采用 all-or-nothing：任一 MD5、size、signature 或 transport 失败都会令 authoritative artifacts 为 0 并清理已创建源文件；`KeyboardInterrupt`、`SystemExit` 或其他 `BaseException` 也会先清理整个 batch workspace 再原样抛出，且不会写最终 Execution 报告。即使全部成功，CLI 也会在写入 `reports/secure-media-download-execution.json` 前完成 cleanup，不保留源文件，不转换 WebP，也不访问 WordPress。
+任何 content request 前都会验证每个预期文件大小，并检查临时 workspace 至少具有全部预期源文件大小加 512 MiB reserve 的可用空间。Preparation 继续限定为 `spreadsheets.readonly` 与 `drive.metadata.readonly`，下载客户端独立限定为 `drive.readonly`。下载 Core 仅对明确标记为 transient 的 Drive content 错误执行最多 3 次 transport attempt，并在第一次、第二次失败后分别等待 1 秒、2 秒；每次重试前都会完整重置当前文件 sink。Google gateway 的 `MediaIoBaseDownload.next_chunk(num_retries=0)` 保持关闭内建重试，避免形成双重重试层。
+
+CLI 会逐项输出仅包含 index、total、SKU、selection position 和状态的安全进度；不输出 Drive ID、URL、文件名、校验值或本地路径。完整 batch 采用 all-or-nothing：任一 MD5、size、signature 或 transport 失败都会令 authoritative artifacts 为 0 并清理已创建源文件；`KeyboardInterrupt`、`SystemExit` 或其他 `BaseException` 也会先清理整个 batch workspace 再原样抛出，且不会写最终 Execution 报告。即使全部成功，CLI 也会在写入 `reports/secure-media-download-execution.json` 前完成 cleanup，不保留源文件，不转换 WebP，也不访问 WordPress。
 
 ## CLM RMB Price List Parser V1
 
