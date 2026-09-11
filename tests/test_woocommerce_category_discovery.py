@@ -252,7 +252,14 @@ class WooCategoryDiscoveryTests(unittest.TestCase):
     def test_14_credentials_are_redacted_from_cli_errors(self) -> None:
         credentials = WooCategoryCredentials("ck_private_value", "cs_private_value")
         logger = Mock(spec=logging.Logger)
+        credential_source = {
+            "WC_CONSUMER_KEY": "ck_private_value",
+            "WC_CONSUMER_SECRET": "cs_private_value",
+        }
         with patch(
+            "sync_worker.cli.load_woo_category_credential_source",
+            return_value=credential_source,
+        ), patch(
             "sync_worker.cli.load_woo_category_credentials",
             return_value=credentials,
         ), patch(
@@ -634,7 +641,7 @@ class WooCategoryDiscoveryTests(unittest.TestCase):
         self.assertEqual(output_path.name, REPORT_FILENAME)
         self.assertEqual(files, [REPORT_FILENAME])
 
-    def test_57_cli_calls_environment_loader_and_runner(self) -> None:
+    def test_57_cli_calls_project_credential_source_and_runner(self) -> None:
         credentials = WooCategoryCredentials("ck_test", "cs_test")
         mock_report = {
             "status": "ok",
@@ -642,7 +649,14 @@ class WooCategoryDiscoveryTests(unittest.TestCase):
             "network_requests_performed": 1,
             "write_requests_performed": 0,
         }
+        credential_source = {
+            "WC_CONSUMER_KEY": "ck_test",
+            "WC_CONSUMER_SECRET": "cs_test",
+        }
         with patch(
+            "sync_worker.cli.load_woo_category_credential_source",
+            return_value=credential_source,
+        ) as source_loader, patch(
             "sync_worker.cli.load_woo_category_credentials",
             return_value=credentials,
         ) as loader, patch(
@@ -653,7 +667,8 @@ class WooCategoryDiscoveryTests(unittest.TestCase):
                 ["discover-woo-categories", "--base-url", "https://shop.example.com"]
             )
         self.assertEqual(status, 0)
-        loader.assert_called_once_with()
+        source_loader.assert_called_once_with()
+        loader.assert_called_once_with(credential_source)
         runner.assert_called_once()
 
 
