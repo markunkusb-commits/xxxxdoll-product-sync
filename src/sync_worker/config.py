@@ -434,6 +434,24 @@ def _configuration_source(
     return source
 
 
+def load_woo_category_credential_source(
+    environ: Mapping[str, str] | None = None,
+    *,
+    dotenv_path: str | Path | None = None,
+) -> dict[str, str]:
+    """Load only Woo category credentials from dotenv plus process overrides.
+
+    This intentionally does not validate unrelated WordPress or sync settings.
+    Missing credentials remain the responsibility of the category credential
+    loader so its existing fail-closed errors and redaction contract are kept.
+    """
+    source = _configuration_source(environ, dotenv_path)
+    return {
+        "WC_CONSUMER_KEY": _read_text(source, "WC_CONSUMER_KEY"),
+        "WC_CONSUMER_SECRET": _read_text(source, "WC_CONSUMER_SECRET"),
+    }
+
+
 def load_config(
     environ: Mapping[str, str] | None = None,
     *,

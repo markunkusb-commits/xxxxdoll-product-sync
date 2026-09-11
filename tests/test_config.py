@@ -12,7 +12,11 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 import sync_worker.config as config_module  # noqa: E402
-from sync_worker.config import ConfigError, load_config  # noqa: E402
+from sync_worker.config import (  # noqa: E402
+    ConfigError,
+    load_config,
+    load_woo_category_credential_source,
+)
 
 
 SAFE_CONFIG = {
@@ -91,6 +95,41 @@ class ConfigTests(unittest.TestCase):
                 settings = load_config(dotenv_path=dotenv_path)
 
         self.assertEqual(settings.wp_username, "from-process")
+
+    def test_woo_category_credential_source_ignores_unrelated_worker_controls(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            dotenv_path = Path(temporary_directory) / ".env"
+            dotenv_path.write_text(
+                "\n".join(
+                    (
+                        "WC_CONSUMER_KEY=ck_from_file",
+                        "WC_CONSUMER_SECRET=cs_from_file",
+                        "DRY_RUN=false",
+                        "WP_BASE_URL=https://xxxxdoll.com",
+                        "SYNC_ENVIRONMENT=production",
+                    )
+                ),
+                encoding="utf-8",
+            )
+
+            with patch.dict(
+                os.environ,
+                {"WC_CONSUMER_KEY": "ck_from_process"},
+                clear=True,
+            ):
+                source = load_woo_category_credential_source(
+                    dotenv_path=dotenv_path
+                )
+
+        self.assertEqual(
+            source,
+            {
+                "WC_CONSUMER_KEY": "ck_from_process",
+                "WC_CONSUMER_SECRET": "cs_from_file",
+            },
+        )
 
     def test_staging_safety_checks_pass_for_safe_target(self) -> None:
         checks = load_config(SAFE_CONFIG).staging_safety_checks()

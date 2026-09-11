@@ -16,6 +16,7 @@ from .config import (
     load_google_config,
     load_google_drive_metadata_config,
     load_google_sheets_readonly_config,
+    load_woo_category_credential_source,
 )
 from .clm_price_dry_run import run_clm_parser_dry_run
 from .doctor import DoctorRunner
@@ -1655,13 +1656,8 @@ def _run_discover_woo_categories(
 ) -> int:
     redactor = Redactor()
     try:
-        settings = load_config()
-        credentials = load_woo_category_credentials(
-            {
-                "WC_CONSUMER_KEY": settings.wc_consumer_key,
-                "WC_CONSUMER_SECRET": settings.wc_consumer_secret,
-            }
-        )
+        credential_source = load_woo_category_credential_source()
+        credentials = load_woo_category_credentials(credential_source)
         redactor = redactor_for_woo_category_credentials(credentials)
         report, _ = run_woo_category_discovery(
             base_url,
