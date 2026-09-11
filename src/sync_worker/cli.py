@@ -1655,7 +1655,13 @@ def _run_discover_woo_categories(
 ) -> int:
     redactor = Redactor()
     try:
-        credentials = load_woo_category_credentials()
+        settings = load_config()
+        credentials = load_woo_category_credentials(
+            {
+                "WC_CONSUMER_KEY": settings.wc_consumer_key,
+                "WC_CONSUMER_SECRET": settings.wc_consumer_secret,
+            }
+        )
         redactor = redactor_for_woo_category_credentials(credentials)
         report, _ = run_woo_category_discovery(
             base_url,

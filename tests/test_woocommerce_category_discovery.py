@@ -252,7 +252,14 @@ class WooCategoryDiscoveryTests(unittest.TestCase):
     def test_14_credentials_are_redacted_from_cli_errors(self) -> None:
         credentials = WooCategoryCredentials("ck_private_value", "cs_private_value")
         logger = Mock(spec=logging.Logger)
+        settings = Mock(
+            wc_consumer_key="ck_private_value",
+            wc_consumer_secret="cs_private_value",
+        )
         with patch(
+            "sync_worker.cli.load_config",
+            return_value=settings,
+        ), patch(
             "sync_worker.cli.load_woo_category_credentials",
             return_value=credentials,
         ), patch(
@@ -642,7 +649,14 @@ class WooCategoryDiscoveryTests(unittest.TestCase):
             "network_requests_performed": 1,
             "write_requests_performed": 0,
         }
+        settings = Mock(
+            wc_consumer_key="ck_test",
+            wc_consumer_secret="cs_test",
+        )
         with patch(
+            "sync_worker.cli.load_config",
+            return_value=settings,
+        ) as config_loader, patch(
             "sync_worker.cli.load_woo_category_credentials",
             return_value=credentials,
         ) as loader, patch(
@@ -653,7 +667,13 @@ class WooCategoryDiscoveryTests(unittest.TestCase):
                 ["discover-woo-categories", "--base-url", "https://shop.example.com"]
             )
         self.assertEqual(status, 0)
-        loader.assert_called_once_with()
+        config_loader.assert_called_once_with()
+        loader.assert_called_once_with(
+            {
+                "WC_CONSUMER_KEY": "ck_test",
+                "WC_CONSUMER_SECRET": "cs_test",
+            }
+        )
         runner.assert_called_once()
 
 
