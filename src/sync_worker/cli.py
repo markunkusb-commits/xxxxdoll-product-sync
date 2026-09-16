@@ -131,6 +131,9 @@ from .sanitization import Redactor
 from .security import redactor_for_settings
 from .size_list_dry_run import run_size_list_dry_run
 from .sku_dry_run import run_sku_dry_run
+from .single_product_staging_package_dry_run import (
+    run_single_product_staging_package_dry_run,
+)
 from .sheet_layout import (
     SheetLayoutInspector,
     parse_a1_range,
@@ -1590,6 +1593,48 @@ def _run_build_woocommerce_payloads(
     return 0 if report.get("status") == "ok" else 1
 
 
+def _run_build_single_product_staging_package(
+    logger: logging.Logger,
+    payload_report_path: Path,
+    sku_report_path: Path,
+    selection_report_path: Path,
+    media_report_path: Path,
+    category_discovery_path: Path,
+    target_sku: str,
+) -> int:
+    try:
+        report, _ = run_single_product_staging_package_dry_run(
+            payload_report_path,
+            sku_report_path,
+            selection_report_path,
+            media_report_path,
+            category_discovery_path,
+            target_sku,
+            project_root=PROJECT_ROOT,
+        )
+    except Exception as error:
+        _log_failure(
+            logger, error, event="single_product_staging_package_aborted"
+        )
+        return 2
+
+    logger.info(
+        json.dumps(
+            {
+                "event": "single_product_staging_package_report_written",
+                "path": "reports/single-product-staging-package.json",
+                "status": report.get("status"),
+                "write_authorized": False,
+                "network_requests_performed": 0,
+                "external_write_requests_performed": 0,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+    )
+    return 0 if report.get("status") == "ok" else 1
+
+
 def _run_generate_sku_dry_run(
     logger: logging.Logger,
     product_input_path: Path,
@@ -2245,6 +2290,23 @@ def build_parser() -> argparse.ArgumentParser:
         dest="target_base_url",
         help="Explicit target WooCommerce base URL used for host validation",
     )
+    build_single_product_package = subcommands.add_parser(
+        "build-single-product-staging-package",
+        help="Exact-join five local reports into a write-disabled product package",
+    )
+    for flag, dest, help_text in (
+        ("--payload-report", "payload_report_path", "Local Woo payload dry-run report"),
+        ("--sku-report", "sku_report_path", "Local current SKU authority report"),
+        ("--selection-report", "selection_report_path", "Local Image Selection report"),
+        ("--media-report", "media_report_path", "Local WordPress Media Execution report"),
+        ("--woo-category-discovery", "category_discovery_path", "Local Woo Category Discovery report"),
+    ):
+        build_single_product_package.add_argument(
+            flag, required=True, type=Path, dest=dest, help=help_text
+        )
+    build_single_product_package.add_argument(
+        "--sku", required=True, dest="target_sku", help="Exact case-sensitive target SKU"
+    )
     generate_sku_dry_run = subcommands.add_parser(
         "generate-sku-dry-run",
         help="Generate stable SKU candidates from a local CLM parser report",
@@ -2465,6 +2527,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             arguments.category_binding_profile_version,
             arguments.woo_category_discovery_path,
             arguments.target_base_url,
+        )
+    if arguments.command == "build-single-product-staging-package":
+        return _run_build_single_product_staging_package(
+            logger,
+            arguments.payload_report_path,
+            arguments.sku_report_path,
+            arguments.selection_report_path,
+            arguments.media_report_path,
+            arguments.category_discovery_path,
+            arguments.target_sku,
         )
     if arguments.command == "generate-sku-dry-run":
         return _run_generate_sku_dry_run(

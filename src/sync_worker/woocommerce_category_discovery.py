@@ -20,7 +20,7 @@ from typing import Protocol
 from urllib.parse import urlencode, urlsplit
 
 from .report import SafeJsonReportWriter, sanitize_report_data
-from .sanitization import Redactor, sanitize_url
+from .sanitization import Redactor
 from .security import basic_auth_headers
 
 
@@ -532,10 +532,14 @@ class WooCategoryDiscovery:
         return _add_tree_metadata(normalized), pages_read
 
     def build_report(self) -> dict[str, object]:
+        normalized_base_url = normalize_woo_base_url(self._transport.base_url)
+        source_host = urlsplit(normalized_base_url).hostname
+        if source_host is None:  # pragma: no cover - guarded by normalization
+            raise WooCategoryConfigurationError("base_url hostname is required")
         records, pages_read = self.discover()
         report: dict[str, object] = {
             "status": "ok",
-            "base_url": sanitize_url(self._transport.base_url),
+            "source_host": source_host,
             "api": {
                 "version": API_VERSION,
                 "resource": API_RESOURCE,
