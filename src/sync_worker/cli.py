@@ -122,6 +122,10 @@ from .woocommerce_category_discovery import (
     redactor_for_woo_category_credentials,
     run_woo_category_discovery,
 )
+from .woocommerce_target_snapshot import (
+    run_woo_target_snapshot,
+    validate_staging_target_base_url,
+)
 from .report import (
     DoctorReportWriter,
     ReferenceProductReportWriter,
@@ -1741,6 +1745,56 @@ def _run_discover_woo_categories(
     return 0 if report.get("status") == "ok" else 1
 
 
+def _run_snapshot_woo_target(
+    logger: logging.Logger,
+    package_report_path: Path,
+    base_url: str,
+) -> int:
+    redactor = Redactor()
+    try:
+        validated_base_url = validate_staging_target_base_url(base_url)
+        credential_source = load_woo_category_credential_source()
+        credentials = load_woo_category_credentials(credential_source)
+        redactor = redactor_for_woo_category_credentials(credentials)
+        report, _ = run_woo_target_snapshot(
+            package_report_path,
+            validated_base_url,
+            credentials,
+            project_root=PROJECT_ROOT,
+            redactor=redactor,
+        )
+    except Exception as error:
+        logger.error(
+            json.dumps(
+                {
+                    "event": "woo_target_snapshot_aborted",
+                    "error": redactor.exception(error),
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        )
+        return 2
+
+    logger.info(
+        json.dumps(
+            {
+                "event": "woo_target_snapshot_report_written",
+                "path": "reports/woo-target-snapshot.json",
+                "status": report.get("status"),
+                "create_eligible": report.get("create_eligible"),
+                "network_requests_performed": report.get(
+                    "network_requests_performed", 0
+                ),
+                "write_requests_performed": 0,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+    )
+    return 0 if report.get("status") == "ok" else 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="python -m sync_worker")
     subcommands = parser.add_subparsers(dest="command", required=True)
@@ -2340,6 +2394,24 @@ def build_parser() -> argparse.ArgumentParser:
         dest="base_url",
         help="HTTPS WooCommerce site base URL",
     )
+    snapshot_woo_target = subcommands.add_parser(
+        "snapshot-woo-target",
+        help="Read one exact staging Woo SKU from a verified local Package",
+    )
+    snapshot_woo_target.add_argument(
+        "--package-report",
+        required=True,
+        type=Path,
+        dest="package_report_path",
+        help="Local single-product-staging-package.json authority",
+    )
+    snapshot_woo_target.add_argument(
+        "--base-url",
+        required=True,
+        type=_woo_base_url_argument,
+        dest="base_url",
+        help="Exact approved WooCommerce staging base URL",
+    )
     return parser
 
 
@@ -2550,4 +2622,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     if arguments.command == "discover-woo-categories":
         return _run_discover_woo_categories(logger, arguments.base_url)
+    if arguments.command == "snapshot-woo-target":
+        return _run_snapshot_woo_target(
+            logger,
+            arguments.package_report_path,
+            arguments.base_url,
+        )
     raise AssertionError("Unhandled command")
