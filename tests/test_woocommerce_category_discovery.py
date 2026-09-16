@@ -39,6 +39,7 @@ from sync_worker.woocommerce_category_discovery import (  # noqa: E402
     redactor_for_woo_category_credentials,
     run_woo_category_discovery,
 )
+from sync_worker.woo_category_binding import STAGING_EXPECTED_HOST  # noqa: E402
 
 
 def category(
@@ -221,6 +222,84 @@ class WooCategoryDiscoveryTests(unittest.TestCase):
     def test_08_base_url_rejects_query_credentials(self) -> None:
         with self.assertRaises(WooCategoryConfigurationError):
             normalize_woo_base_url("https://shop.example.com?consumer_key=secret")
+
+    def test_08a_report_contains_exact_source_host_for_valid_staging_url(self) -> None:
+        report = discovered(
+            FakeTransport(
+                {1: page([category(1431, "Realistic sex dolls")])},
+                base_url=f"https://{STAGING_EXPECTED_HOST}",
+            )
+        )
+
+        self.assertEqual(report["source_host"], STAGING_EXPECTED_HOST)
+
+    def test_08b_source_host_contains_hostname_only(self) -> None:
+        report = discovered(
+            FakeTransport(
+                {1: page([category(1431, "Realistic sex dolls")])},
+                base_url=f"https://{STAGING_EXPECTED_HOST}:443/shop/",
+            )
+        )
+
+        self.assertEqual(report["source_host"], STAGING_EXPECTED_HOST)
+        self.assertNotIn(":", str(report["source_host"]))
+        self.assertNotIn("/", str(report["source_host"]))
+
+    def test_08c_source_host_survives_report_sanitization(self) -> None:
+        report = discovered(
+            FakeTransport(
+                {1: page([category(1431, "Realistic sex dolls")])},
+                base_url=f"https://{STAGING_EXPECTED_HOST}",
+            )
+        )
+        serialized = json.dumps(report, sort_keys=True)
+
+        self.assertIn("source_host", report)
+        self.assertIn(STAGING_EXPECTED_HOST, serialized)
+
+    def test_08d_safe_report_does_not_contain_base_url_or_full_url(self) -> None:
+        report = discovered(
+            FakeTransport(
+                {1: page([category(1431, "Realistic sex dolls")])},
+                base_url=f"https://{STAGING_EXPECTED_HOST}:443/shop/",
+            )
+        )
+        serialized = json.dumps(report, sort_keys=True)
+
+        self.assertNotIn("base_url", report)
+        self.assertNotIn("https://", serialized)
+        self.assertNotIn(":443", serialized)
+        self.assertNotIn("/shop", serialized)
+
+    def test_08e_source_host_never_accepts_auth_or_query_data(self) -> None:
+        unsafe_urls = (
+            f"https://user:password@{STAGING_EXPECTED_HOST}",
+            f"https://{STAGING_EXPECTED_HOST}?consumer_key=secret",
+        )
+
+        for unsafe_url in unsafe_urls:
+            with self.subTest(unsafe_url=unsafe_url):
+                transport = FakeTransport(
+                    {1: page([category(1431, "Realistic sex dolls")])},
+                    base_url=unsafe_url,
+                )
+                with self.assertRaises(WooCategoryConfigurationError):
+                    discovered(transport)
+                self.assertEqual(transport.calls, [])
+                self.assertEqual(transport.network_requests_performed, 0)
+                self.assertEqual(transport.write_requests_performed, 0)
+
+    def test_08f_source_host_keeps_discovery_get_only_and_write_free(self) -> None:
+        transport = FakeTransport(
+            {1: page([category(1431, "Realistic sex dolls")])},
+            base_url=f"https://{STAGING_EXPECTED_HOST}",
+        )
+
+        report = discovered(transport)
+
+        self.assertEqual(transport.calls, [(1, DEFAULT_PER_PAGE)])
+        self.assertEqual(report["network_requests_performed"], 1)
+        self.assertEqual(report["write_requests_performed"], 0)
 
     def test_09_credentials_are_read_from_process_environment_mapping(self) -> None:
         credentials = load_woo_category_credentials(
