@@ -126,6 +126,7 @@ from .woocommerce_target_snapshot import (
     run_woo_target_snapshot,
     validate_staging_target_base_url,
 )
+from .woocommerce_apply_plan import run_woo_apply_plan
 from .report import (
     DoctorReportWriter,
     ReferenceProductReportWriter,
@@ -1795,6 +1796,39 @@ def _run_snapshot_woo_target(
     return 0 if report.get("status") == "ok" else 1
 
 
+def _run_freeze_woo_apply_plan(
+    logger: logging.Logger,
+    package_report_path: Path,
+    target_snapshot_path: Path,
+) -> int:
+    try:
+        report, _ = run_woo_apply_plan(
+            package_report_path,
+            target_snapshot_path,
+            project_root=PROJECT_ROOT,
+        )
+    except Exception as error:
+        _log_failure(logger, error, event="woo_apply_plan_freeze_aborted")
+        return 2
+
+    logger.info(
+        json.dumps(
+            {
+                "event": "woo_apply_plan_frozen",
+                "path": "reports/woo-apply-plan.json",
+                "status": report.get("status"),
+                "plan_hash": report.get("plan_hash"),
+                "write_authorized": False,
+                "network_requests_performed": 0,
+                "write_requests_performed": 0,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+    )
+    return 0 if report.get("status") == "ok" else 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="python -m sync_worker")
     subcommands = parser.add_subparsers(dest="command", required=True)
@@ -2412,6 +2446,24 @@ def build_parser() -> argparse.ArgumentParser:
         dest="base_url",
         help="Exact approved WooCommerce staging base URL",
     )
+    freeze_woo_apply_plan = subcommands.add_parser(
+        "freeze-woo-apply-plan",
+        help="Freeze local Package and target Snapshot into a non-authorizing plan",
+    )
+    freeze_woo_apply_plan.add_argument(
+        "--package-report",
+        required=True,
+        type=Path,
+        dest="package_report_path",
+        help="Local single-product-staging-package.json authority",
+    )
+    freeze_woo_apply_plan.add_argument(
+        "--target-snapshot",
+        required=True,
+        type=Path,
+        dest="target_snapshot_path",
+        help="Local woo-target-snapshot.json authority",
+    )
     return parser
 
 
@@ -2627,5 +2679,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             logger,
             arguments.package_report_path,
             arguments.base_url,
+        )
+    if arguments.command == "freeze-woo-apply-plan":
+        return _run_freeze_woo_apply_plan(
+            logger,
+            arguments.package_report_path,
+            arguments.target_snapshot_path,
         )
     raise AssertionError("Unhandled command")
