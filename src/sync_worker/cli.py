@@ -127,6 +127,7 @@ from .woocommerce_target_snapshot import (
     validate_staging_target_base_url,
 )
 from .woocommerce_apply_plan import run_woo_apply_plan
+from .woocommerce_apply_idempotency import run_woo_apply_receipt_verification
 from .woocommerce_product_apply import run_woo_product_apply
 from .report import (
     DoctorReportWriter,
@@ -1868,6 +1869,46 @@ def _run_apply_woo_plan(
     return exit_code if type(exit_code) is int and 0 <= exit_code <= 3 else 2
 
 
+def _run_verify_woo_apply_receipt(
+    logger: logging.Logger,
+    plan_report_path: Path,
+    receipt_report_path: Path,
+    confirmed_plan_hash: str,
+    base_url: str,
+) -> int:
+    try:
+        result = run_woo_apply_receipt_verification(
+            plan_report_path,
+            receipt_report_path,
+            confirmed_plan_hash,
+            base_url,
+            project_root=PROJECT_ROOT,
+        )
+    except Exception as error:
+        _log_failure(logger, error, event="woo_apply_receipt_verification_error")
+        return 2
+
+    logger.info(
+        json.dumps(
+            {
+                "event": "woo_apply_receipt_verification_finished",
+                "status": result.get("status"),
+                "result_code": result.get("result_code"),
+                "network_requests_performed": result.get(
+                    "network_requests_performed", 0
+                ),
+                "woocommerce_write_requests_performed": result.get(
+                    "woocommerce_write_requests_performed", 0
+                ),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+    )
+    exit_code = result.get("exit_code")
+    return exit_code if type(exit_code) is int and 0 <= exit_code <= 3 else 2
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="python -m sync_worker")
     subcommands = parser.add_subparsers(dest="command", required=True)
@@ -2526,6 +2567,36 @@ def build_parser() -> argparse.ArgumentParser:
         dest="base_url",
         help="Exact approved staging root URL",
     )
+    verify_woo_apply_receipt = subcommands.add_parser(
+        "verify-woo-apply-receipt",
+        help="Verify one applied receipt using an exact staging Woo GET",
+    )
+    verify_woo_apply_receipt.add_argument(
+        "--plan-report",
+        required=True,
+        type=Path,
+        dest="plan_report_path",
+        help="Local woo-apply-plan.json authority",
+    )
+    verify_woo_apply_receipt.add_argument(
+        "--receipt-report",
+        required=True,
+        type=Path,
+        dest="receipt_report_path",
+        help="Local woo-apply-receipt.json authority",
+    )
+    verify_woo_apply_receipt.add_argument(
+        "--confirm-plan-hash",
+        required=True,
+        dest="confirmed_plan_hash",
+        help="Manually copied exact PLAN_HASH",
+    )
+    verify_woo_apply_receipt.add_argument(
+        "--base-url",
+        required=True,
+        dest="base_url",
+        help="Exact approved staging root URL",
+    )
     return parser
 
 
@@ -2752,6 +2823,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_apply_woo_plan(
             logger,
             arguments.plan_report_path,
+            arguments.confirmed_plan_hash,
+            arguments.base_url,
+        )
+    if arguments.command == "verify-woo-apply-receipt":
+        return _run_verify_woo_apply_receipt(
+            logger,
+            arguments.plan_report_path,
+            arguments.receipt_report_path,
             arguments.confirmed_plan_hash,
             arguments.base_url,
         )
