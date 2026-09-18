@@ -129,6 +129,7 @@ from .woocommerce_target_snapshot import (
 from .woocommerce_apply_plan import run_woo_apply_plan
 from .woocommerce_apply_idempotency import run_woo_apply_receipt_verification
 from .woocommerce_product_apply import run_woo_product_apply
+from .woocommerce_pending_recovery import inspect_woo_apply_pending
 from .report import (
     DoctorReportWriter,
     ReferenceProductReportWriter,
@@ -1909,6 +1910,45 @@ def _run_verify_woo_apply_receipt(
     return exit_code if type(exit_code) is int and 0 <= exit_code <= 3 else 2
 
 
+def _run_inspect_woo_apply_pending(
+    logger: logging.Logger,
+    plan_report_path: Path,
+    confirmed_plan_hash: str,
+    base_url: str,
+) -> int:
+    try:
+        result = inspect_woo_apply_pending(
+            plan_report_path,
+            confirmed_plan_hash,
+            base_url,
+            project_root=PROJECT_ROOT,
+        )
+    except Exception as error:
+        _log_failure(logger, error, event="woo_apply_pending_inspection_error")
+        return 2
+
+    logger.info(
+        json.dumps(
+            {
+                "event": "woo_apply_pending_inspection_finished",
+                "status": result.get("status"),
+                "decision": result.get("decision"),
+                "result_code": result.get("result_code"),
+                "network_requests_performed": result.get(
+                    "network_requests_performed", 0
+                ),
+                "woocommerce_write_requests_performed": result.get(
+                    "woocommerce_write_requests_performed", 0
+                ),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+    )
+    exit_code = result.get("exit_code")
+    return exit_code if type(exit_code) is int and 0 <= exit_code <= 3 else 2
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="python -m sync_worker")
     subcommands = parser.add_subparsers(dest="command", required=True)
@@ -2597,6 +2637,29 @@ def build_parser() -> argparse.ArgumentParser:
         dest="base_url",
         help="Exact approved staging root URL",
     )
+    inspect_woo_apply_pending = subcommands.add_parser(
+        "inspect-woo-apply-pending",
+        help="Observe remote state for the canonical uncertain Woo Pending",
+    )
+    inspect_woo_apply_pending.add_argument(
+        "--plan-report",
+        required=True,
+        type=Path,
+        dest="plan_report_path",
+        help="Local woo-apply-plan.json authority",
+    )
+    inspect_woo_apply_pending.add_argument(
+        "--confirm-plan-hash",
+        required=True,
+        dest="confirmed_plan_hash",
+        help="Manually copied exact PLAN_HASH",
+    )
+    inspect_woo_apply_pending.add_argument(
+        "--base-url",
+        required=True,
+        dest="base_url",
+        help="Exact approved staging root URL",
+    )
     return parser
 
 
@@ -2831,6 +2894,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             logger,
             arguments.plan_report_path,
             arguments.receipt_report_path,
+            arguments.confirmed_plan_hash,
+            arguments.base_url,
+        )
+    if arguments.command == "inspect-woo-apply-pending":
+        return _run_inspect_woo_apply_pending(
+            logger,
+            arguments.plan_report_path,
             arguments.confirmed_plan_hash,
             arguments.base_url,
         )
