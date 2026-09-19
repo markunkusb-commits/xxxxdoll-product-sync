@@ -10,6 +10,11 @@ from pathlib import Path
 from . import single_product_staging_package_dry_run as package_io
 from . import woocommerce_product_apply as apply_core
 from . import woocommerce_target_snapshot as target_snapshot
+from .woocommerce_pending_reconciliation import (
+    RECOVERY_RECEIPT_POLICY_VERSION,
+    WooPendingReconciliationError,
+    validate_recovery_receipt,
+)
 from .sanitization import Redactor
 from .woocommerce_category_discovery import WooCategoryCredentials
 
@@ -251,14 +256,27 @@ def run_woo_apply_receipt_verification(
         )
 
     try:
-        receipt_product_id = _validate_receipt(
-            receipt,
-            plan_source=plan_source,
-            plan_hash=plan_hash,
-            sku=sku,
-            payload=payload,
-        )
-    except WooApplyIdempotencyError:
+        if receipt.get("policy_version") == apply_core.RECEIPT_POLICY_VERSION:
+            receipt_product_id = _validate_receipt(
+                receipt,
+                plan_source=plan_source,
+                plan_hash=plan_hash,
+                sku=sku,
+                payload=payload,
+            )
+        elif receipt.get("policy_version") == RECOVERY_RECEIPT_POLICY_VERSION:
+            receipt_product_id = validate_recovery_receipt(
+                receipt,
+                plan_source=plan_source,
+                plan_hash=plan_hash,
+                sku=sku,
+                payload=payload,
+            )
+        else:
+            raise WooApplyIdempotencyError(
+                "woo_apply_receipt_policy_invalid"
+            )
+    except (WooApplyIdempotencyError, WooPendingReconciliationError):
         return _result(
             "pre_write_error",
             EXIT_PRE_WRITE_ERROR,
