@@ -6,9 +6,10 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import shutil
 import tempfile
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -23,10 +24,17 @@ REPORTS_DIRECTORY = "reports"
 PLAN_FILENAME = "woo-apply-plan.json"
 TEMP_PREFIX = ".woo-batch-build-"
 PUBLISH_RESERVATION_PREFIX = ".woo-batch-publish-"
+PUBLISH_RESERVATION_POLICY_VERSION = (
+    "xxxxdoll-woo-batch-publish-reservation-v1"
+)
 MAX_BATCH_REPORT_BYTES = 16 * 1024 * 1024
+MAX_RESERVATION_BYTES = 4096
 
 _HASH_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+_OWNER_TOKEN_PATTERN = re.compile(r"^[0-9a-f]{32}$")
 _SCHEME_PATTERN = re.compile(r"^[a-z][a-z0-9+.-]+:", re.IGNORECASE)
+
+
 class WooBatchWorkspaceError(ValueError):
     """Fixed-code local batch workspace failure."""
 
@@ -47,6 +55,9 @@ class BatchWorkspaceResult:
     path: Path
     reused: bool
     persisted_report: dict[str, object]
+
+
+ProcessLivenessChecker = Callable[[int], bool | None]
 
 
 def item_directory_name(sequence: int) -> str:
@@ -106,6 +117,122 @@ def _write_exclusive_bytes(path: Path, data: bytes) -> None:
     finally:
         if descriptor is not None:
             os.close(descriptor)
+
+
+def _reservation_value(batch_hash: str) -> dict[str, object]:
+    return {
+        "policy_version": PUBLISH_RESERVATION_POLICY_VERSION,
+        "batch_hash": batch_hash,
+        "owner_pid": os.getpid(),
+        "owner_token": secrets.token_hex(16),
+    }
+
+
+def _reservation_bytes(value: Mapping[str, object]) -> bytes:
+    try:
+        return (
+            json.dumps(
+                value,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n"
+        ).encode("utf-8")
+    except (TypeError, ValueError, RecursionError):
+        raise WooBatchWorkspaceError(
+            "woo_batch_publish_reservation_invalid"
+        ) from None
+
+
+def _read_reservation(
+    path: Path,
+    batch_hash: str,
+) -> tuple[dict[str, object], bytes]:
+    try:
+        if not _regular_unlinked_file(path):
+            raise WooBatchWorkspaceError(
+                "woo_batch_publish_reservation_invalid"
+            )
+        size = path.stat().st_size
+        if size <= 0 or size > MAX_RESERVATION_BYTES:
+            raise WooBatchWorkspaceError(
+                "woo_batch_publish_reservation_invalid"
+            )
+        raw = path.read_bytes()
+        value = json.loads(
+            raw.decode("utf-8"),
+            object_pairs_hook=target_snapshot._json_object_no_duplicates,
+        )
+    except WooBatchWorkspaceError:
+        raise
+    except (
+        OSError,
+        UnicodeError,
+        json.JSONDecodeError,
+        RecursionError,
+        target_snapshot.WooTargetSnapshotInputError,
+    ):
+        raise WooBatchWorkspaceError(
+            "woo_batch_publish_reservation_invalid"
+        ) from None
+    if (
+        not isinstance(value, dict)
+        or set(value)
+        != {"policy_version", "batch_hash", "owner_pid", "owner_token"}
+        or value.get("policy_version") != PUBLISH_RESERVATION_POLICY_VERSION
+        or value.get("batch_hash") != batch_hash
+        or type(value.get("owner_pid")) is not int
+        or value["owner_pid"] <= 0
+        or type(value.get("owner_token")) is not str
+        or _OWNER_TOKEN_PATTERN.fullmatch(value["owner_token"]) is None
+    ):
+        raise WooBatchWorkspaceError(
+            "woo_batch_publish_reservation_invalid"
+        )
+    return value, raw
+
+
+def _process_liveness(owner_pid: int) -> bool | None:
+    if owner_pid == os.getpid():
+        return True
+    try:
+        os.kill(owner_pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return None
+    return True
+
+
+def _remove_unchanged_reservation(path: Path, expected_raw: bytes) -> bool:
+    try:
+        if path.read_bytes() != expected_raw:
+            return False
+        path.unlink()
+        return not path.exists()
+    except OSError:
+        return False
+
+
+def _release_owned_reservation(path: Path, expected_raw: bytes) -> bool:
+    return _remove_unchanged_reservation(path, expected_raw)
+
+
+def _reservation_owner_liveness(
+    reservation: Mapping[str, object],
+    checker: ProcessLivenessChecker,
+) -> bool | None:
+    owner_pid = reservation.get("owner_pid")
+    if type(owner_pid) is not int:
+        return None
+    try:
+        result = checker(owner_pid)
+    except Exception:
+        return None
+    return result if type(result) is bool else None
 
 
 def _report_bytes(report: Mapping[str, object]) -> bytes:
@@ -293,6 +420,8 @@ def publish_batch_workspace(
     batch_hash: str,
     report: Mapping[str, object],
     copies: Sequence[BatchPlanCopy],
+    *,
+    process_liveness_checker: ProcessLivenessChecker = _process_liveness,
 ) -> BatchWorkspaceResult:
     """Publish one exact batch workspace without overwriting an existing one."""
 
@@ -306,20 +435,61 @@ def publish_batch_workspace(
     publish_reservation = root / (
         f"{PUBLISH_RESERVATION_PREFIX}{batch_hash}.reservation"
     )
+    owned_reservation_raw = _reservation_bytes(_reservation_value(batch_hash))
     reservation_owned = False
+    reservation_released = True
+    result: BatchWorkspaceResult | None = None
     try:
         _build_temporary_workspace(temporary, report, copies_tuple)
         _validate_existing_workspace(temporary, report, copies_tuple)
-        try:
-            _write_exclusive_bytes(
+
+        while not reservation_owned:
+            try:
+                _write_exclusive_bytes(
+                    publish_reservation,
+                    owned_reservation_raw,
+                )
+                reservation_owned = True
+                reservation_released = False
+                break
+            except WooBatchWorkspaceError as error:
+                if str(error) != "woo_batch_workspace_file_exists":
+                    raise
+
+            existing_reservation, existing_raw = _read_reservation(
                 publish_reservation,
-                batch_hash.encode("ascii"),
+                batch_hash,
             )
-            reservation_owned = True
-        except WooBatchWorkspaceError as error:
-            if str(error) == "woo_batch_workspace_file_exists":
-                raise WooBatchWorkspaceError("woo_batch_publish_in_progress") from None
-            raise
+            owner_liveness = _reservation_owner_liveness(
+                existing_reservation,
+                process_liveness_checker,
+            )
+
+            if final_path.exists():
+                persisted = _validate_existing_workspace(
+                    final_path,
+                    report,
+                    copies_tuple,
+                )
+                if owner_liveness is False:
+                    _remove_unchanged_reservation(
+                        publish_reservation,
+                        existing_raw,
+                    )
+                return BatchWorkspaceResult(final_path, True, persisted)
+
+            if owner_liveness is not False:
+                raise WooBatchWorkspaceError(
+                    "woo_batch_publish_in_progress"
+                ) from None
+            if not _remove_unchanged_reservation(
+                publish_reservation,
+                existing_raw,
+            ):
+                if publish_reservation.exists():
+                    raise WooBatchWorkspaceError(
+                        "woo_batch_publish_reservation_changed"
+                    ) from None
 
         if final_path.exists():
             persisted = _validate_existing_workspace(
@@ -327,25 +497,38 @@ def publish_batch_workspace(
                 report,
                 copies_tuple,
             )
-            return BatchWorkspaceResult(final_path, True, persisted)
-        try:
-            os.rename(temporary, final_path)
-        except OSError:
-            if final_path.exists():
-                persisted = _validate_existing_workspace(
-                    final_path,
-                    report,
-                    copies_tuple,
-                )
-                return BatchWorkspaceResult(final_path, True, persisted)
-            raise WooBatchWorkspaceError("woo_batch_publish_failed") from None
-        temporary = Path()
-        return BatchWorkspaceResult(final_path, False, dict(report))
+            result = BatchWorkspaceResult(final_path, True, persisted)
+        else:
+            try:
+                os.rename(temporary, final_path)
+            except OSError:
+                if final_path.exists():
+                    persisted = _validate_existing_workspace(
+                        final_path,
+                        report,
+                        copies_tuple,
+                    )
+                    result = BatchWorkspaceResult(final_path, True, persisted)
+                else:
+                    raise WooBatchWorkspaceError(
+                        "woo_batch_publish_failed"
+                    ) from None
+            else:
+                temporary = Path()
+                result = BatchWorkspaceResult(final_path, False, dict(report))
     finally:
         if reservation_owned:
-            try:
-                publish_reservation.unlink()
-            except OSError:
-                pass
+            reservation_released = _release_owned_reservation(
+                publish_reservation,
+                owned_reservation_raw,
+            )
         if temporary != Path() and temporary.exists():
             _cleanup_temporary(temporary, root)
+
+    if not reservation_released:
+        raise WooBatchWorkspaceError(
+            "woo_batch_publish_reservation_cleanup_failed"
+        )
+    if result is None:
+        raise WooBatchWorkspaceError("woo_batch_publish_failed")
+    return result

@@ -71,6 +71,30 @@ def copied_plan_path(root: Path) -> Path:
     )
 
 
+def publish_reservation_path(output_root: Path) -> Path:
+    return output_root / (
+        f"{workspace.PUBLISH_RESERVATION_PREFIX}{BATCH_HASH}.reservation"
+    )
+
+
+def seed_publish_reservation(
+    output_root: Path,
+    *,
+    owner_pid: int = 424_242,
+) -> tuple[Path, bytes]:
+    output_root.mkdir(parents=True, exist_ok=True)
+    value = {
+        "policy_version": workspace.PUBLISH_RESERVATION_POLICY_VERSION,
+        "batch_hash": BATCH_HASH,
+        "owner_pid": owner_pid,
+        "owner_token": "d" * 32,
+    }
+    raw = workspace._reservation_bytes(value)
+    path = publish_reservation_path(output_root)
+    workspace._write_exclusive_bytes(path, raw)
+    return path, raw
+
+
 def test_workspace_uses_full_hash_and_sequence_not_sku(tmp_path):
     result = workspace.publish_batch_workspace(
         tmp_path / "batches",
@@ -267,3 +291,108 @@ def test_no_temporary_or_publish_reservation_artifacts_remain_after_success(tmp_
         copies(),
     )
     assert {entry.name for entry in output.iterdir()} == {BATCH_HASH}
+
+
+def test_crash_left_reservation_has_valid_recoverable_provenance(tmp_path):
+    output = tmp_path / "batches"
+    reservation, raw = seed_publish_reservation(output)
+    value, persisted_raw = workspace._read_reservation(
+        reservation,
+        BATCH_HASH,
+    )
+    assert reservation.exists()
+    assert persisted_raw == raw
+    assert value == {
+        "policy_version": workspace.PUBLISH_RESERVATION_POLICY_VERSION,
+        "batch_hash": BATCH_HASH,
+        "owner_pid": 424_242,
+        "owner_token": "d" * 32,
+    }
+
+
+def test_next_freeze_recovers_incomplete_stale_reservation(tmp_path):
+    output = tmp_path / "batches"
+    reservation, _ = seed_publish_reservation(output)
+    result = workspace.publish_batch_workspace(
+        output,
+        BATCH_HASH,
+        report(),
+        copies(),
+        process_liveness_checker=lambda owner_pid: False,
+    )
+    assert result.reused is False
+    assert result.path == output / BATCH_HASH
+    assert not reservation.exists()
+
+
+def test_valid_existing_workspace_reuses_and_cleans_stale_reservation(tmp_path):
+    output = tmp_path / "batches"
+    first = workspace.publish_batch_workspace(
+        output,
+        BATCH_HASH,
+        report(),
+        copies(),
+    )
+    reservation, _ = seed_publish_reservation(output)
+    second = workspace.publish_batch_workspace(
+        output,
+        BATCH_HASH,
+        report(),
+        copies(),
+        process_liveness_checker=lambda owner_pid: False,
+    )
+    assert second.reused is True
+    assert second.path == first.path
+    assert not reservation.exists()
+
+
+def test_active_publish_reservation_blocks_without_removal(tmp_path):
+    output = tmp_path / "batches"
+    reservation, original = seed_publish_reservation(output)
+    with pytest.raises(workspace.WooBatchWorkspaceError) as raised:
+        workspace.publish_batch_workspace(
+            output,
+            BATCH_HASH,
+            report(),
+            copies(),
+            process_liveness_checker=lambda owner_pid: True,
+        )
+    assert str(raised.value) == "woo_batch_publish_in_progress"
+    assert reservation.read_bytes() == original
+    assert not (output / BATCH_HASH).exists()
+
+
+@pytest.mark.parametrize(
+    "tampered",
+    [
+        b"not-json\n",
+        b'{"batch_hash":"' + (b"e" * 64) + b'"}\n',
+        workspace._reservation_bytes(
+            {
+                "policy_version": workspace.PUBLISH_RESERVATION_POLICY_VERSION,
+                "batch_hash": BATCH_HASH,
+                "owner_pid": 424_242,
+                "owner_token": "not-a-valid-owner-token",
+            }
+        ),
+    ],
+)
+def test_tampered_publish_reservation_fails_closed_without_removal(
+    tmp_path,
+    tampered,
+):
+    output = tmp_path / "batches"
+    output.mkdir()
+    reservation = publish_reservation_path(output)
+    workspace._write_exclusive_bytes(reservation, tampered)
+    with pytest.raises(workspace.WooBatchWorkspaceError) as raised:
+        workspace.publish_batch_workspace(
+            output,
+            BATCH_HASH,
+            report(),
+            copies(),
+            process_liveness_checker=lambda owner_pid: False,
+        )
+    assert str(raised.value) == "woo_batch_publish_reservation_invalid"
+    assert reservation.read_bytes() == tampered
+    assert not (output / BATCH_HASH).exists()
