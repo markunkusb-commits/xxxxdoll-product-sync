@@ -127,6 +127,7 @@ from .woocommerce_target_snapshot import (
     validate_staging_target_base_url,
 )
 from .woocommerce_apply_plan import run_woo_apply_plan
+from .woocommerce_batch_plan import freeze_woo_batch_plan
 from .woocommerce_apply_idempotency import run_woo_apply_receipt_verification
 from .woocommerce_product_apply import run_woo_product_apply
 from .woocommerce_pending_recovery import inspect_woo_apply_pending
@@ -1833,6 +1834,43 @@ def _run_freeze_woo_apply_plan(
     return 0 if report.get("status") == "ok" else 1
 
 
+def _run_freeze_woo_batch_plan(
+    logger: logging.Logger,
+    manifest_path: Path,
+    output_root: Path | None,
+) -> int:
+    try:
+        report, _, reused = freeze_woo_batch_plan(
+            manifest_path,
+            output_root=(
+                output_root
+                if output_root is not None
+                else PROJECT_ROOT / "reports" / "woo-batches"
+            ),
+        )
+    except Exception as error:
+        _log_failure(logger, error, event="woo_batch_plan_freeze_aborted")
+        return 2
+
+    logger.info(
+        json.dumps(
+            {
+                "event": "woo_batch_plan_frozen",
+                "status": report.get("status"),
+                "batch_hash": report.get("batch_hash"),
+                "item_count": len(report.get("items", [])),
+                "workspace_reused": reused,
+                "write_authorized": False,
+                "network_requests_performed": 0,
+                "write_requests_performed": 0,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+    )
+    return 0 if report.get("status") == "ok" else 1
+
+
 def _run_apply_woo_plan(
     logger: logging.Logger,
     plan_report_path: Path,
@@ -2625,6 +2663,23 @@ def build_parser() -> argparse.ArgumentParser:
         dest="target_snapshot_path",
         help="Local woo-target-snapshot.json authority",
     )
+    freeze_woo_batch_plan = subcommands.add_parser(
+        "freeze-woo-batch-plan",
+        help="Freeze local Single Product Plans into an isolated batch workspace",
+    )
+    freeze_woo_batch_plan.add_argument(
+        "--manifest",
+        required=True,
+        type=Path,
+        dest="manifest_path",
+        help="Local Batch Plan Input V1 manifest",
+    )
+    freeze_woo_batch_plan.add_argument(
+        "--output-root",
+        type=Path,
+        dest="output_root",
+        help="Optional safe local woo-batches directory",
+    )
     apply_woo_plan = subcommands.add_parser(
         "apply-woo-plan",
         help="Apply one manually confirmed frozen CREATE plan to exact staging",
@@ -2951,6 +3006,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             logger,
             arguments.package_report_path,
             arguments.target_snapshot_path,
+        )
+    if arguments.command == "freeze-woo-batch-plan":
+        return _run_freeze_woo_batch_plan(
+            logger,
+            arguments.manifest_path,
+            arguments.output_root,
         )
     if arguments.command == "apply-woo-plan":
         return _run_apply_woo_plan(
