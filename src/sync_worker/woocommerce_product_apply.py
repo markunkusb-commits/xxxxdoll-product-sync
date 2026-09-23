@@ -262,11 +262,10 @@ def _read_plan(
     )
 
 
-def validate_frozen_plan(
+def validate_frozen_plan_integrity(
     value: Mapping[str, object],
-    confirmed_plan_hash: str,
 ) -> tuple[str, dict[str, object], str]:
-    """Recompute the semantic hash and validate manual authorization exactly."""
+    """Validate one frozen Plan without granting manual authorization."""
 
     stored_hash = value.get("plan_hash")
     if (
@@ -324,6 +323,16 @@ def validate_frozen_plan(
         raise WooProductApplyPreWriteError("woo_apply_plan_hash_invalid") from None
     if stored_hash != recomputed:
         raise WooProductApplyPreWriteError("woo_apply_plan_hash_invalid")
+    return sku, frozen_payload, stored_hash
+
+
+def validate_frozen_plan(
+    value: Mapping[str, object],
+    confirmed_plan_hash: str,
+) -> tuple[str, dict[str, object], str]:
+    """Validate Plan integrity and manual authorization exactly."""
+
+    sku, frozen_payload, stored_hash = validate_frozen_plan_integrity(value)
     if confirmed_plan_hash != stored_hash:
         raise WooProductApplyPreWriteError("woo_apply_manual_confirmation_mismatch")
     return sku, frozen_payload, stored_hash
