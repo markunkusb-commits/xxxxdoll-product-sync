@@ -270,6 +270,134 @@ def test_valid_plan_and_exact_manual_hash_pass_local_validation():
     assert digest == source["plan_hash"]
 
 
+def test_frozen_plan_integrity_returns_same_result_without_confirmation():
+    source = valid_plan()
+    integrity_result = apply.validate_frozen_plan_integrity(source)
+    confirmed_result = apply.validate_frozen_plan(source, source["plan_hash"])
+    assert integrity_result == confirmed_result
+    assert integrity_result == (SKU, frozen_payload(), source["plan_hash"])
+
+
+def test_frozen_plan_integrity_has_no_confirmation_parameter():
+    signature = inspect.signature(apply.validate_frozen_plan_integrity)
+    assert tuple(signature.parameters) == ("value",)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected_code"),
+    [
+        (
+            lambda value: value.update(plan_hash="f" * 64),
+            "woo_apply_plan_hash_invalid",
+        ),
+        (
+            lambda value: value["operation"]["payload"].update(
+                name="Tampered but structurally valid"
+            ),
+            "woo_apply_plan_hash_invalid",
+        ),
+        (
+            lambda value: value["operation"]["payload"].update(
+                regular_price="invalid"
+            ),
+            "woo_apply_plan_payload_invalid",
+        ),
+        (
+            lambda value: value["target"].update(source_host="example.test"),
+            "woo_apply_plan_target_invalid",
+        ),
+        (
+            lambda value: value.update(
+                preconditions={"match_count": 1, "create_eligible": False}
+            ),
+            "woo_apply_plan_preconditions_invalid",
+        ),
+        (
+            lambda value: value.update(
+                source_package={"basename": "package.json", "sha256": "bad"}
+            ),
+            "woo_apply_plan_sources_invalid",
+        ),
+        (
+            lambda value: value.update(
+                source_target_snapshot={
+                    "basename": "snapshot.json",
+                    "sha256": "bad",
+                }
+            ),
+            "woo_apply_plan_sources_invalid",
+        ),
+        (
+            lambda value: value.update(network_requests_performed=1),
+            "woo_apply_plan_contract_invalid",
+        ),
+        (
+            lambda value: value.update(network_requests_performed=False),
+            "woo_apply_plan_contract_invalid",
+        ),
+        (
+            lambda value: value.update(
+                status="blocked",
+                blocking_issues=["blocked"],
+                plan_hash=None,
+            ),
+            "woo_apply_plan_contract_invalid",
+        ),
+        (
+            lambda value: value.update(write_authorized=True),
+            "woo_apply_plan_contract_invalid",
+        ),
+    ],
+    ids=(
+        "stored-hash",
+        "semantic-body",
+        "payload",
+        "target",
+        "preconditions",
+        "source-package",
+        "source-target-snapshot",
+        "counter-nonzero",
+        "counter-bool",
+        "blocked-plan",
+        "write-authorized",
+    ),
+)
+def test_frozen_plan_integrity_rejects_invalid_contract(
+    mutation,
+    expected_code,
+):
+    source = valid_plan()
+    mutation(source)
+    with pytest.raises(apply.WooProductApplyPreWriteError) as raised:
+        apply.validate_frozen_plan_integrity(source)
+    assert str(raised.value) == expected_code
+
+
+def test_original_validator_preserves_manual_confirmation_semantics():
+    source = valid_plan()
+    with pytest.raises(apply.WooProductApplyPreWriteError) as raised:
+        apply.validate_frozen_plan(source, "e" * 64)
+    assert str(raised.value) == "woo_apply_manual_confirmation_mismatch"
+    assert apply.validate_frozen_plan(source, source["plan_hash"]) == (
+        SKU,
+        frozen_payload(),
+        source["plan_hash"],
+    )
+
+
+def test_frozen_plan_integrity_helper_is_pure_local_validation():
+    source = inspect.getsource(apply.validate_frozen_plan_integrity)
+    for forbidden in (
+        "credential_loader",
+        "StdlibWooProductTargetTransport",
+        "StdlibWooProductCreateTransport",
+        "http.client",
+        "SafeJsonReportWriter",
+        "SafeWriteAuditJsonReportWriter",
+    ):
+        assert forbidden not in source
+
+
 @pytest.mark.parametrize(
     ("mutation", "confirmation"),
     [
