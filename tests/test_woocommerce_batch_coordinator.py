@@ -531,6 +531,173 @@ def test_post_dispatch_loader_failure_is_recovery_not_success(harness):
     assert harness.dispatch.call_count == 1
 
 
+@pytest.mark.parametrize("initial_state", ["NOT_STARTED", "ALREADY_APPLIED_OBSERVED"])
+@pytest.mark.parametrize("regressed_state", ["NOT_STARTED", "RECOVERY_REQUIRED", "BLOCKED"])
+@pytest.mark.parametrize("refresh,dispatched", [(4, 1), (5, 2), (7, 3)])
+def test_processed_item_regression_stops_before_dispatch_or_completion(
+    harness, initial_state, regressed_state, refresh, dispatched,
+):
+    harness.state(1, initial_state)
+    regressed_runtime = []
+
+    def regress(count):
+        if count == refresh:
+            harness.state(1, regressed_state)
+            regressed_runtime.append(harness.current)
+
+    harness.on_load = regress
+    result = harness.run()
+    assert result.exit_code == 3
+    assert result.status == "recovery_required"
+    assert result.result_code == "woo_batch_processed_item_regressed"
+    # Identify the regressed item, not the next otherwise-healthy item.
+    assert result.stopped_sequence == 1
+    assert result.dispatched_items == dispatched
+    assert result.successful_items == dispatched - 1
+    prior = result.items[0]
+    assert prior.status == "RECOVERY_REQUIRED"
+    assert prior.observed_state == regressed_state
+    assert prior.result_code == result.result_code
+    assert prior.execution_result.exit_code == 0
+    assert prior.execution_result.state_after == (
+        "APPLIED" if initial_state == "NOT_STARTED" else "ALREADY_APPLIED"
+    )
+    for row in result.items[1:dispatched]:
+        assert row.status == "APPLIED"
+        assert row.execution_result.exit_code == 0
+    for row in result.items[dispatched:]:
+        assert row.status == "NOT_DISPATCHED"
+        assert not row.dispatched
+        assert row.operation is None
+        assert row.execution_result is None
+    verified = int(initial_state == "ALREADY_APPLIED_OBSERVED")
+    network, writes = dispatched * 3 - verified * 2, dispatched - verified
+    assert result.counters == adapter.ItemCounters(network, network, writes, 0, writes, writes)
+    assert result.counters_complete
+    assert harness.provider.call_count == harness.dispatch.call_count == dispatched
+    assert harness.load_count == refresh  # no retry, re-verification or recovery
+    assert harness.current is regressed_runtime[0]  # no cleanup or repair
+
+
+def test_processed_item_regression_checks_all_prior_items_not_only_previous(harness):
+    def regress(count):
+        if count == 6:  # before item 3: item 2 remains healthy, item 1 loses its Receipt
+            harness.state(1, "NOT_STARTED")
+
+    harness.on_load = regress
+    result = harness.run()
+    assert result.exit_code == 3
+    assert result.stopped_sequence == 1
+    assert [row.status for row in result.items] == ["RECOVERY_REQUIRED", "APPLIED", "NOT_DISPATCHED"]
+    assert result.dispatched_items == 2
+    assert result.successful_items == 1
+    assert harness.provider.call_count == harness.dispatch.call_count == 2
+
+
+def test_multiple_processed_item_regressions_remove_all_stale_success_counts(harness):
+    def regress(count):
+        if count == 7:  # final post-dispatch refresh must not report completed
+            harness.state(1, "NOT_STARTED")
+            harness.state(2, "RECOVERY_REQUIRED")
+
+    harness.on_load = regress
+    result = harness.run()
+    assert result.exit_code == 3
+    assert result.stopped_sequence == 1  # first regression in frozen order
+    assert [row.status for row in result.items] == ["RECOVERY_REQUIRED", "RECOVERY_REQUIRED", "APPLIED"]
+    assert result.successful_items == 1
+    assert result.dispatched_items == 3
+    assert all(row.execution_result.exit_code == 0 for row in result.items)
+    assert all(row.result_code == "woo_batch_processed_item_regressed" for row in result.items[:2])
+    assert result.counters == adapter.ItemCounters(9, 9, 3, 0, 3, 3)
+
+
+def test_processed_regression_and_current_unconfirmed_result_preserve_both_audits(harness):
+    def regress(count):
+        if count == 5:
+            harness.state(1, "NOT_STARTED")
+            harness.state(2, "RECOVERY_REQUIRED")
+
+    harness.on_load = regress
+    result = harness.run()
+    assert result.exit_code == 3
+    assert result.stopped_sequence == 1
+    assert result.items[0].result_code == "woo_batch_processed_item_regressed"
+    assert result.items[1].result_code == "woo_batch_post_dispatch_runtime_unconfirmed"
+    assert all(row.status == "RECOVERY_REQUIRED" and row.execution_result.exit_code == 0
+               for row in result.items[:2])
+    assert result.items[2].status == "NOT_DISPATCHED"
+    assert result.successful_items == 0
+    assert result.dispatched_items == 2
+    assert result.counters == adapter.ItemCounters(6, 6, 2, 0, 2, 2)
+
+
+def test_processed_item_regression_does_not_replace_unknown_counters_with_zero(harness):
+    harness.results[1] = execution(harness.initial.items[0], counters=adapter.ItemCounters.unknown())
+
+    def regress(count):
+        if count == 4:
+            harness.state(1, "RECOVERY_REQUIRED")
+
+    harness.on_load = regress
+    result = harness.run()
+    assert result.exit_code == 3
+    assert result.counters == adapter.ItemCounters.unknown()
+    assert not result.counters_complete
+    assert result.dispatched_items == 1
+    assert result.successful_items == 0
+
+
+@pytest.mark.parametrize("mutation", ["remove_receipt", "add_pending", "add_lock"])
+def test_real_loader_detects_processed_item_file_regression_in_mock_workspace(tmp_path, mutation):
+    fixture = Fixture(tmp_path)
+    initial = runtime.load_woo_batch_runtime(fixture.root)
+    approvals = {
+        item.sequence: adapter.ManualAuthorizationContext(
+            batch_hash=initial.batch_hash, sequence=item.sequence, sku=item.sku,
+            confirmed_plan_hash=item.plan_hash, allowed_operations=frozenset({"apply"}),
+        ) for item in initial.items
+    }
+    load_count = 0
+    regressed_files = {}
+    reports = fixture.reports_root()
+
+    def read_runtime(root):
+        nonlocal load_count
+        load_count += 1
+        if load_count == 4:
+            if mutation == "remove_receipt":
+                (reports / adapter.apply_core.RECEIPT_FILENAME).unlink()
+            else:
+                filename = (adapter.apply_core.PENDING_FILENAME if mutation == "add_pending"
+                            else adapter.apply_core.LOCK_FILENAME)
+                (reports / filename).write_bytes(b"opaque regression sentinel")
+            regressed_files.update({path.name: path.read_bytes() for path in reports.iterdir()})
+        return runtime.load_woo_batch_runtime(root)
+
+    def mock_dispatch(item, authorization, *, operation, base_url):
+        assert authorization is approvals[item.sequence]
+        assert item.sequence == 1 and operation == "apply" and base_url == BASE_URL
+        # Test double simulates only the Core's local Receipt; no real Core call.
+        (reports / adapter.apply_core.RECEIPT_FILENAME).write_bytes(b"opaque mock receipt")
+        return execution(item, operation, batch_hash=initial.batch_hash)
+
+    provider = Mock(side_effect=lambda batch_hash, item, operation: approvals[item.sequence])
+    dispatch = Mock(side_effect=mock_dispatch)
+    result = coordinator.run_woo_batch(
+        initial, provider, base_url=BASE_URL, item_adapter=dispatch, runtime_loader=read_runtime,
+    )
+    assert result.exit_code == 3
+    assert result.result_code == "woo_batch_processed_item_regressed"
+    assert result.stopped_sequence == 1
+    assert result.items[0].status == "RECOVERY_REQUIRED"
+    assert result.items[1].status == "NOT_DISPATCHED"
+    assert result.successful_items == 0
+    assert result.dispatched_items == 1
+    assert provider.call_count == dispatch.call_count == 1
+    assert {path.name: path.read_bytes() for path in reports.iterdir()} == regressed_files
+
+
 @pytest.mark.parametrize("text", [
     "https://user:password@example.com?token=private", "Authorization: private",
     "Cookie: private", "ck_" + "a" * 25,
