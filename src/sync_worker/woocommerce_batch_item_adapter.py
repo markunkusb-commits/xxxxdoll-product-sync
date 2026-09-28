@@ -49,6 +49,72 @@ _FAILURE_STATUSES = {
     2: frozenset({"pre_write_error"}),
     3: frozenset({"recovery_required", "recovery_observation"}),
 }
+_OPERATION_FAILURE_CODES = {
+    "apply": frozenset(
+        {
+            "woo_apply_target_sku_already_exists",
+            "woo_apply_target_sku_ambiguous",
+            "woo_apply_preflight_get_failed",
+            "woo_apply_attempt_marker_failed",
+            "woo_apply_readback_failed",
+            "woo_apply_post_count_invalid",
+            "woo_apply_readback_mismatch",
+            "woo_apply_pending_prepare_failed",
+            "woo_apply_pending_state_uncertain",
+            "woo_apply_pending_cleanup_failed",
+            "woo_apply_receipt_write_failed",
+        }
+    ),
+    "verify_receipt": frozenset(
+        {
+            "woo_apply_receipt_not_found",
+            "woo_apply_receipt_plan_or_target_invalid",
+            "woo_apply_receipt_input_invalid",
+            "woo_apply_receipt_contract_invalid",
+            "woo_apply_receipt_runtime_state_requires_recovery",
+            "woo_apply_receipt_get_setup_failed",
+            "woo_apply_receipt_remote_get_failed",
+            "woo_apply_receipt_transport_not_read_only",
+            "woo_apply_receipt_remote_state_mismatch",
+        }
+    ),
+    "inspect_pending": frozenset(
+        {
+            "woo_apply_pending_not_found",
+            "woo_apply_pending_plan_or_target_invalid",
+            "woo_apply_pending_runtime_state_requires_recovery",
+            "woo_apply_pending_contract_invalid",
+            "woo_apply_pending_get_setup_failed",
+            "woo_apply_pending_remote_get_failed",
+            "woo_apply_pending_transport_not_read_only",
+            "woo_apply_pending_remote_absent",
+            "woo_apply_pending_remote_exact",
+            "woo_apply_pending_remote_state_inconsistent",
+        }
+    ),
+    "reconcile_pending": frozenset(
+        {
+            "woo_apply_reconciliation_plan_or_target_invalid",
+            "woo_apply_reconciliation_runtime_state_invalid",
+            "woo_apply_reconciliation_runtime_state_requires_recovery",
+            "woo_apply_pending_confirmation_mismatch",
+            "woo_apply_reconciliation_lock_acquire_failed",
+            "woo_apply_reconciliation_lock_unverifiable",
+            "woo_apply_reconciliation_post_lock_state_changed",
+            "woo_apply_reconciliation_get_setup_failed",
+            "woo_apply_reconciliation_remote_get_failed",
+            "woo_apply_reconciliation_transport_not_read_only",
+            "woo_apply_reconciliation_remote_absent",
+            "woo_apply_reconciliation_remote_state_inconsistent",
+            "woo_apply_reconciliation_pre_receipt_state_changed",
+            "woo_apply_reconciliation_receipt_write_or_verify_failed",
+            "woo_apply_reconciliation_pre_cleanup_state_changed",
+            "woo_apply_reconciliation_pending_cleanup_failed",
+            "woo_apply_reconciliation_lock_cleanup_failed",
+            "woo_apply_reconciliation_final_state_invalid",
+        }
+    ),
+}
 # Only fixed Core audit codes may cross the adapter boundary. Unknown codes,
 # exception text and arbitrary extra response fields are never serialized.
 _CORE_CODES = frozenset("""
@@ -211,35 +277,77 @@ def _authorized(bound: _Binding, auth: ManualAuthorizationContext, operation: Op
         ))
     )
 
-
 def _convert(bound: _Binding, operation: Operation, value: object) -> ItemExecutionResult:
     function = _FUNCTIONS[operation]
     counters = ItemCounters.unknown()
+
     valid = isinstance(value, Mapping)
+
     if valid:
-        counts = {field.name: value.get(field.name) for field in fields(ItemCounters)}
-        valid = all(type(count) is int and count >= 0 for count in counts.values())
+        counts = {
+            field.name: value.get(field.name)
+            for field in fields(ItemCounters)
+        }
+        valid = all(
+            type(count) is int and count >= 0
+            for count in counts.values()
+        )
         if valid:
             counters = ItemCounters(**counts)
+
     status = value.get("status") if isinstance(value, Mapping) else None
     code = value.get("result_code") if isinstance(value, Mapping) else None
     exit_code = value.get("exit_code") if isinstance(value, Mapping) else None
-    valid = (valid and type(status) is str and type(code) is str
-             and code in _CORE_CODES and type(exit_code) is int)
+
+    valid = (
+        valid
+        and type(status) is str
+        and type(code) is str
+        and code in _CORE_CODES
+        and type(exit_code) is int
+    )
+
     after = None
+
     if valid and exit_code == 0:
         expected = _SUCCESS.get(operation)
-        valid = expected is not None and (status, code) == expected[:2]
+        valid = (
+            expected is not None
+            and (status, code) == expected[:2]
+        )
         if valid:
             after = expected[2]
+
     elif valid:
-        valid = status in _FAILURE_STATUSES.get(exit_code, frozenset())
+        valid = (
+            code
+            in _OPERATION_FAILURE_CODES.get(
+                operation,
+                frozenset(),
+            )
+        )
+
     if not valid:
-        return _outcome(bound, operation, 3, "woo_batch_item_core_result_invalid",
-                        core_function=function, counters=counters)
-    return _outcome(bound, operation, exit_code, code, state_after=after,
-                    core_function=function, core_status=status, core_result_code=code,
-                    counters=counters)
+        return _outcome(
+            bound,
+            operation,
+            3,
+            "woo_batch_item_core_result_invalid",
+            core_function=function,
+            counters=counters,
+        )
+
+    return _outcome(
+        bound,
+        operation,
+        exit_code,
+        code,
+        state_after=after,
+        core_function=function,
+        core_status=status,
+        core_result_code=code,
+        counters=counters,
+    )
 
 
 def execute_batch_item(
