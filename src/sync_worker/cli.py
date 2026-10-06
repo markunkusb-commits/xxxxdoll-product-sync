@@ -6,6 +6,7 @@ import argparse
 import json
 import logging
 from collections.abc import Sequence
+from dataclasses import asdict
 from decimal import Decimal
 from pathlib import Path
 
@@ -128,6 +129,12 @@ from .woocommerce_target_snapshot import (
 )
 from .woocommerce_apply_plan import run_woo_apply_plan
 from .woocommerce_batch_plan import freeze_woo_batch_plan
+from . import woocommerce_batch_authorization as batch_authorization
+from . import woocommerce_batch_coordinator as batch_coordinator
+from . import woocommerce_batch_item_adapter as batch_adapter
+from . import woocommerce_batch_runtime as batch_runtime
+from . import woocommerce_batch_workspace as batch_workspace
+from . import woocommerce_product_apply as batch_apply_target
 from .woocommerce_apply_idempotency import run_woo_apply_receipt_verification
 from .woocommerce_product_apply import run_woo_product_apply
 from .woocommerce_pending_recovery import inspect_woo_apply_pending
@@ -136,8 +143,9 @@ from .report import (
     DoctorReportWriter,
     ReferenceProductReportWriter,
     SafeJsonReportWriter,
+    sanitize_report_data,
 )
-from .sanitization import Redactor
+from .sanitization import REPORT_SECRET_SCAN_PATTERN, Redactor
 from .security import redactor_for_settings
 from .size_list_dry_run import run_size_list_dry_run
 from .sku_dry_run import run_sku_dry_run
@@ -1871,6 +1879,181 @@ def _run_freeze_woo_batch_plan(
     return 0 if report.get("status") == "ok" else 1
 
 
+WOO_BATCH_INSPECT_COMPLETED = "woo_batch_inspection_completed"
+WOO_BATCH_INSPECT_RECOVERY_REQUIRED = "woo_batch_inspection_recovery_required"
+WOO_BATCH_HASH_INVALID = "woo_batch_cli_hash_invalid"
+WOO_BATCH_WORKSPACE_REJECTED = "woo_batch_cli_workspace_rejected"
+WOO_BATCH_LOCAL_ERROR = "woo_batch_cli_local_error"
+WOO_BATCH_PRE_DISPATCH_INTERRUPTED = "woo_batch_cli_pre_dispatch_interrupted"
+WOO_BATCH_EXECUTION_INTERRUPTED = "woo_batch_cli_execution_interrupted"
+WOO_BATCH_EXECUTION_UNCERTAIN = "woo_batch_cli_execution_uncertain"
+WOO_BATCH_NOT_DISPATCHED = "woo_batch_cli_not_dispatched"
+WOO_BATCH_OUTPUT_FAILED = "woo_batch_cli_output_failed"
+
+
+class _WooBatchInvocationInterrupted(BaseException):
+    """Carry a CLI interrupt across frozen Coordinator callback boundaries.
+
+    Coordinator maps callback KeyboardInterrupt to a local error. Once the CLI
+    has entered execution it must instead stop with unknown effects. This narrow
+    signal keeps all normally returned Coordinator outcomes unchanged.
+    """
+
+
+def _load_cli_woo_batch(batch_hash: str, batch_root: Path | None) -> batch_runtime.BatchRuntime:
+    root = PROJECT_ROOT / "reports" / "woo-batches" if batch_root is None else batch_root
+    # Read-only location: publication helpers create directories and are not used.
+    observed = batch_runtime.load_woo_batch_runtime(root / batch_hash)
+    if observed.batch_hash != batch_hash:
+        raise batch_runtime.WooBatchRuntimeError(WOO_BATCH_WORKSPACE_REJECTED)
+    return observed
+
+
+def _woo_batch_local_result(
+    mode: str, runtime: batch_runtime.BatchRuntime | None, exit_code: int, code: str,
+    *, stopped_sequence: int | None = None, uncertain: bool = False,
+) -> dict[str, object]:
+    counts = batch_adapter.ItemCounters.unknown() if uncertain else batch_adapter.ItemCounters()
+    # After an escaped execution failure no partial Coordinator record is
+    # available. Do not invent NOT_DISPATCHED observations or zero attempt counts.
+    items = [] if runtime is None or uncertain else [asdict(batch_coordinator.BatchItemResult(
+        item.sequence, item.sku, item.plan_hash, item.state, "NOT_DISPATCHED", None,
+        False, WOO_BATCH_NOT_DISPATCHED, None,
+    )) for item in runtime.items]
+    return {
+        "mode": mode,
+        "batch_hash": runtime.batch_hash if runtime is not None else None,
+        "status": {0: "completed", 1: "blocked", 2: "local_error", 3: "recovery_required"}[exit_code],
+        "result_code": code, "exit_code": exit_code,
+        "total_items": len(runtime.items) if runtime is not None else 0,
+        "dispatched_items": None if uncertain else 0,
+        "successful_items": None if uncertain else 0,
+        "stopped_sequence": stopped_sequence,
+        "counters": asdict(counts), "counters_complete": not uncertain, "items": items,
+    }
+
+
+def _encode_woo_batch_result(result: dict[str, object]) -> str:
+    """Project only public dataclasses; refuse unsafe output before printing."""
+    # JSON projection turns immutable dataclass tuples into public arrays without
+    # changing any outcome or converting unknown counters to zero.
+    projected = json.loads(json.dumps(result, ensure_ascii=False, allow_nan=False))
+    if sanitize_report_data(projected, Redactor()) != projected:
+        raise ValueError(WOO_BATCH_OUTPUT_FAILED)
+
+    def public(value: object) -> bool:
+        if isinstance(value, dict):
+            return all(public(key) and public(item) for key, item in value.items())
+        if isinstance(value, list):
+            return all(public(item) for item in value)
+        if type(value) is str:
+            return not any(char in value for char in "/\\:") and REPORT_SECRET_SCAN_PATTERN.search(value) is None
+        return value is None or type(value) in (int, bool)
+
+    if not public(projected):
+        raise ValueError(WOO_BATCH_OUTPUT_FAILED)
+    return json.dumps(projected, ensure_ascii=False, sort_keys=True, allow_nan=False)
+
+
+def _run_woo_batch_cli(
+    logger: logging.Logger, mode: str, batch_hash: str, batch_root: Path | None,
+    authorization_file: Path | None = None,
+) -> int:
+    runtime = None
+    coordinator_started = False
+    try:
+        if type(batch_hash) is not str or batch_workspace._HASH_PATTERN.fullmatch(batch_hash) is None:
+            result = _woo_batch_local_result(mode, None, 2, WOO_BATCH_HASH_INVALID)
+        else:
+            runtime = _load_cli_woo_batch(batch_hash, batch_root)
+            if mode == "inspect":
+                unresolved = next((item.sequence for item in runtime.items
+                                   if item.state == "RECOVERY_REQUIRED"), None)
+                result = _woo_batch_local_result(
+                    mode, runtime, 0 if unresolved is None else 3,
+                    WOO_BATCH_INSPECT_COMPLETED if unresolved is None else WOO_BATCH_INSPECT_RECOVERY_REQUIRED,
+                    stopped_sequence=unresolved,
+                )
+            else:
+                approvals = batch_authorization.load_woo_batch_authorization(authorization_file, runtime)
+
+                def fresh_runtime(path: Path) -> batch_runtime.BatchRuntime:
+                    try:
+                        return batch_runtime.load_woo_batch_runtime(path)
+                    except KeyboardInterrupt:
+                        raise _WooBatchInvocationInterrupted() from None
+
+                def authorized(batch_hash, item, operation):
+                    try:
+                        return approvals(batch_hash, item, operation)
+                    except KeyboardInterrupt:
+                        raise _WooBatchInvocationInterrupted() from None
+
+                coordinator_started = True
+                executed = batch_coordinator.run_woo_batch(
+                    runtime, authorized, base_url=batch_apply_target.APPROVED_BASE_URL,
+                    runtime_loader=fresh_runtime,
+                )
+                if type(executed) is not batch_coordinator.BatchExecutionResult:
+                    raise ValueError(WOO_BATCH_EXECUTION_UNCERTAIN)
+                result = {"mode": mode, **asdict(executed)}
+    except batch_runtime.WooBatchRuntimeError:
+        result = _woo_batch_local_result(
+            mode, runtime, 3 if coordinator_started else 1,
+            WOO_BATCH_EXECUTION_UNCERTAIN if coordinator_started else WOO_BATCH_WORKSPACE_REJECTED,
+            uncertain=coordinator_started,
+        )
+    except batch_authorization.WooBatchAuthorizationError as error:
+        result = _woo_batch_local_result(
+            mode, runtime, 3 if coordinator_started else error.exit_code,
+            WOO_BATCH_EXECUTION_UNCERTAIN if coordinator_started else error.result_code,
+            uncertain=coordinator_started,
+        )
+    except (KeyboardInterrupt, _WooBatchInvocationInterrupted):
+        result = _woo_batch_local_result(
+            mode, runtime, 3 if coordinator_started else 2,
+            WOO_BATCH_EXECUTION_INTERRUPTED if coordinator_started else WOO_BATCH_PRE_DISPATCH_INTERRUPTED,
+            uncertain=coordinator_started,
+        )
+    except Exception:
+        # Do not echo local paths, approvals, raw payloads or exception text.
+        result = _woo_batch_local_result(
+            mode, runtime if coordinator_started else None, 3 if coordinator_started else 2,
+            WOO_BATCH_EXECUTION_UNCERTAIN if coordinator_started else WOO_BATCH_LOCAL_ERROR,
+            uncertain=coordinator_started,
+        )
+
+    try:
+        encoded = _encode_woo_batch_result(result)
+    except KeyboardInterrupt:
+        result = _woo_batch_local_result(
+            mode, runtime if coordinator_started else None, 3 if coordinator_started else 2,
+            WOO_BATCH_EXECUTION_INTERRUPTED if coordinator_started else WOO_BATCH_PRE_DISPATCH_INTERRUPTED,
+            uncertain=coordinator_started,
+        )
+        encoded = _encode_woo_batch_result(result)
+    except Exception:
+        # Output safety applies to error envelopes as well as successful results.
+        result = _woo_batch_local_result(
+            mode, runtime if coordinator_started else None, 3 if coordinator_started else 2,
+            WOO_BATCH_EXECUTION_UNCERTAIN if coordinator_started else WOO_BATCH_LOCAL_ERROR,
+            uncertain=coordinator_started,
+        )
+        encoded = _encode_woo_batch_result(result)
+
+    try:
+        print(encoded, flush=True)
+        logger.info(json.dumps({
+            "event": "woo_batch_cli_finished", "mode": mode,
+            "status": result["status"], "result_code": result["result_code"],
+            "exit_code": result["exit_code"],
+        }, sort_keys=True))
+    except (OSError, KeyboardInterrupt):
+        logger.error(json.dumps({"event": WOO_BATCH_OUTPUT_FAILED, "mode": mode}, sort_keys=True))
+        return 3 if coordinator_started else 2
+    return result["exit_code"]
+
+
 def _run_apply_woo_plan(
     logger: logging.Logger,
     plan_report_path: Path,
@@ -2680,6 +2863,19 @@ def build_parser() -> argparse.ArgumentParser:
         dest="output_root",
         help="Optional safe local woo-batches directory",
     )
+    for command in ("inspect-woo-batch", "run-woo-batch"):
+        woo_batch = subcommands.add_parser(
+            command, allow_abbrev=False,
+            help="Inspect local frozen batch observations" if command == "inspect-woo-batch"
+            else "Run or re-invoke an explicitly authorized sequential staging batch",
+        )
+        woo_batch.add_argument("--batch-hash", required=True, help="Full lowercase 64-hex BATCH_HASH")
+        woo_batch.add_argument("--batch-root", type=Path, help="Existing local woo-batches directory")
+        if command == "run-woo-batch":
+            woo_batch.add_argument(
+                "--authorization-file", required=True, type=Path,
+                help="Operator-supplied local woo-batch-approvals.json input",
+            )
     apply_woo_plan = subcommands.add_parser(
         "apply-woo-plan",
         help="Apply one manually confirmed frozen CREATE plan to exact staging",
@@ -3012,6 +3208,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             logger,
             arguments.manifest_path,
             arguments.output_root,
+        )
+    if arguments.command == "inspect-woo-batch":
+        return _run_woo_batch_cli(logger, "inspect", arguments.batch_hash, arguments.batch_root)
+    if arguments.command == "run-woo-batch":
+        return _run_woo_batch_cli(
+            logger, "run", arguments.batch_hash, arguments.batch_root, arguments.authorization_file,
         )
     if arguments.command == "apply-woo-plan":
         return _run_apply_woo_plan(
