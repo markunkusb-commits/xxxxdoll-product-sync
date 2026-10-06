@@ -594,6 +594,95 @@ def test_processed_item_regression_checks_all_prior_items_not_only_previous(harn
     assert harness.provider.call_count == harness.dispatch.call_count == 2
 
 
+@pytest.mark.parametrize("state", ["NOT_STARTED", "RECOVERY_REQUIRED"])
+def test_processed_prefix_gate_precedes_next_authorization_and_dispatch(harness, state):
+    accepted = execution(harness.initial.items[0])
+    harness.results[1] = accepted
+
+    def regress(count):
+        if count == 4:  # the refresh immediately before item 2 authorization
+            harness.state(1, state)
+
+    harness.on_load = regress
+    result = harness.run()
+    assert result.status == "recovery_required"
+    assert result.exit_code == 3
+    assert result.result_code == "woo_batch_processed_item_regressed"
+    assert result.stopped_sequence == 1
+    assert result.items[0].execution_result is accepted
+    assert result.items[0].status == "RECOVERY_REQUIRED"
+    assert result.items[0].observed_state == state
+    assert result.successful_items == 0
+    assert result.dispatched_items == 1
+    assert result.counters == accepted.counters
+    assert result.items[1].observed_state == "NOT_STARTED"
+    assert all(row.status == "NOT_DISPATCHED" and row.operation is None
+               and not row.dispatched and row.execution_result is None for row in result.items[1:])
+    assert harness.events == [
+        ("load",), ("load",), ("authorize", 1, "apply"),
+        ("dispatch", 1, "apply"), ("load",), ("load",),
+    ]
+
+
+def test_all_regressed_processed_items_are_revoked_before_next_dispatch(harness):
+    accepted = [execution(item) for item in harness.initial.items[:2]]
+    harness.results.update({1: accepted[0], 2: accepted[1]})
+
+    def regress(count):
+        if count == 6:  # both earlier items regress before item 3 can be authorized
+            harness.state(1, "NOT_STARTED")
+            harness.state(2, "RECOVERY_REQUIRED")
+
+    harness.on_load = regress
+    result = harness.run()
+    assert result.exit_code == 3
+    assert result.stopped_sequence == 1
+    assert result.result_code == "woo_batch_processed_item_regressed"
+    assert result.successful_items == 0
+    assert result.dispatched_items == 2
+    for row, original in zip(result.items[:2], accepted, strict=True):
+        assert row.status == "RECOVERY_REQUIRED"
+        assert row.result_code == result.result_code
+        assert row.execution_result is original
+    assert result.items[2].status == "NOT_DISPATCHED"
+    assert result.items[2].operation is None
+    assert harness.provider.call_count == harness.dispatch.call_count == 2
+    assert result.counters == adapter.ItemCounters(6, 6, 2, 0, 2, 2)
+
+
+def test_first_regressed_sequence_is_not_assumed_to_be_one(harness):
+    def regress(count):
+        if count == 6:
+            harness.state(2, "NOT_STARTED")
+
+    harness.on_load = regress
+    result = harness.run()
+    assert result.exit_code == 3
+    assert result.stopped_sequence == 2
+    assert result.result_code == "woo_batch_processed_item_regressed"
+    assert result.successful_items == 1
+    assert [row.status for row in result.items] == ["APPLIED", "RECOVERY_REQUIRED", "NOT_DISPATCHED"]
+    assert harness.provider.call_count == harness.dispatch.call_count == 2
+
+
+def test_healthy_processed_prefix_allows_each_later_item(harness):
+    harness.state(1, "ALREADY_APPLIED_OBSERVED")
+
+    def authorize(item, operation):
+        assert all(prior.state == "ALREADY_APPLIED_OBSERVED"
+                   for prior in harness.current.items[:item.sequence - 1])
+        return harness.approvals[(item.sequence, operation)]
+
+    harness.on_provider = authorize
+    result = harness.run()
+    assert result.exit_code == 0
+    assert result.status == "completed"
+    assert result.stopped_sequence is None
+    assert result.successful_items == result.dispatched_items == 3
+    assert [row.status for row in result.items] == ["ALREADY_APPLIED", "APPLIED", "APPLIED"]
+    assert harness.provider.call_count == harness.dispatch.call_count == 3
+
+
 def test_multiple_processed_item_regressions_remove_all_stale_success_counts(harness):
     def regress(count):
         if count == 7:  # final post-dispatch refresh must not report completed

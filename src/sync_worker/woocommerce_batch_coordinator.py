@@ -113,22 +113,26 @@ def _reload(expected: runtime_core.BatchRuntime, loader: RuntimeLoader) -> runti
     return fresh
 
 
-def _observe(rows: list[BatchItemResult], fresh: runtime_core.BatchRuntime) -> int | None:
-    """Refresh every observation and flag all previously accepted successes.
+def _observe(rows: list[BatchItemResult], fresh: runtime_core.BatchRuntime) -> None:
+    for index, item in enumerate(fresh.items):
+        rows[index] = replace(rows[index], observed_state=item.state)
+
+
+def _check_processed_items(rows: list[BatchItemResult], current_index: int) -> int | None:
+    """Check the processed prefix after refresh, before considering a new item.
 
     A processed item must remain Receipt-only. Preserve its original Adapter
     audit/counters, but revoke the stale success classification if it regresses.
-    Return the first affected index in frozen order, without repairing anything.
+    Current/later items are not part of this gate. Flag every regressed success
+    and return the first affected index in frozen order, without repairing it.
     """
     first_regressed = None
-    for index, item in enumerate(fresh.items):
-        row = replace(rows[index], observed_state=item.state)
+    for index, row in enumerate(rows[:current_index]):
         if (row.status in {"APPLIED", "ALREADY_APPLIED"}
-                and item.state != "ALREADY_APPLIED_OBSERVED"):
-            row = replace(row, status="RECOVERY_REQUIRED", result_code=_PROCESSED_REGRESSION)
+                and row.observed_state != "ALREADY_APPLIED_OBSERVED"):
+            rows[index] = replace(row, status="RECOVERY_REQUIRED", result_code=_PROCESSED_REGRESSION)
             if first_regressed is None:
                 first_regressed = index
-        rows[index] = row
     return first_regressed
 
 
@@ -231,7 +235,10 @@ def run_woo_batch(
             fresh = _reload(frozen, loader)
         except _RefreshError as error:
             return stop(index, error.exit_code, error.code)
-        regressed = _observe(rows, fresh)
+        _observe(rows, fresh)
+        # Do not even request authorization for the next item until every
+        # previously accepted success still has a clean runtime observation.
+        regressed = _check_processed_items(rows, current_index=index)
         if regressed is not None:
             return stop(regressed, 3, _PROCESSED_REGRESSION)
         item = fresh.items[index]
@@ -275,7 +282,8 @@ def run_woo_batch(
             after = _reload(frozen, loader)
         except _RefreshError:
             return stop(index, 3, "woo_batch_post_dispatch_runtime_unconfirmed")
-        regressed = _observe(rows, after)
+        _observe(rows, after)
+        regressed = _check_processed_items(rows, current_index=index)
         if after.items[index].state != "ALREADY_APPLIED_OBSERVED":
             if regressed is None:
                 return stop(index, 3, "woo_batch_post_dispatch_runtime_unconfirmed")
