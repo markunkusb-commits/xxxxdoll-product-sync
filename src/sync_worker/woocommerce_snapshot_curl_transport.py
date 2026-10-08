@@ -36,6 +36,9 @@ PROXY_ENVIRONMENT_VARIABLE = "WOO_SNAPSHOT_HTTP_PROXY"
 METADATA_LIMIT = 16 * 1024
 PARENT_TIMEOUT = 30
 OFFLINE_TRUST_FLAGS = 0x1000 | 0x10 | 0x2000  # CACHE_ONLY, revocation NONE, no MD2/4
+# Corruption protection, not a normal catalog-selection limit: thousands of
+# catalogs for a single file hash are already far above realistic inbox counts.
+_MAX_CATALOG_CANDIDATES = 4096
 _FRAME_START = "WOO_SNAPSHOT_META_V1"
 _FRAME_END = "END_WOO_SNAPSHOT_META_V1"
 _FIELDS = ("status", "content_type", "total", "total_pages", "connect_status", "redirects", "retries")
@@ -297,7 +300,7 @@ class _WindowsTrust:
         # the same locked file, find a LOCAL catalog and verify it offline too.
         acquire = _function(self.trust, "CryptCATAdminAcquireContext2", w.BOOL, [ctypes.POINTER(w.HANDLE), ctypes.c_void_p, w.LPCWSTR, ctypes.c_void_p, w.DWORD])
         calculate = _function(self.trust, "CryptCATAdminCalcHashFromFileHandle2", w.BOOL, [w.HANDLE, w.HANDLE, ctypes.POINTER(w.DWORD), ctypes.c_void_p, w.DWORD])
-        enumerate_catalog = _function(self.trust, "CryptCATAdminEnumCatalogFromHash", w.HANDLE, [w.HANDLE, ctypes.c_void_p, w.DWORD, w.DWORD, ctypes.c_void_p])
+        enumerate_catalog = _function(self.trust, "CryptCATAdminEnumCatalogFromHash", w.HANDLE, [w.HANDLE, ctypes.c_void_p, w.DWORD, w.DWORD, ctypes.POINTER(w.HANDLE)])
         catalog_info = _function(self.trust, "CryptCATCatalogInfoFromContext", w.BOOL, [w.HANDLE, ctypes.POINTER(_CatalogInfo), w.DWORD])
         release_catalog = _function(self.trust, "CryptCATAdminReleaseCatalogContext", w.BOOL, [w.HANDLE, w.HANDLE, w.DWORD])
         release_admin = _function(self.trust, "CryptCATAdminReleaseContext", w.BOOL, [w.HANDLE, w.DWORD])
@@ -313,24 +316,36 @@ class _WindowsTrust:
                 if not calculate(admin, handle, ctypes.byref(length), digest, 0):
                     raise _configuration_failure("signature_untrusted")
                 catalog = enumerate_catalog(admin, digest, length, 0, None)
-                if not catalog:
-                    continue
-                info = _CatalogInfo()
-                info.size = ctypes.sizeof(info)
-                if not catalog_info(catalog, ctypes.byref(info), 0):
-                    raise _configuration_failure("signature_untrusted")
-                member = _TrustCatalog()
-                member.size, member.catalog, member.tag = ctypes.sizeof(member), info.path, bytes(digest).hex().upper()
-                member.path, member.handle = path, handle
-                member.hash, member.hash_size, member.admin = ctypes.cast(digest, ctypes.c_void_p), length.value, admin
-                if self._verify(member, 2) == 0:
-                    return
-                raise _configuration_failure("signature_untrusted")
+                examined = 0
+                while catalog:
+                    if examined >= _MAX_CATALOG_CANDIDATES:
+                        raise _configuration_failure("signature_untrusted")
+                    examined += 1
+                    info = _CatalogInfo()
+                    info.size = ctypes.sizeof(info)
+                    if not catalog_info(catalog, ctypes.byref(info), 0):
+                        raise _configuration_failure("signature_untrusted")
+                    member = _TrustCatalog()
+                    member.size, member.catalog, member.tag = ctypes.sizeof(member), info.path, bytes(digest).hex().upper()
+                    member.path, member.handle = path, handle
+                    member.hash, member.hash_size, member.admin = ctypes.cast(digest, ctypes.c_void_p), length.value, admin
+                    if self._verify(member, 2) == 0:
+                        return
+                    # EnumCatalogFromHash consumes/releases the previous context
+                    # passed by pointer, including when it returns NULL. Do not
+                    # release it ourselves before or after continuation. The new
+                    # return value is the only context we still own. If the call
+                    # raises before entering the native API, assignment has not
+                    # occurred and finally still owns/cleans the previous one.
+                    previous = w.HANDLE(catalog)
+                    catalog = enumerate_catalog(admin, digest, length, 0, ctypes.byref(previous))
             finally:
-                if catalog:
-                    release_catalog(admin, catalog, 0)
-                if admin:
-                    release_admin(admin, 0)
+                try:
+                    if catalog:
+                        release_catalog(admin, catalog, 0)
+                finally:
+                    if admin:
+                        release_admin(admin, 0)
         raise _configuration_failure("signature_untrusted")
 
 

@@ -531,6 +531,254 @@ def test_catalog_signed_inbox_executable_uses_same_locked_member(monkeypatch):
     assert released == ["catalog", "admin"]
 
 
+class CatalogEnumerationHarness:
+    """Model native continuation ownership, not a list-returning enumeration stub.
+
+    Passing a previous HCATINFO by pointer transfers it to the enumeration API,
+    which releases it even on exhaustion. Only an early-return/current context
+    is explicitly released by our caller. Every issued handle has one disposer.
+    """
+
+    def __init__(self, monkeypatch, sha256=(), sha1=(), *, failure=None, embedded=0x800B0100):
+        self.candidates = {"SHA256": tuple(sha256), "SHA1": tuple(sha1)}
+        self.failure, self.embedded = failure, embedded
+        self.events = []
+        self.admins, self.positions, self.contexts = {}, {}, {}
+        self.live_admins, self.live_catalogs = set(), set()
+        self.issued_catalogs, self.disposed_catalogs, self.released_admins = [], [], []
+        self.native = object.__new__(curl._WindowsTrust)
+        self.native.trust = object()
+        self.native._verify = self.verify
+        functions = {
+            "CryptCATAdminAcquireContext2": self.acquire,
+            "CryptCATAdminCalcHashFromFileHandle2": self.calculate,
+            "CryptCATAdminEnumCatalogFromHash": self.enumerate,
+            "CryptCATCatalogInfoFromContext": self.info,
+            "CryptCATAdminReleaseCatalogContext": self.release_catalog,
+            "CryptCATAdminReleaseContext": self.release_admin,
+        }
+
+        def bind(library, name, result, arguments):
+            assert library is self.native.trust
+            if name == "CryptCATAdminEnumCatalogFromHash":
+                assert arguments[-1] is ctypes.POINTER(curl.w.HANDLE)
+            return functions[name]
+
+        monkeypatch.setattr(curl, "_function", bind)
+
+    @staticmethod
+    def value(handle):
+        return getattr(handle, "value", handle)
+
+    def acquire(self, pointer, subsystem, algorithm, policy, flags):
+        assert subsystem is policy is None and flags == 0
+        self.events.append(("acquire", algorithm))
+        if self.failure == "acquire":
+            return False
+        admin = len(self.admins) + 201
+        self.admins[admin], self.positions[admin] = algorithm, 0
+        self.live_admins.add(admin)
+        ctypes.cast(pointer, ctypes.POINTER(curl.w.HANDLE))[0] = admin
+        return self.failure != "acquire_partial"
+
+    def calculate(self, admin, file_handle, pointer, buffer, flags):
+        admin = self.value(admin)
+        assert admin in self.live_admins and file_handle == 77 and flags == 0
+        algorithm = self.admins[admin]
+        length = 32 if algorithm == "SHA256" else 20
+        self.events.append(("hash", algorithm, buffer is not None, file_handle))
+        if self.failure == ("hash_size" if buffer is None else "hash_data"):
+            return False
+        ctypes.cast(pointer, ctypes.POINTER(curl.w.DWORD))[0] = length
+        if buffer is not None:
+            for index in range(length):
+                buffer[index] = 1 if algorithm == "SHA256" else 2
+        return True
+
+    def dispose(self, catalog, owner):
+        assert catalog in self.live_catalogs, "premature or double catalog release"
+        self.live_catalogs.remove(catalog)
+        self.disposed_catalogs.append(catalog)
+        self.events.append(("dispose", owner, catalog))
+
+    def enumerate(self, admin, digest, length, flags, previous_pointer):
+        admin = self.value(admin)
+        assert admin in self.live_admins and flags == 0
+        algorithm, index = self.admins[admin], self.positions[admin]
+        assert self.value(length) == len(digest)
+        previous = None if previous_pointer is None else ctypes.cast(previous_pointer, ctypes.POINTER(curl.w.HANDLE)).contents.value
+        self.events.append(("enumerate", algorithm, previous))
+        if self.failure == ("enum_first" if previous is None else "enum_continue"):
+            # Simulate an exception at the Python/native boundary BEFORE the API
+            # consumes ownership. The caller must still clean its current handle.
+            raise OSError("mock_native_enum_failure")
+        if index:
+            assert previous is not None and self.contexts[previous][:2] == (admin, index - 1)
+            self.dispose(previous, "enum")
+        else:
+            assert previous is None, "first candidate must use NULL"
+        if index == len(self.candidates[algorithm]):
+            self.events.append(("exhausted", algorithm))
+            return None
+        catalog = admin * 100 + index
+        self.positions[admin] += 1
+        self.contexts[catalog] = (admin, index, self.candidates[algorithm][index])
+        self.live_catalogs.add(catalog)
+        self.issued_catalogs.append(catalog)
+        return catalog
+
+    def info(self, catalog, pointer, flags):
+        assert catalog in self.live_catalogs and flags == 0
+        self.events.append(("info", catalog))
+        if self.failure == "info":
+            return False
+        ctypes.cast(pointer, ctypes.POINTER(curl._CatalogInfo)).contents.path = rf"C:\MockCatalogs\{catalog}.cat"
+        return True
+
+    def verify(self, info, choice):
+        assert info.handle == 77 and info.path == FakeExecutable.path
+        if choice == 1:
+            self.events.append(("embedded", self.embedded))
+            return self.embedded
+        assert choice == 2
+        admin = info.admin
+        algorithm = self.admins[admin]
+        catalog = int(info.catalog.rsplit("\\", 1)[1].split(".", 1)[0])
+        assert catalog in self.live_catalogs and self.contexts[catalog][0] == admin
+        assert info.hash_size == (32 if algorithm == "SHA256" else 20)
+        assert info.tag == ("01" * 32 if algorithm == "SHA256" else "02" * 20)
+        self.events.append(("verify", algorithm, catalog))
+        if self.failure == "verify":
+            raise RuntimeError("mock_native_verify_failure")
+        return 0 if self.contexts[catalog][2] else 0x800B0109
+
+    def release_catalog(self, admin, catalog, flags):
+        assert self.value(admin) == self.contexts[catalog][0] and flags == 0
+        self.dispose(catalog, "caller")
+        if self.failure == "release_catalog":
+            raise RuntimeError("mock_native_release_failure")
+        return True
+
+    def release_admin(self, admin, flags):
+        admin = self.value(admin)
+        assert admin in self.live_admins and flags == 0
+        assert not any(self.contexts[cat][0] == admin for cat in self.live_catalogs), "catalog leaked before admin release"
+        self.live_admins.remove(admin)
+        self.released_admins.append(admin)
+        self.events.append(("release_admin", self.admins[admin]))
+        return True
+
+    def run(self):
+        self.native.verify_signature(FakeExecutable.path, 77)
+
+    def assert_clean(self):
+        assert not self.live_admins and not self.live_catalogs
+        assert sorted(self.disposed_catalogs) == sorted(self.issued_catalogs)
+        assert len(self.disposed_catalogs) == len(set(self.disposed_catalogs))
+        assert sorted(self.released_admins) == sorted(self.admins)
+        assert len(self.released_admins) == len(set(self.released_admins))
+
+
+@pytest.mark.parametrize(
+    "sha256,sha1,algorithms,verified",
+    [
+        ((True,), (), ["SHA256"], ["SHA256"]),
+        ((False, True), (), ["SHA256"], ["SHA256", "SHA256"]),
+        ((False, False), (True,), ["SHA256", "SHA1"], ["SHA256", "SHA256", "SHA1"]),
+        ((), (True,), ["SHA256", "SHA1"], ["SHA1"]),
+        ((False,), (False, True), ["SHA256", "SHA1"], ["SHA256", "SHA1", "SHA1"]),
+    ],
+)
+def test_catalog_enumeration_trust_and_hash_fallback(monkeypatch, sha256, sha1, algorithms, verified):
+    harness = CatalogEnumerationHarness(monkeypatch, sha256, sha1)
+    harness.run()
+    harness.assert_clean()
+    assert [event[1] for event in harness.events if event[0] == "acquire"] == algorithms
+    assert [event[1] for event in harness.events if event[0] == "verify"] == verified
+    # Success releases the current context explicitly; every prior one was
+    # consumed by native continuation, never released a second time by us.
+    disposals = [event[1] for event in harness.events if event[0] == "dispose"]
+    assert disposals == ["enum"] * (len(verified) - 1) + ["caller"]
+    if "SHA1" in algorithms:
+        assert harness.events.index(("exhausted", "SHA256")) < harness.events.index(("release_admin", "SHA256")) < harness.events.index(("acquire", "SHA1"))
+
+
+@pytest.mark.parametrize("sha256,sha1", [((False, False), (False, False)), ((), ()), ((False,), ()), ((), (False,))])
+def test_all_catalogs_untrusted_or_absent_exhaust_both_algorithms(monkeypatch, sha256, sha1):
+    harness = CatalogEnumerationHarness(monkeypatch, sha256, sha1)
+    with pytest.raises(snapshot.WooTargetSnapshotConfigurationError, match="^woo_target_snapshot_curl_signature_untrusted$"):
+        harness.run()
+    harness.assert_clean()
+    assert [event[1] for event in harness.events if event[0] == "verify"] == ["SHA256"] * len(sha256) + ["SHA1"] * len(sha1)
+    assert [event[1] for event in harness.events if event[0] == "exhausted"] == ["SHA256", "SHA1"]
+    assert all(event[1] == "enum" for event in harness.events if event[0] == "dispose")
+
+
+@pytest.mark.parametrize("failure", ["acquire", "acquire_partial", "hash_size", "hash_data", "info"])
+def test_catalog_structural_failures_do_not_become_trust_fallback(monkeypatch, failure):
+    harness = CatalogEnumerationHarness(monkeypatch, (False, True), (True,), failure=failure)
+    with pytest.raises(snapshot.WooTargetSnapshotConfigurationError, match="^woo_target_snapshot_curl_signature_untrusted$"):
+        harness.run()
+    harness.assert_clean()
+    assert ("acquire", "SHA1") not in harness.events
+    assert not any(event[0] == "exhausted" for event in harness.events)
+    if failure == "info":
+        assert not any(event[0] == "verify" for event in harness.events)
+        assert [event[1] for event in harness.events if event[0] == "dispose"] == ["caller"]
+
+
+@pytest.mark.parametrize("failure,error_type", [("enum_first", OSError), ("enum_continue", OSError), ("verify", RuntimeError), ("release_catalog", RuntimeError)])
+def test_catalog_native_boundary_exceptions_still_release_owned_resources(monkeypatch, failure, error_type):
+    harness = CatalogEnumerationHarness(monkeypatch, (False, True), (True,), failure=failure)
+    with pytest.raises(error_type, match="^mock_native_"):
+        harness.run()
+    harness.assert_clean()
+    assert ("acquire", "SHA1") not in harness.events
+    if failure != "enum_first":
+        expected = ["enum", "caller"] if failure == "release_catalog" else ["caller"]
+        assert [event[1] for event in harness.events if event[0] == "dispose"] == expected
+
+
+def test_catalog_corruption_limit_is_not_first_candidate_policy(monkeypatch):
+    monkeypatch.setattr(curl, "_MAX_CATALOG_CANDIDATES", 2)
+    harness = CatalogEnumerationHarness(monkeypatch, (False, False, True), (True,))
+    with pytest.raises(snapshot.WooTargetSnapshotConfigurationError, match="signature_untrusted"):
+        harness.run()
+    harness.assert_clean()
+    assert len([event for event in harness.events if event[0] == "verify"]) == 2
+    assert ("acquire", "SHA1") not in harness.events
+    assert [event[1] for event in harness.events if event[0] == "dispose"] == ["enum", "enum", "caller"]
+
+
+@pytest.mark.parametrize("embedded", [0, 0x800B0109])
+def test_embedded_signature_does_not_open_any_catalog_admin(monkeypatch, embedded):
+    harness = CatalogEnumerationHarness(monkeypatch, (True,), (True,), embedded=embedded)
+    if embedded:
+        with pytest.raises(snapshot.WooTargetSnapshotConfigurationError, match="signature_untrusted"):
+            harness.run()
+    else:
+        harness.run()
+    harness.assert_clean()
+    assert harness.events == [("embedded", embedded)]
+
+
+def test_catalog_members_still_use_offline_winverifytrust_and_close_state(monkeypatch):
+    native = object.__new__(curl._WindowsTrust)
+    native.trust = object()
+    calls = []
+    member = curl._TrustCatalog()
+    member.size, member.path, member.handle = ctypes.sizeof(member), FakeExecutable.path, 77
+    def verify(window, action, pointer):
+        data = ctypes.cast(pointer, ctypes.POINTER(curl._TrustData)).contents
+        actual = ctypes.cast(data.info, ctypes.POINTER(curl._TrustCatalog)).contents
+        calls.append((data.choice, data.action, data.flags, data.revocation, actual.handle))
+        return 0x800B0109
+    monkeypatch.setattr(curl, "_function", lambda *args: verify)
+    assert native._verify(member, 2) == 0x800B0109
+    assert [call[1] for call in calls] == [1, 2]
+    assert all(call[0] == 2 and call[2] == curl.OFFLINE_TRUST_FLAGS and call[2] & 0x1000 and call[3] == 0 and call[4] == 77 for call in calls)
+
+
 @pytest.mark.parametrize("owner, mask, accepted", [("S-1-5-18", 0x10000, False), ("S-1-5-18", 0x120089, True), ("S-1-5-21-untrusted", 0, False)])
 def test_protection_rejects_untrusted_owner_or_write_ace(owner, mask, accepted, monkeypatch):
     native = object.__new__(curl._WindowsTrust)
