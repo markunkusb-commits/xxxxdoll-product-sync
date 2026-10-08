@@ -634,6 +634,7 @@ def test_cli_exit_zero_and_one(status, expected_exit, tmp_path, monkeypatch):
         "network_requests_performed": 1,
     }
     monkeypatch.setattr(cli, "PROJECT_ROOT", tmp_path)
+    mock_cli_curl(monkeypatch)
     monkeypatch.setattr(
         cli,
         "load_woo_category_credential_source",
@@ -654,6 +655,7 @@ def test_cli_exit_zero_and_one(status, expected_exit, tmp_path, monkeypatch):
 def test_cli_contract_error_returns_two(tmp_path, monkeypatch):
     package_path = write_package(tmp_path)
     monkeypatch.setattr(cli, "PROJECT_ROOT", tmp_path)
+    mock_cli_curl(monkeypatch)
     monkeypatch.setattr(
         cli,
         "load_woo_category_credential_source",
@@ -706,3 +708,83 @@ def test_no_real_network_or_write_api_is_used(monkeypatch, tmp_path):
     report, _ = run(tmp_path, FakeTransport({1: page([])}))
     assert report["network_requests_performed"] == 1
     assert report["write_requests_performed"] == 0
+
+
+def mock_cli_curl(monkeypatch):
+    class FakeCurl(FakeTransport):
+        def __init__(self, base_url, credentials, *, options):
+            super().__init__({1: page([])}, base_url=base_url)
+            self.options = options
+            self.credentials = credentials
+            self.closed = False
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            self.closed = True
+
+    monkeypatch.setattr(cli, "CurlWooProductTargetTransport", FakeCurl)
+    monkeypatch.setattr(cli, "load_curl_snapshot_options", lambda: "mock immutable options")
+    return FakeCurl
+
+
+def test_none_transport_still_constructs_stdlib(tmp_path, monkeypatch):
+    transport = FakeTransport({1: page([])})
+    constructed = []
+
+    def stdlib(base_url, credentials):
+        constructed.append((base_url, credentials))
+        return transport
+
+    monkeypatch.setattr(snapshot, "StdlibWooProductTargetTransport", stdlib)
+    report, _ = snapshot.run_woo_target_snapshot(
+        write_package(tmp_path), BASE_URL, CREDENTIALS, project_root=tmp_path,
+    )
+    assert constructed == [(BASE_URL, CREDENTIALS)]
+    assert report["create_eligible"] is True
+
+
+def test_explicit_zero_retries_has_one_attempt_and_no_report(tmp_path):
+    transport = FakeTransport({1: [snapshot.WooTargetSnapshotRetryableError("safe"), page([])]})
+    with pytest.raises(snapshot.WooTargetSnapshotRetryableError):
+        snapshot.run_woo_target_snapshot(
+            write_package(tmp_path), BASE_URL, None, project_root=tmp_path,
+            transport=transport, max_retries=0, sleeper=lambda _: pytest.fail("no retry"),
+        )
+    assert len(transport.calls) == 1
+    assert not (tmp_path / "reports" / snapshot.REPORT_FILENAME).exists()
+
+
+def test_cli_explicitly_injects_curl_with_no_retries(tmp_path, monkeypatch):
+    mock_type = mock_cli_curl(monkeypatch)
+    monkeypatch.setattr(cli, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(cli, "load_woo_category_credential_source", lambda: {
+        "WC_CONSUMER_KEY": "ck_test", "WC_CONSUMER_SECRET": "cs_test",
+    })
+    calls = []
+    original = snapshot.run_woo_target_snapshot
+
+    def run_snapshot(*args, **kwargs):
+        calls.append(kwargs)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(cli, "run_woo_target_snapshot", run_snapshot)
+    assert cli._run_snapshot_woo_target(logging.getLogger("test"), write_package(tmp_path), BASE_URL) == 0
+    assert len(calls) == 1
+    assert type(calls[0]["transport"]) is mock_type
+    assert calls[0]["transport"].closed
+    assert calls[0]["max_retries"] == 0
+
+
+def test_cli_proxy_failure_does_not_fallback_or_publish(tmp_path, monkeypatch, caplog):
+    monkeypatch.setattr(cli, "load_woo_category_credential_source", lambda: {
+        "WC_CONSUMER_KEY": "ck_test", "WC_CONSUMER_SECRET": "cs_test",
+    })
+    def invalid_options():
+        raise snapshot.WooTargetSnapshotConfigurationError("woo_target_snapshot_curl_proxy_invalid")
+    monkeypatch.setattr(cli, "load_curl_snapshot_options", invalid_options)
+    monkeypatch.setattr(cli, "run_woo_target_snapshot", lambda *a, **k: pytest.fail("no fallback"))
+    monkeypatch.setattr(cli, "CurlWooProductTargetTransport", lambda *a, **k: pytest.fail("no process"))
+    assert cli._run_snapshot_woo_target(logging.getLogger("test"), write_package(tmp_path), BASE_URL) == 2
+    assert "ck_test" not in caplog.text and "cs_test" not in caplog.text

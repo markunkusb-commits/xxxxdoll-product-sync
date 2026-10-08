@@ -539,6 +539,7 @@ def run_woo_target_snapshot(
     project_root: Path,
     transport: WooProductTargetTransport | None = None,
     redactor: Redactor | None = None,
+    max_retries: int = DEFAULT_MAX_RETRIES,
     sleeper: Callable[[float], None] = time.sleep,
 ) -> tuple[dict[str, object], Path]:
     """Validate one Package, perform only exact-SKU GETs, then write safely."""
@@ -580,6 +581,7 @@ def run_woo_target_snapshot(
         )
     report = WooTargetSnapshotter(
         active_transport,
+        max_retries=max_retries,
         sleeper=sleeper,
     ).build_report(sku, source_package, redactor=redactor)
     try:

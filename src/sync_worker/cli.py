@@ -127,6 +127,11 @@ from .woocommerce_target_snapshot import (
     run_woo_target_snapshot,
     validate_staging_target_base_url,
 )
+from .woocommerce_snapshot_curl_transport import (
+    CurlWooProductTargetTransport,
+    load_curl_snapshot_options,
+    validate_curl_snapshot_base_url,
+)
 from .woocommerce_apply_plan import run_woo_apply_plan
 from .woocommerce_batch_plan import freeze_woo_batch_plan
 from . import woocommerce_batch_authorization as batch_authorization
@@ -1766,17 +1771,23 @@ def _run_snapshot_woo_target(
 ) -> int:
     redactor = Redactor()
     try:
-        validated_base_url = validate_staging_target_base_url(base_url)
+        validated_base_url = validate_curl_snapshot_base_url(base_url)
         credential_source = load_woo_category_credential_source()
         credentials = load_woo_category_credentials(credential_source)
         redactor = redactor_for_woo_category_credentials(credentials)
-        report, _ = run_woo_target_snapshot(
-            package_report_path,
-            validated_base_url,
-            credentials,
-            project_root=PROJECT_ROOT,
-            redactor=redactor,
-        )
+        options = load_curl_snapshot_options()
+        with CurlWooProductTargetTransport(
+            validated_base_url, credentials, options=options,
+        ) as transport:
+            report, _ = run_woo_target_snapshot(
+                package_report_path,
+                validated_base_url,
+                credentials,
+                project_root=PROJECT_ROOT,
+                redactor=redactor,
+                transport=transport,
+                max_retries=0,
+            )
     except Exception as error:
         logger.error(
             json.dumps(
